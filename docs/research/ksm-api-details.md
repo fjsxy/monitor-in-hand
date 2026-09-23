@@ -164,10 +164,10 @@ standard Deployment 没有任何 args，因此每个 Pod 使用默认 `--shard=0
 
 - `Kubernetes 1.19 -> kube-state-metrics v2.3.0` 的 image、RBAC、ServiceAccount/Pod token、container securityContext、probes、ports、Service 与内部 scheduling；
 - `Kubernetes 1.28 -> kube-state-metrics v2.11.0` 的对应版本对象；
-- 两版均只生成 `Deployment`，不自动切换为 StatefulSet/DaemonSet；
+- 基础模式在两版均生成 `Deployment`；水平/节点分片的额外模式与版本约束见第 7 节；
 - namespace、实例前缀与 owner labels 用于多实例资源命名和归属，但不暴露原始 PodTemplate 或 `extraArgs`。
 
-一期暂不应暴露：image/tag/registry override、`extraArgs`、端口、Service type、PodTemplate、affinity/tolerations/nodeSelector、sharding、custom resource state、label/annotation allowlist、TLS/config file。这些能力要么已被需求明确设为内部策略，要么跨版本扩展面明显大于当前必要范围；等出现明确需求后再增加类型化字段。
+一期暂不应暴露：image/tag/registry override、`extraArgs`、端口、Service type、PodTemplate、affinity/tolerations/nodeSelector、custom resource state、label/annotation allowlist、TLS/config file。分片不能通过 `extraArgs` 透传，应按第 7 节建模成类型化部署模式。
 
 ## 6. 对“定义 kube-state-metrics 实例 API 与版本适配”的决策影响
 
@@ -177,3 +177,104 @@ standard Deployment 没有任何 args，因此每个 Pod 使用默认 `--shard=0
 4. **`replicas` 必须与 sharding 解耦**：一期若允许 `>1`，status/文档不能称其为 shard 或线性扩容，也不承诺不重复采集。
 5. **版本适配不只是镜像 tag**：至少还包括 RBAC、ServiceAccount token 与 container securityContext；应以两个显式 adapter/manifest builder 的 golden tests 固定，而不是一个通用模板只替换 image。
 6. **所有可在调谐前发现的错误都应前置**：unknown collector、allow/deny 同时非空、错误 regex、非法 namespace name、`replicas < 1` 都应先产生 `InvalidSpec`，避免生成必然 crash 的 Pod。
+
+## 7. 部署模式补充核查
+
+### 7.1 能力矩阵
+
+| 模式 | v2.3.0 | v2.11.0 | 上游状态 | workload 语义 |
+| --- | --- | --- | --- | --- |
+| 单副本 Deployment | 支持 | 支持 | standard example | 一个完整 collector 副本，默认不分片 |
+| Manual horizontal sharding | 支持 | 支持 | horizontal sharding 本身未标 experimental | 每个进程显式配置唯一 `--shard=i --total-shards=N`；上游没有“manual sharding StatefulSet”示例 |
+| Automated horizontal sharding | 支持 | 支持 | **experimental** | 一个 StatefulSet，Pod ordinal 是 shard，StatefulSet replicas 是 total shards |
+| DaemonSet node sharding | 不支持 | 支持 | `--node` 明确标为 **experimental** | 每个节点一个 KSM，只采集该节点上的 Pod；需要 companion Deployment 覆盖其他 collectors，并可再加一个 Deployment 覆盖未调度 Pod |
+
+`v2.3.0` 与 `v2.11.0` 都记录了 manual/automated horizontal sharding；两版 README 分别见 [`v2.3.0`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/README.md#L218-L237) 与 [`v2.11.0`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/README.md#L229-L248)。DaemonSet node sharding 只存在于 `v2.11.0` 的 [`README`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/README.md#L250-L296)、[`--node` CLI 帮助](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/docs/cli-arguments.md#L62-L69) 和 [`examples/daemonsetsharding`](https://github.com/kubernetes/kube-state-metrics/tree/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding)；`v2.3.0` 的 Options/CLI 没有 `Node`/`--node`，见其完整 flags 定义 [`pkg/options/options.go`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/pkg/options/options.go#L29-L114)。`v2.11.0` 自带 changelog 进一步确认 per-node FieldSelector sharding 在 `v2.7.0` 才加入，而采集尚未分配节点的 Pod 是 `v2.11.0` 才补齐：[`CHANGELOG v2.7.0`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/CHANGELOG.md#L115-L140)、[`CHANGELOG v2.11.0`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/CHANGELOG.md#L1-L17)。因此在固定 `Kubernetes 1.19 -> KSM v2.3.0` 的矩阵下，DaemonSet node sharding 不能成为两个集群都可用的共同能力。
+
+### 7.2 Manual horizontal sharding
+
+Manual sharding 的进程参数是：
+
+```text
+--shard=<zero-based ordinal>
+--total-shards=<N>
+```
+
+两版参数与默认值相同；`--shard` 默认 `0`，`--total-shards` 默认 `1`，此组合明确走不分片路径：[`v2.3.0 flags`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/pkg/options/options.go#L93-L111)、[`v2.11.0 flags`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/options/options.go#L120-L148)、两版相同的 [`NewShardedListWatch`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/sharding/listwatch.go#L35-L45)。
+
+精确实现不是 README 所说的简单 “md5/modulo”：两个 tag 的源码都是以对象 UID 计算 FNV-64a，再调用 jump consistent hash，保留 hash 结果等于本进程 shard ordinal 的对象：[`v2.3.0`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/pkg/sharding/listwatch.go#L94-L103)、[`v2.11.0`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/sharding/listwatch.go#L94-L103)。List 与 Watch 都在 client 收到完整响应/事件后本地过滤，见 [`List/Watch`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/sharding/listwatch.go#L47-L91)；所以分片减少每个进程保存和导出的对象，但不会按 `1/N` 减少 API list/watch 网络输入。
+
+Manual 模式没有 Pod identity 参数；Operator 必须创建 N 个能携带不同固定 `--shard=i` 的进程。若用 Deployment 表达，每个 shard workload 应只有一个 replica；同一 shard workload 调成多个 replicas 会重复导出该 shard 的全部对象。上游没有一个 Pod template 内能给 StatefulSet 每个 Pod 注入不同固定 `--shard` 值的 manual 示例；一个 StatefulSet 要从 ordinal 派生 shard，只能使用下一节的 auto detection。因而“manual sharding StatefulSet”不是这两个 tag 已提供的原生部署形态。
+
+上游 Options 没有完整验证 `N >= 1` 和 `0 <= i < N`；hash 结果直接与 `shard` 比较。因此 Operator 必须前置验证：`shards >= 1`，并保证恰好生成 `0..N-1` 每个 ordinal 一次。漏掉 ordinal 会漏指标，重复 ordinal 会重复指标；官方也要求监控所有 total shards 是否齐全：[`v2.11.0 README`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/README.md#L231-L238)。
+
+### 7.3 Automated horizontal sharding StatefulSet
+
+两版官方 manifest 均使用一个 StatefulSet，并只传：
+
+```text
+--pod=$(POD_NAME)
+--pod-namespace=$(POD_NAMESPACE)
+```
+
+`POD_NAME=metadata.name`、`POD_NAMESPACE=metadata.namespace` 都来自 downward API。证据：[`v2.3.0 statefulset.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/examples/autosharding/statefulset.yaml#L1-L59)、[`v2.11.0 statefulset.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/autosharding/statefulset.yaml#L1-L68)。两参数只要都非空就启用 auto path，并优先于静态 `--shard/--total-shards`：[`v2.3.0 Run`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/pkg/metricshandler/metrics_handler.go#L89-L107)、[`v2.11.0 Run`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/metricshandler/metrics_handler.go#L92-L111)。
+
+运行时先读取自己的 Pod ownerReference 找到 StatefulSet；Pod 名的末尾 ordinal 被解析为 shard，`StatefulSet.spec.replicas` 被读取为 total shards。StatefulSet 更新时各 Pod 重新配置 sharding：[`v2.3.0 detection`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/pkg/metricshandler/metrics_handler.go#L211-L256)、[`v2.11.0 detection`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/metricshandler/metrics_handler.go#L236-L281)。所以这个模式里 `replicas` 的业务含义就是 shard count，不是每个 shard 的冗余副本数。
+
+除 collector 的 ClusterRole/ClusterRoleBinding 外，官方 auto manifests 还创建 namespaced Role/RoleBinding：允许 `get` 自己的 Pod，以及 `get` 特定 StatefulSet；StatefulSet informer 所需的 `list/watch` 已在 ClusterRole 内。两版局部 RBAC 拓扑相同：[`v2.3.0 role.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/examples/autosharding/role.yaml#L1-L24)、[`v2.11.0 role.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/autosharding/role.yaml#L1-L24)。两版也都用 headless Service 选择全部 shard Pods：[`v2.3.0 service.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/examples/autosharding/service.yaml#L1-L20)、[`v2.11.0 service.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/autosharding/service.yaml#L1-L20)。采集端必须发现并抓取所有 shard endpoints；只抓一个 Service VIP/一个 Pod 会漏掉其他 shard 的对象。
+
+该能力在两个版本都明确标为 experimental。官方还指出 StatefulSet rollout 逐个终止再创建 Pod，会造成单 shard 短暂不可用，恰逢 scrape 时会漏指标；证据见两版 README 上述 automated sharding 段落。因此 API 不能把它承诺成无损 HA。
+
+### 7.4 DaemonSet node sharding 与 companion Deployments
+
+此模式只在 `v2.11.0` 可用。官方示例实际是三个 workload 角色：
+
+1. `kube-state-metrics-shard` DaemonSet：固定 `--resources=pods`，通过 downward API 将 `spec.nodeName` 注入 `NODE_NAME`，再传 `--node=$(NODE_NAME)`。每个 KSM 用 `spec.nodeName` FieldSelector 只 list/watch 同节点 Pod。[`daemonset.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding/daemonset.yaml#L1-L63)、[`README`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/README.md#L250-L278)。
+2. `kube-state-metrics` Deployment：`replicas: 1`，`--resources` 显式列出共同默认集合中除 `pods` 以外的 27 项；它负责全部非 Pod collectors。[`deployment.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding/deployment.yaml#L1-L57)。
+3. 可选的 `kube-state-metrics-pods` Deployment：`replicas: 1`，传 `--resources=pods --node=""`，负责尚未分配 `spec.nodeName` 的 Pod；官方 README 明确说没有它就无法覆盖 unassigned Pods。[`deployment-no-node-pods.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding/deployment-no-node-pods.yaml#L1-L58)、[`README`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/README.md#L280-L296)。这里的字面参数 `--node=""` 不能被渲染器擅自规范化成“未传 `--node`”或普通空值：单元测试确认显式空 node 产生 `spec.nodeName=`，而未配置 node 不产生 selector，[`TestNodeFieldSelector`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/options/types_test.go#L158-L200)。
+
+README 的短片段把 resource flag 误写成单数 `--resource=pods`，但实际 CLI 与官方完整 manifest 都是复数 `--resources=pods`；实现应以 manifest/Options 为准，不能复制 README 拼写。
+
+KSM 会拒绝非空 `--node` 与 `pods` 之外的 resource 组合，见 [`Options.Validate`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/options/options.go#L162-L173)。namespace deny selector 与 node selector 在启动时做 AND 合并，再交给 store builder，见 [`server.go`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/pkg/app/server.go#L205-L213)；Pod List/Watch 将该 FieldSelector 直接发给 API server，而不是先收全量 Pod 再在进程内过滤，[`internal/store/pod.go`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/internal/store/pod.go#L1752-L1763)。因此 namespace allow/deny 和 metric filters 仍能用于 node-sharded Pod collector，但 DaemonSet 自身的 resource 集合只能是 `pods`。
+
+官方为两类 endpoint 分别创建两个 headless Service：`kube-state-metrics-shard` 选择 DaemonSet Pods，[`daemonset-service.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding/daemonset-service.yaml#L1-L20)；`kube-state-metrics` 选择 companion Deployment Pods，[`deployment-service.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding/deployment-service.yaml#L1-L20)。后一个 Service 实际同时选择主非 Pod Deployment 与 unassigned-Pod Deployment，因而 endpoints 暴露的 metric families 是异构的，而不是每个 endpoint 内容相同。采集端必须覆盖两类 Service 的全部 endpoints。若 companion Deployment 未排除 `pods`，就会与 DaemonSet 重复 Pod metrics；官方通过显式 27 项资源列表避免这一点。
+
+三个 workload 共用同一个 ServiceAccount/ClusterRole/ClusterRoleBinding；官方没有按角色拆最小权限。[`service-account.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding/service-account.yaml#L1-L10)、[`cluster-role-binding.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding/cluster-role-binding.yaml#L1-L16)、[`cluster-role.yaml`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/examples/daemonsetsharding/cluster-role.yaml#L1-L128)。所以 `--node` 是请求过滤，不是 RBAC 隔离；DaemonSet Pod 在官方例子中仍持有整套 cluster-wide 权限。
+
+这个 DaemonSet 没有 `replicas` 字段；官方 KSM CLI 也没有“暂停 DaemonSet”或“scale to zero”参数。上游提供的唯一实例数量语义是一台符合调度条件的节点对应一个 Pod。因而 `replicas=0` 不能表达该模式的停机；在本项目已经确定的生命周期契约下，`enabled=false` 必须由 Operator 删除 DaemonSet 及两个 companion Deployments/Services，`enabled=true` 再重建。利用虚假 nodeSelector 驱逐所有 Pod 不是 kube-state-metrics 原生机制，也不应成为公共 API。官方 DaemonSet 只有 `kubernetes.io/os: linux` nodeSelector、没有 tolerations；若某目标节点无法调度该 DaemonSet Pod，该节点上的 Pod metrics 就会形成缺口，这属于 Operator 内部 scheduling 策略必须处理的风险。
+
+### 7.5 Filters、重复与发现的跨模式约束
+
+- **单 Deployment**：`replicas=1` 无重复；`replicas>1` 是完整重复副本，沿用第 4 节结论。
+- **Manual/auto horizontal sharding**：resource、namespace、metric allow/deny/opt-in 必须在所有 shards 上完全相同。resource/namespace filters 先限定输入范围，之后每种已启用对象再按 UID hash 分片；若某 shard 使用不同 filters，就会造成不完整或不可预测的整体视图。所有 shard endpoints 都必须被抓取。构建顺序可由两版 store builder 复核：[`v2.3.0`](https://github.com/kubernetes/kube-state-metrics/blob/b761b5382bdd85d7af915516f48cba1c46859c1d/internal/store/builder.go#L383-L428)、[`v2.11.0`](https://github.com/kubernetes/kube-state-metrics/blob/5e4e7d0bb727ac4c50097770ce0dd7979eb04b77/internal/store/builder.go#L504-L607)。
+- **DaemonSet node sharding**：DaemonSet 与 unassigned-Pod Deployment 只能启用 `pods`；非 Pod collectors 进入单独 Deployment。相同 namespace/metric filters 应复制到三个角色。漏抓任一节点 endpoint 会漏该节点 Pod；漏掉 unassigned endpoint 会漏尚未调度 Pod；让非 Pod companion 再启用 `pods` 会重复。
+- **Service discovery**：三种分片模式都不是由 Service 聚合 metrics。headless Service 只是暴露多个独立 endpoints；采集配置必须发现每个 endpoint。该项目又明确不创建 ServiceMonitor/PodMonitor，因此 Operator 至少要给所有相关 Services 一致、可选择的实例 labels，并在 status 中列出它们，但是否完整抓取仍由用户创建的采集配置负责。
+
+### 7.6 能表达三类模式的稳定字段
+
+不要把 workload kind、flags 和 replica 的多重含义塞进一个裸 `replicas`。建议使用有判别字段的 union；名称可调整，但语义应固定：
+
+```yaml
+spec:
+  deployment:
+    mode: Deployment | ManualSharding | AutoSharding | DaemonSetSharding
+
+    # mode=Deployment
+    replicas: 1
+
+    # mode=ManualSharding 或 AutoSharding
+    shards: 2
+
+    # mode=DaemonSetSharding，仅 v2.11.0/Kubernetes 1.28 可用
+    collectUnscheduledPods: true
+```
+
+校验规则：
+
+- `Deployment`：`replicas >= 1`，不得设置 `shards`、`collectUnscheduledPods`；`replicas>1` 明确是重复完整副本。
+- `ManualSharding`：两版可用；`shards >= 1`；controller 生成 `shards` 个单副本 workload，并固定唯一 ordinal。公共 API 不暴露 `shard` ordinal。
+- `AutoSharding`：两版可用但 experimental；`shards >= 1` 映射 StatefulSet replicas；不再接受 `replicas`，因为 replicas 就是 shard count。
+- `DaemonSetSharding`：只允许 KSM `v2.11.0`；collector 集合必须包含 `pods`。DaemonSet 固定负责 `pods`，其余已选 collectors 自动进入 companion Deployment；`collectUnscheduledPods=true` 时创建 `--node=""` companion。不得设置 `replicas`/`shards`。
+- 模式切换会替换 workload kind/集合，应沿用公共生命周期契约：先清理旧模式的直接受管资源，再创建新模式，避免切换窗口中两套 endpoints 重复暴露。
+
+若不愿把 experimental 能力固化进一期 API，更稳妥的公共 union 只保留 `Deployment | ManualSharding`；`AutoSharding` 与 `DaemonSetSharding` 留到版本矩阵扩大或明确接受 experimental 风险后再增加。尤其 `DaemonSetSharding` 无法在 Kubernetes 1.19/KSM v2.3.0 上兑现，不能宣称为一期双版本共同能力。
