@@ -14,11 +14,12 @@
 
 1. 一个逻辑采集实例只需要创建一个 `PrometheusAgent` CR。默认 `StatefulSet` 模式下，Prometheus Operator 按 `shards` 创建同等数量的 `StatefulSet`，每个 `StatefulSet` 的副本数为 `replicas`，总 Pod 数为 `replicas × shards`。同一 shard 内的 replicas 抓取相同目标，是高可用副本；不同 shard 通过 relabel hash 分摊目标。
 2. `replicas=0` 在 v0.83.0 中可用，会把每个 shard 的 `StatefulSet` 缩到 0；`paused=true` 只冻结调谐，已有 Pod 仍会继续采集和 remote write，因此不能用作“挂起”。
-3. `PrometheusAgent` 没有 `retention`、rules、alerting、query、remote read、Thanos 等 server-only 字段；但它继承了 `storage` 和 `walCompression`。Agent 会把待发送样本写入本地 WAL，默认使用 `EmptyDir`，并不是“完全无本地数据”。
+3. `PrometheusAgent` 没有 `retention`、rules、alerting、query、remote read、Thanos 等 server-only 字段；但它继承了 `storage` 和 `walCompression`。Agent 会把待发送样本写入本地 WAL；一期既然要求 PVC，就必须同时定义 PVC 的保留、冲突、扩容和 namespace 删除语义，不能只把 `volumeClaimTemplate` 透传下去。
 4. 应显式设置 `spec.version: v2.55.1` 和固定的 `spec.image`。v0.83.0 未指定版本时默认的是当时最新 Prometheus `v3.4.0`，而 `image` 与 `version` 是两个相互独立的输入，Operator 会信任 `version` 来生成配置。
 5. 对跨 namespace 的四类采集配置，应给四个对象 selector 都写入同一稳定 label selector，并把四个 namespace selector 设为空对象 `{}`。`null` 对象 selector 表示不选择；四者全为 `null` 还会进入已废弃的 unmanaged configuration 模式。
 6. runtime `ServiceAccount` 的固定最小 RBAC 可以覆盖 `ServiceMonitor`、`PodMonitor` 和 ingress/static `Probe`；但任意 `ScrapeConfig` 能声明不同的 Kubernetes SD role，所以不存在既支持所有 `ScrapeConfig` 又保持最小权限的静态 ClusterRole。这个边界必须由产品契约决定。
 7. CRD annotation/schema 或 server-side dry-run 只能证明 API capability，不能证明当前 Prometheus Operator controller 正在运行。一次成功的、带当前 `observedGeneration` 的 `Reconciled=True` 加受管 `StatefulSet` 能证明该实例曾被实际调谐，但 status 没有 heartbeat，不能长期证明 controller 存活。
+8. Kubernetes 1.19 没有 `StatefulSet.spec.persistentVolumeClaimRetentionPolicy`，所以不能把 1.28 的自动 PVC 删除能力当成跨版本契约。共同基线是 PVC 默认保留：`replicas=0`、replica/shard 缩容、StatefulSet 替换以及 `PrometheusAgent` 删除都不会删除 PVC；同名 StatefulSet 与 ordinal 会复用确定性命名的旧 PVC。
 
 ## 1. `PrometheusAgent` 的 API 结构
 
@@ -37,7 +38,7 @@
 | `version` | 未设置时采用 Operator 自带默认版本 | wrapper 必须固定为 `v2.55.1` |
 | `image` | 非空时直接覆盖镜像地址；仍需同时填写 `version` | 若按 digest 固定镜像，仍必须设置匹配的 `version` |
 | `paused` | 仅停止 Operator 对底层对象的新增/更新动作，删除仍由 ownerReferences 处理 | 不能映射为“挂起” |
-| `storage` | 支持 `EmptyDir`、ephemeral volume 或 PVC template | 一期若不暴露，保持 `nil` 即为 `EmptyDir` |
+| `storage` | 支持 `EmptyDir`、ephemeral volume 或 PVC template | 一期使用受限的 PVC API 映射，不直接透传完整 `PersistentVolumeClaimSpec` |
 | `walCompression` | `nil` 时由 Prometheus 默认决定；v2.55.1 默认开启 | 一期可不暴露 |
 | `remoteWrite` | 数组，允许多个 remote write target | 可映射一期多目标需求 |
 
@@ -112,7 +113,7 @@ PrometheusAgent CR 没有一等字段暴露 `storage.agent.retention.min-time/ma
 
 虽然 v0.83.0 的 `PrometheusAgent` 顶部注释仍称“不支持 persistent storage”，实际 Go 类型已经通过 `CommonPrometheusFields` 暴露 `storage`，controller 也会生成 PVC template；该注释与实现不一致，应以类型和 controller 为准。[注释与内嵌类型](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/apis/monitoring/v1alpha1/prometheusagent_types.go#L56-L68)；[storage 渲染](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/agent/statefulset.go#L76-L126)
 
-未设置 `storage` 时，Operator 给每个 Pod 使用 `EmptyDir`。它能跨 container restart 保留 WAL，但 Pod 被删除、重建或迁移后数据消失。若一期不承诺本地 retry buffer 的跨 Pod 持久性，不暴露 storage 是更小且一致的契约。
+未设置 `storage` 时，Operator 给每个 Pod 使用 `EmptyDir`。它能跨 container restart 保留 WAL，但 Pod 被删除、重建或迁移后数据消失。一期已经决定支持 PVC，因此 wrapper 需要生成 `volumeClaimTemplate`，并承担第 10 节所述的清理、冲突检测和状态聚合责任。
 
 ## 3. remote write 可映射能力
 
@@ -205,6 +206,8 @@ StatefulSet 数量与命名见 [`ExpectedStatefulSetShardNames`](https://github.
 
 StatefulSet 和 Secrets 使用 `controller=true`、`blockOwnerDeletion=true` 的 PrometheusAgent ownerReference；默认 governing Service 使用非-controller ownerReference，因为同 namespace 的多个 PrometheusAgent 可能共享它。[owner helper](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/operator/factory.go#L33-L69)；[StatefulSet owner](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/agent/statefulset.go#L60-L81)；[Service owner](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/common.go#L464-L496)
 
+PVC 是例外：Kubernetes 1.19 的 StatefulSet controller 从 `volumeClaimTemplates` 复制 metadata/spec 并生成 PVC，不增加 StatefulSet 或 Pod ownerReference；v0.83.0 的嵌入式 PVC metadata 也只允许 name、labels、annotations，无法通过模板注入 ownerReference。[Kubernetes 1.19 PVC 构造](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/controller/statefulset/stateful_set_utils.go#L135-L154)；[Prometheus Operator 嵌入式 metadata](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/apis/monitoring/v1/types.go#L283-L325) 因此删除 PrometheusAgent 所触发的 ownerReference 级联不会覆盖 PVC。
+
 对于允许同 namespace 多实例的 wrapper，建议自己创建唯一 headless Service，并把名称写入 `PrometheusAgent.spec.serviceName`。此时 Prometheus Operator 只校验 Service 已存在且 selector 能选中该实例 Pod，不接管该 Service。[`serviceName` 契约](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/apis/monitoring/v1/prometheus_types.go#L899-L907)；[校验逻辑](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/k8sutil/k8sutil.go#L584-L611)
 
 ## 7. 能力与运行状态检测
@@ -241,25 +244,30 @@ wrapper 先创建并确认唯一 headless Service、runtime ServiceAccount、Clu
 - `replicas`、`shards`；
 - 四类对象 selector 与 namespace selector；
 - 至少一个 `remoteWrite`；
-- 用户允许配置的 `resources`。
+- 用户允许配置的 `resources`；
+- wrapper 生成的 `storage.volumeClaimTemplate`，其中带稳定的 claim template name、实例 UID label、`ReadWriteOnce`、`Filesystem`、容量和 `storageClassName`。
 
 ### 8.2 挂起
 
 安全映射是保留 PrometheusAgent 和其非-workload 依赖，把渲染给下游的 `replicas` 设为 0，并等待所有 shard 的 `StatefulSet.spec.replicas=0`、Pod 数归零。不要设置 `paused=true`。
 
-这会保留配置 Secrets、headless Service、ServiceAccount 和 RBAC；恢复时重新写回用户期望 replicas。由于 Agent 默认使用 `EmptyDir`，缩零会丢弃 Pod 本地尚未发送的 WAL，这是挂起语义必须明确接受的结果。
+这会保留配置 Secrets、headless Service、ServiceAccount、RBAC 和 PVC；恢复时重新写回用户期望 replicas。相同 StatefulSet name/ordinal 会重新挂载同名 PVC，因此 WAL 文件可以延续，但这不构成端到端“零丢失”保证：Agent 自身 WAL 截断、remote endpoint 的时间窗口与去重/乱序策略仍在契约之外。
 
 ### 8.3 停用与删除 wrapper CR
 
 停用应删除 PrometheusAgent，再删除 wrapper 自己管理的 ServiceAccount/RBAC/Service。删除 PrometheusAgent 后，其 StatefulSet/Secrets/默认 Service 依赖 ownerReferences 由 Kubernetes garbage collector 级联清理，Prometheus Operator 缺席也不妨碍 GC。[Operator 对删除的依赖说明](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/agent/operator.go#L550-L559)
 
+PVC 不在上述级联链中。wrapper 必须用 finalizer 明确实现所选策略：`Delete` 时先确保 Pods/StatefulSets 已消失，再只删除带当前实例 UID label 且名称属于预期 identity 集合的 PVC，等待删除完成后释放 finalizer；`Retain` 时保留 PVC。停用后再启用且 wrapper UID 未变时可安全复用自己的 retained PVC；wrapper 删除后若同名新对象 UID 不同，必须报告 `ResourceConflict`，不能静默采用旧 PVC。
+
 如果 wrapper CR 是 cluster-scoped，它可以合法成为 namespaced PrometheusAgent/ServiceAccount/Service 与 cluster-scoped ClusterRole/ClusterRoleBinding 的 owner；反过来，namespaced owner 不能拥有 cluster-scoped dependent。[Kubernetes 1.19 ownerReference scope 规则](https://github.com/kubernetes/website/blob/1c8fbbcc9cbd381070c8f73d10756544be68d0fa/content/en/docs/concepts/workloads/controllers/garbage-collection.md#L62-L66)
+
+不建议 wrapper 在 PVC 创建后补自己的 ownerReference。显式 finalizer + UID label 可以分别表达 `Delete`/`Retain`；ownerReference 会把 wrapper 删除固定成自动 GC，破坏 `Retain` 语义，也可能与 Kubernetes 1.28 的 StatefulSet PVC retention ownerReference 发生竞争。
 
 ### 8.4 外部 Prometheus Operator 缺席
 
 - **创建前缺席/能力不满足**：不创建 PrometheusAgent，保留 wrapper 声明与必要非-workload 资源，报告 `DependencyMissing`，写入量为 0。
 - **创建后 controller 消失**：已有 Agent Pod 会继续运行和 remote write；仅凭 CRD/status 无法及时确认 controller 已消失。若产品承诺“DependencyMissing 必须零写入”，就必须额外约定一种可靠的外部 controller workload 定位/健康检测方式，并在确认缺席后删除 PrometheusAgent，让 GC 停止 Pod。否则只能承诺“不创建新的 Agent，已有 workload 可能继续运行”。
-- **依赖恢复**：重新通过 capability gate 后重建 PrometheusAgent；不要修改或接管 Prometheus Operator 生成的 StatefulSet/Secrets。
+- **依赖恢复**：重新通过 capability gate 后重建 PrometheusAgent；不要修改或接管 Prometheus Operator 生成的 StatefulSet/Secrets。只要 PVC 的实例 UID label 与预期一致，重建后的同名 StatefulSet 会复用它们。
 
 这一项是当前事实边界中最重要的未决点：没有通用 API 能同时保证外部 controller liveness 检测与安装无关。
 
@@ -269,15 +277,119 @@ wrapper 先创建并确认唯一 headless Service、runtime ServiceAccount、Clu
 
 - Prometheus Operator 会按 `shards` 自动创建多个 StatefulSet；
 - 每个 StatefulSet 使用 `replicas`；
+- persistent storage 下每个 shard/replica identity 由 StatefulSet 自动获得一个独立 PVC，当前运行所需 PVC 数是 `shards × replicas`；历史缩容后 retained PVC 数可以更大；
 - 默认 sharding 对 ServiceMonitor、PodMonitor、ScrapeConfig 使用 `__address__`，对 Probe 使用 `__param_target__`，生成 hashmod/keep relabel 规则。[sharding 规则](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/promcfg.go#L2106-L2144)
 
 多个 PrometheusAgent 只在这些场景必要：需要不同的 selector、remote write targets、runtime RBAC/ServiceAccount、资源规格或故障域。不要为了实现同一实例的 shard 而创建多个 PrometheusAgent，否则会把目标分配、状态聚合和生命周期原子性重新实现一遍。
 
-## 10. 仍需 Wayfinder 决策的问题
+## 10. PVC 生命周期的跨版本事实
+
+### 10.1 上游支持的字段与实际渲染
+
+v0.83.0 的 `StorageSpec` 有三种互斥来源，优先级是 `emptyDir`、`ephemeral`、`volumeClaimTemplate`。`volumeClaimTemplate` 使用精简 metadata（name、labels、annotations）和完整的 Kubernetes `PersistentVolumeClaimSpec`，因此技术上能携带 access modes、resources、selector、`storageClassName`、`volumeMode`、`dataSource` 等字段。[`StorageSpec`](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/apis/monitoring/v1/prometheus_types.go#L1310-L1335)；[`EmbeddedPersistentVolumeClaim`](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/apis/monitoring/v1/types.go#L283-L325)
+
+Prometheus Operator 把同一个 template 放进每个 shard 的 StatefulSet。template 未命名时默认使用 `prometheus-agent-<agent-name>-db`，access modes 未设置时默认 `ReadWriteOnce`；其余 PVC spec 由转换函数复制。[Agent StatefulSet storage 渲染](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/agent/statefulset.go#L86-L130)；[template 转换函数](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/operator/types.go#L24-L38)；[默认 volume name](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/common.go#L160-L165)
+
+一期不应透传完整 `PersistentVolumeClaimSpec`。跨 1.19/1.28 的稳定子集建议只有：
+
+- `size`：必填；第一期若不实现受控扩容，则创建后 immutable；
+- `storageClassName`：可选或必填仍需决策；
+- 内部固定 `accessModes: [ReadWriteOnce]`、`volumeMode: Filesystem`；
+- template name、instance UID label 由 wrapper 生成且对用户不可配置；
+- 不暴露 selector、`volumeName`、`dataSource`、generic ephemeral、`disableMountSubPath` 和原生 retention policy。
+
+原因不是这些字段“上游不支持”，而是它们会把 PV 预绑定、快照/数据源版本差异、feature gate、不可变字段和清理责任泄露进稳定 API。
+
+### 10.2 `persistentVolumeClaimRetentionPolicy` 不能作为共同基线
+
+Prometheus Operator 的公共字段包含 `persistentVolumeClaimRetentionPolicy`，并在非空时原样写入 StatefulSet。[字段定义](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/apis/monitoring/v1/prometheus_types.go#L390-L396)；[渲染逻辑](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/agent/statefulset.go#L127-L131) 但版本能力不同：
+
+- Kubernetes 1.19 的 `StatefulSetSpec` 只有 `volumeClaimTemplates`，没有该字段。[1.19 API](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/staging/src/k8s.io/api/apps/v1/types.go#L120-L175)
+- Kubernetes 1.28 有 `whenDeleted`/`whenScaled`，默认均为 `Retain`。[1.28 API 类型](https://github.com/kubernetes/kubernetes/blob/841856557ef0f6a399096c42635d114d6f2cf7f4/staging/src/k8s.io/api/apps/v1/types.go#L135-L165) 该 feature 在 v1.22 为 alpha、v1.27 为 beta，1.28 默认启用。[feature 历史](https://github.com/kubernetes/kubernetes/blob/841856557ef0f6a399096c42635d114d6f2cf7f4/pkg/features/kube_features.go#L817-L822)；[1.28 默认值](https://github.com/kubernetes/kubernetes/blob/841856557ef0f6a399096c42635d114d6f2cf7f4/pkg/features/kube_features.go#L1149-L1155)
+
+所以不能依赖这个字段在两个目标版本产生相同行为。即使 CRD 接受它，1.19 的 StatefulSet API 也没有相应能力。跨版本契约应保持原生字段为空，由 wrapper 显式执行 PVC retention。
+
+1.28 也只有在策略要求 `Delete` 时才通过 StatefulSet/Pod ownerReferences 驱动 GC；默认 `Retain/Retain` 明确不设置这些 ownerReferences。[1.28 ownerReference 策略矩阵](https://github.com/kubernetes/kubernetes/blob/841856557ef0f6a399096c42635d114d6f2cf7f4/pkg/controller/statefulset/stateful_set_utils.go#L238-L249)；[ownerReference 写入逻辑](https://github.com/kubernetes/kubernetes/blob/841856557ef0f6a399096c42635d114d6f2cf7f4/pkg/controller/statefulset/stateful_set_utils.go#L307-L350)
+
+### 10.3 各生命周期动作的精确结果
+
+StatefulSet PVC 名称是 `<claim-template-name>-<statefulset-name>-<ordinal>`。controller 发现同名 PVC 已存在时只检查它是否正在删除，不验证或更新 resources/access modes；源码中保留了对应 TODO。[1.19 命名与构造](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/controller/statefulset/stateful_set_utils.go#L91-L96)；[1.19 已存在 PVC 逻辑](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/controller/statefulset/stateful_pod_control.go#L177-L204)；[1.28 同样的逻辑](https://github.com/kubernetes/kubernetes/blob/841856557ef0f6a399096c42635d114d6f2cf7f4/pkg/controller/statefulset/stateful_pod_control.go#L337-L364)
+
+在不设置原生 retention policy 的共同基线下：
+
+| 动作 | StatefulSet/Pod | PVC | 再次扩容/重建 |
+| --- | --- | --- | --- |
+| `replicas: 0` | 每个 shard StatefulSet 保留，Pods 归零 | 全部保留 | 相同 ordinal 复用原 PVC |
+| replicas 从 N 降到 M | 高 ordinal Pods 删除 | 高 ordinal PVC 保留 | 回到 N 时复用 |
+| shards 从 N 降到 M | Prometheus Operator 删除多余 shard StatefulSets | 这些 shard 的 PVC 保留 | 回到 N 时同名 shard StatefulSet 复用 |
+| shards/replicas 首次增加到新 identity | 创建新 StatefulSet/Pod | 不存在同名 claim 时按 template 新建 | 后续按 identity 复用 |
+| StatefulSet immutable update | Prometheus Operator 收到 422 后 foreground 删除并在后续 reconcile 重建 | 保留 | 同名 StatefulSet/ordinal 复用 |
+| 删除 PrometheusAgent | ownerReferences 级联删除 StatefulSets/Pods/Secrets | 保留 | 同 namespace 同名 Agent 会撞上并复用旧 PVC |
+| 删除 target namespace | namespace controller 删除其中所有可删除的 namespaced resources，包括 PVC | PVC 对象被删除 | 后端数据是否仍在取决于 PV reclaim policy，不能自动复用 |
+
+Prometheus Operator 缩 shards 时只删除 StatefulSet；遇到不可变更新时也只删除 StatefulSet，没有显式 PVC 删除路径。[shard 清理](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/agent/operator.go#L808-L831)；[422 替换路径](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/agent/operator.go#L782-L805) Kubernetes 1.19 又禁止直接更新 `volumeClaimTemplates` 等 StatefulSet 字段，因此改变 template 会触发该替换路径。[1.19 StatefulSet update validation](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/apis/apps/validation/validation.go#L143-L158)
+
+namespace controller 会发现所有支持 delete 的 namespaced GVR 并逐类删除资源，因此 wrapper finalizer 无法把 target namespace 删除转换成普通的“保留 PVC”语义。[1.19 namespace 删除实现](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/controller/namespace/deletion/namespaced_resources_deleter.go#L491-L555) target namespace 已进入 `Terminating` 或消失时，wrapper 应停止重建 namespaced resources，报告 `TargetNamespaceUnavailable`；不能宣称数据已保留或已擦除。
+
+### 10.4 PVC 删除不等于后端数据删除
+
+动态 provision 的 PV 继承 StorageClass 的 `reclaimPolicy`，未设置时默认 `Delete`；`allowVolumeExpansion` 是另一个独立字段。[Kubernetes 1.19 StorageClass API](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/staging/src/k8s.io/api/storage/v1/types.go#L40-L67) PVC 删除后：
+
+- PV `Delete` 表示 Kubernetes 删除 PV，并请求对应 storage backend 删除资产；
+- PV `Retain` 表示 PV 进入 Released，等待管理员手工回收。
+
+两者的 API 定义见 [Kubernetes 1.19 reclaim policy 类型](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/staging/src/k8s.io/api/core/v1/types.go#L375-L387)，外部 storage asset 的处理见[同版本官方文档](https://github.com/kubernetes/website/blob/1c8fbbcc9cbd381070c8f73d10756544be68d0fa/content/en/docs/concepts/storage/persistent-volumes.md#L124-L138)。因此 wrapper 的 `Delete` retention 最多承诺“PVC 对象已删除并触发底层 reclaim 流程”，不能承诺云盘/数据已物理擦除；后者属于 StorageClass、CSI provisioner 和基础设施的责任边界。
+
+### 10.5 不可变字段与扩容
+
+在 Kubernetes 1.19 的共同基线中，bound PVC 的 spec 除 `resources.requests.storage` 外不可变，`volumeMode` 也单独强制 immutable，容量不能缩小。[PVC update validation](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/apis/core/validation/validation.go#L2010-L2060) 增大容量还要求 PVC 已 Bound、StorageClass 一致且 `allowVolumeExpansion=true`。[resize admission](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/plugin/pkg/admission/storage/persistentvolume/resize/admission.go#L75-L130)
+
+只修改 PrometheusAgent 的 template 不会扩已有 PVC：Prometheus Operator 会替换 StatefulSet，而 StatefulSet controller 会复用同名 PVC且不更新其 spec。结果可能是旧 identities 仍用旧容量，新 identity 按新 template 创建，形成混合容量。
+
+一期有两个可行方案：
+
+1. **建议：`size` 创建后 immutable。** API 最小、跨版本结果确定；用户要换容量时创建新实例并接受 WAL 重新开始。
+2. **grow-only 工作流。** wrapper 必须先逐个 patch 当前及 retained PVC，等待 `status.capacity` 达标并处理 `Resizing`/`FileSystemResizePending`，再更新 PrometheusAgent template 供未来 identity 使用；任何 PVC 或 StorageClass 不支持时保持旧 desired state 并报告失败。不能仅修改 template，也不能支持缩容。
+
+Kubernetes 1.19 可跨版本依赖的 PVC status 只有 phase、capacity 和 resize conditions；`Resizing` 与 `FileSystemResizePending` 的定义见 [PVC status API](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/staging/src/k8s.io/api/core/v1/types.go#L507-L555)。具体 CSI 是否支持 online filesystem resize 仍是外部能力，不能由 API schema 推断。
+
+### 10.6 数据连续性、冲突与安全清理
+
+PVC 能保留同一个 Pod identity 的 WAL 文件，但不是业务级 exactly-once 或零丢失保证。Agent 运行期间仍受第 2.2 节的 WAL truncate 参数约束；恢复后外部 remote endpoint 仍可能按自己的过期、重复或 out-of-order 规则接受/拒绝样本。
+
+必须在 template labels 中写入不可变的 wrapper instance UID。原因是删除并创建同 namespace、同名 wrapper/PrometheusAgent 会生成完全相同的 StatefulSet 和 PVC 名；StatefulSet controller 会直接复用同名 PVC，不验证它是否属于新实例。安全判定如下：
+
+- PVC label UID 等于当前 wrapper UID：可视为本实例的 retained PVC；
+- 同名 PVC 无 UID label 或 UID 不同：报告 `ResourceConflict`，停止创建/恢复，不自动 adopt、不覆盖、不删除；
+- template name、target namespace 或其他决定 PVC 名称的字段创建后 immutable。
+
+`suspended=true` 永远保留 PVC。对于 component disabled 和 wrapper deletion，建议暴露或内部固定一个 retention policy：
+
+- `Delete`：wrapper finalizer 删除 PrometheusAgent，等待 StatefulSets/Pods 消失，再删除当前 UID 标记的 PVC，最后删除其余资源并释放 finalizer；
+- `Retain`：不删 PVC。相同 wrapper UID 的 disable→enable 可以复用；wrapper 本身删除后，PVC 成为明确的管理员资产，未来同名新实例因 UID 不同必须冲突退出。
+
+wrapper 因此至少需要对目标 namespace 中 PVC 的 `get/list/watch/delete`；若实现 grow-only 再增加 `patch/update`。PVC 由 StatefulSet controller 创建，wrapper 不需要 `create`。还应读取 StatefulSet、Pod 和 Event 来完成删除等待与诊断。不要通过事后给 PVC 增加 wrapper ownerReference 代替 finalizer，因为那会丢失 `Retain` 选择并产生跨版本不同的 GC 行为。
+
+### 10.7 status 与 Events
+
+PVC 创建 API 失败时，StatefulSet controller 在 StatefulSet 上记录 `FailedCreate`；绑定/动态 provision 过程在 PVC 上记录 `FailedBinding`、`VolumeMismatch`、`ExternalProvisioning`、`ProvisioningFailed` 等 Event。[StatefulSet claim Event](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/controller/statefulset/stateful_pod_control.go#L160-L204)；[volume Event reasons](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/controller/volume/events/event.go#L19-L35)；[未绑定与 provision 事件](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/controller/volume/persistentvolume/pv_controller.go#L345-L364)
+
+异步 binding 失败不一定让 PrometheusAgent `Reconciled=False`：StatefulSet 已创建时 reconcile 可以成功，而 Pod 因未绑定 PVC 无法调度。Prometheus Operator 的 `Available` 只汇总 ready Pods，并把 Pod condition message 带入 `NoPodReady`/`SomePodsNotReady`。[Prometheus status 汇总](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/prometheus/operator.go#L138-L245)；[Pod message 选择](https://github.com/prometheus-operator/prometheus-operator/blob/5cf2f5d37906d64b2259a262e319df4c74639e31/pkg/operator/statefulset_reporter.go#L35-L67) Kubernetes 1.19 scheduler 的典型 message 是 `pod has unbound immediate PersistentVolumeClaims`。[scheduler volume binding](https://github.com/kubernetes/kubernetes/blob/e37e4ab4cc8dcda84f1344dda47a97bb1927d074/pkg/scheduler/framework/plugins/volumebinding/volume_binding.go#L133-L145)
+
+wrapper 不能只转译 `PrometheusAgent.status`，应独立维护：
+
+- `StorageReady=True`：所有当前期望 identity 的 PVC 均为 Bound，且容量符合 desired；
+- `StorageReady=False, reason=PVCNotBound|PVCProvisioningFailed|PVCResizePending|PVCConflict`：message 写入 namespace/name、当前 phase 与最近可行动原因；
+- `Ready` 必须同时要求 `Reconciled=True`、`Available=True` 和 `StorageReady=True`；suspended 时另用 `Suspended=True` 表达期望状态，不把零副本当成正常采集；
+- 发出 wrapper 自己的 Kubernetes Event，但不能把 Event 当持久状态；Event 会过期，当前阻塞原因必须留在 CR status。
+
+## 11. 仍需 Wayfinder 决策的问题
 
 1. runtime ClusterRole 采用官方 Agent 最小基线，还是采用覆盖任意 Kubernetes SD 的较宽权限；若选择前者，如何向用户表达 ScrapeConfig 自行补充 RBAC 的责任。
 2. 外部 Prometheus Operator 的持续 liveness 是否属于一期承诺；若属于，如何配置或发现其 Deployment/Pod，而不是只验证 CRD。
 3. 产品是否要求预装 Prometheus Operator watch 全部 namespaces；如果允许受限 watch scope，如何配置或检测它对实例 namespace 与采集配置 namespaces 的覆盖。
 4. wrapper remote write API 暴露全部 queue 参数，还是只暴露 `capacity`、`minShards`、`maxShards`、`maxSamplesPerSend`、`batchSendDeadline`、backoff 与 `sampleAgeLimit` 的稳定子集。
-5. 是否接受挂起、滚动更新、缩分片会丢失 `EmptyDir` 中未发送 WAL；若不接受，就必须把 persistent storage 纳入一期并明确 PVC 清理策略。
-6. 是否支持 `ScrapeConfig` 的任意认证 Secret 引用；Prometheus Operator 会读取这些 Secret，因此错误通常出现在下游 `Reconciled=False`，wrapper 只能转译状态，不能预先完整验证。
+5. PVC retention 是只提供一个固定策略，还是暴露 `Delete`/`Retain`；若暴露，默认值应是什么，以及 `Retain` 后的人工恢复/清理入口由谁负责。
+6. PVC 容量在一期保持 immutable，还是实现显式的 grow-only 工作流；后者必须逐个 patch 已存在 PVC、等待扩容状态，并处理 StorageClass/CSI 不支持在线扩容的情况。
+7. `storageClassName` 是否强制显式设置；若允许省略，应在 status 记录 admission/defaulting 后每个 PVC 的实际 StorageClass，避免默认 StorageClass 变化造成不同 identity 使用不同后端。
+8. 是否支持 `ScrapeConfig` 的任意认证 Secret 引用；Prometheus Operator 会读取这些 Secret，因此错误通常出现在下游 `Reconciled=False`，wrapper 只能转译状态，不能预先完整验证。
