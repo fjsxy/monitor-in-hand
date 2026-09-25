@@ -21,7 +21,7 @@ kubebuilder init \
 
 ## 开发验证
 
-需要 Go 1.22、Helm 3、Docker、kind、kubectl、jq、curl 与 ripgrep。常用入口：
+需要 Go 1.22、Helm 3、Docker、kind、kubectl、jq 与 curl。常用入口：
 
 ```bash
 make typecheck

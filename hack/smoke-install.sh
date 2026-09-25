@@ -29,7 +29,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if kind get clusters | rg -Fxq "${cluster_name}"; then
+if kind get clusters | grep -Fxq "${cluster_name}"; then
   echo "拒绝复用已有 kind 集群：${cluster_name}" >&2
   exit 1
 fi
@@ -94,7 +94,7 @@ if "${helm_bin}" install monitor-in-hand-second "${repo_root}/charts/monitor-in-
   echo "第二套 Operator 安装不应成功" >&2
   exit 1
 fi
-if ! rg -q 'monitor-in-hand-manager-role' /tmp/monitor-in-hand-second-install.log; then
+if ! grep -q 'monitor-in-hand-manager-role' /tmp/monitor-in-hand-second-install.log; then
   echo "第二套 Operator 安装失败，但原因不是集群级安装锁冲突" >&2
   sed -n '1,80p' /tmp/monitor-in-hand-second-install.log >&2
   exit 1
