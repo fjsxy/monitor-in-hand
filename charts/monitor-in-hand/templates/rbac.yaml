@@ -1,0 +1,24 @@
+{{- $generatedRole := .Files.Get "generated/manager-role.yaml" | fromYaml -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: monitor-in-hand-manager-role
+  labels:
+    {{- include "monitor-in-hand.labels" . | nindent 4 }}
+rules:
+  {{- toYaml $generatedRole.rules | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-leader-election" (include "monitor-in-hand.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "monitor-in-hand.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: monitor-in-hand-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "monitor-in-hand.fullname" . }}
+    namespace: {{ .Release.Namespace }}

@@ -1,0 +1,23 @@
+resources:
+  requests:
+    cpu: 50m
+nodeSelector:
+  topology.kubernetes.io/zone: test-zone
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution: []
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: observability
+    effect: NoSchedule
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: monitor-in-hand
+healthProbe:
+  port: 9081
+logLevel: warn

@@ -1,0 +1,8 @@
+resources: {}
+nodeSelector: {}
+affinity: {}
+tolerations: []
+topologySpreadConstraints: []
+healthProbe:
+  port: 8081
+logLevel: info
