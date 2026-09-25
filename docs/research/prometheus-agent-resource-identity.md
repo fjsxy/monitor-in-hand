@@ -6,6 +6,7 @@
 
 - Prometheus Operator `v0.83.0`，tag 对应 commit `5cf2f5d37906d64b2259a262e319df4c74639e31`；
 - `monitoring.coreos.com/v1alpha1` `PrometheusAgent`；
+- Prometheus `v2.55.1`，tag 对应源码 commit `6d7569113f1ca814f1e149f74176656540043b8d`；
 - Kubernetes `v1.19.16` 与 `v1.28.15`；
 - StatefulSet 模式。`DaemonSet` 模式不产生 StatefulSet governing Service 或 PVC，本文仅在资源冲突行为相同时顺带提及。
 
@@ -29,6 +30,7 @@
 8. Agent runtime ServiceAccount、ClusterRole、ClusterRoleBinding 均不是 Operator 生成资源。Operator 只把 `spec.serviceAccountName` 原样放入 PodSpec；这些 RBAC 对象由集群管理员创建和维护。
 9. 默认 external labels 为 `prometheus=<namespace>/<agent-name>` 与 `prometheus_replica=<pod-name>`。Pod 名含 shard 与 replica ordinal，因此同一集群内能区分各 shard/replica；它们没有 cluster identity，所以不同集群采用相同 namespace/name/topology 时仍会碰撞。
 10. VictoriaMetrics `-dedup.minScrapeInterval` 只在**完整 label set 相同**的同一 time series 内去重，不识别、忽略或特殊处理 `prometheus_replica`。保留默认 `prometheus_replica=<pod-name>` 会把 HA replicas 写成不同 series，无法靠该参数合并。
+11. Prometheus `v2.55.1` 合并 remote write external labels 时，**原 series 的同名 label 优先**。因此若采集样本已经有 `cluster=x`，`external_labels.cluster=y` 不会覆盖它、也不会令配置报错；写出的仍是 `cluster=x`。
 
 ## 资源名称与数量
 
@@ -269,6 +271,42 @@ Prometheus Operator API 明确规定空字符串会禁止添加 replica external
 
 另一条技术路径是在写入前用 relabeling 删除 `prometheus_replica`；VictoriaMetrics 支持 `labeldrop`。[官方 relabeling 文档](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/018bc7808882fc8c10b150486de90b22e75ac504/docs/victoriametrics/relabeling.md#L870-L900) 但对本项目而言，直接设置 `replicaExternalLabelName: ""` 更小、更明确，也不需要引入此前未纳入一期保证的 `writeRelabelConfigs` 或 backend ingestion relabel 配置。
 
+### `external_labels.cluster` 与采集样本同名 label 的优先级
+
+Prometheus `v2.55.1` 官方配置文档明确说明：global `external_labels` 与 `honor_labels` 无关；向外部系统发送数据时，external label 只会在 time series **尚无该 label** 时添加，已有同名 label 时 external label 被忽略。[官方配置文档](https://github.com/prometheus/prometheus/blob/v2.55.1/docs/configuration/configuration.md#L216-L239)
+
+remote write 源码与该文档一致：
+
+1. `QueueManager.StoreSeries` 从 WAL series 取出原始 labels；
+2. `processExternalLabels` 逐个检查 external label，只有 `Builder.Get(name) == ""` 时才 `Set`；函数注释明确写着“`b` 中的值获胜”；
+3. external labels 合并完成后才执行 `write_relabel_configs`。
+
+来源见 [`StoreSeries`](https://github.com/prometheus/prometheus/blob/v2.55.1/storage/remote/queue_manager.go#L974-L993) 与 [`processExternalLabels`](https://github.com/prometheus/prometheus/blob/v2.55.1/storage/remote/queue_manager.go#L1070-L1077)。上游单元测试也固定了冲突行为：series 有 `a=b`、external label 为 `a=c` 时，结果仍为 `a=b`，不会返回错误。[测试](https://github.com/prometheus/prometheus/blob/v2.55.1/storage/remote/queue_manager_test.go#L1436-L1502)
+
+所以给定：
+
+```yaml
+global:
+  external_labels:
+    cluster: cluster-a
+```
+
+行为是：
+
+| 采集后 series labels | remote write 最终值（未另配 write relabel） |
+| --- | --- |
+| 无 `cluster` | 增加 `cluster="cluster-a"` |
+| `cluster="target-value"` | 保留 `cluster="target-value"`，忽略 external label |
+
+这不是配置冲突，Prometheus 不会因为采集 series 与 external label 同名而拒绝加载或报告错误；`GlobalConfig` 对 external labels 只校验 label name/value 合法性。[配置校验源码](https://github.com/prometheus/prometheus/blob/v2.55.1/config/config.go#L538-L559) 如果配置了 `write_relabel_configs`，它发生在 external labels 合并之后，仍可继续替换或删除 `cluster`。
+
+由此，一期若把 `cluster` 定义为可信、稳定的 cluster identity，就必须明确以下二选一约束，不能只写“配置 `externalLabels.cluster`”：
+
+- 将 `cluster` 设为保留 label，保证所有被选中的采集配置和目标样本在进入 remote write 前都不产生它，并对这一前提做可验证的准入或验收；或
+- 由管理员在每个 remote write 的 `write_relabel_configs` 中使用 `replace` 无条件把 `cluster` 覆盖为该集群的固定 ID。因为 write relabel 在 external-label 合并之后执行，这条规则能覆盖目标自带的同名值；`replace` 的官方定义就是把 `target_label` 设置为 `replacement`。[官方 relabel 配置说明](https://github.com/prometheus/prometheus/blob/v2.55.1/docs/configuration/configuration.md#L3574-L3610)
+
+若一期既不管控采集配置，也不生成上述强制 write relabel，就只能把 `externalLabels.cluster` 定义为**尽力而为的来源标签**，不能把它承诺为可信 cluster identity。该冲突还会破坏 VictoriaMetrics HA 去重：两个 replica 若抓到的同名 `cluster` 值不同，最终 label set 不同，backend 不会将其视为同一 series。
+
 ### backend 必须如何配置
 
 VictoriaMetrics Cluster 官方说明：
@@ -298,6 +336,6 @@ vminsert:  无对应 storage dedup flag
 3. 是否固定默认 Retain 且禁止/不承诺 `persistentVolumeClaimRetentionPolicy`，以保持 1.19/1.28 一致行为。
 4. 是否要求重建前校验旧 PVC 的 StorageClass、accessModes、capacity、labels 与业务归属；StatefulSet controller 不替项目完成这项校验。
 5. 是否将 Agent `replicas` 定义为 VictoriaMetrics HA duplicates；若是，必须禁用 `prometheus_replica`，并要求 VM `vmstorage`/`vmselect` 以统一 scrape interval 开启 dedup。
-6. 多集群写向同一 backend 时，是否强制增加项目定义的 cluster external label；默认 external labels 不含 cluster identity。
+6. 多集群写向同一 backend 时，是否强制增加项目定义的 cluster identity，并以保留 label 准入规则或强制 `write_relabel_configs replace` 处理同名冲突；只设置 external label 不能覆盖 target 自带值，默认 external labels 也不含 cluster identity。
 7. 是否强制所有 scrape targets 使用同一 `scrape_interval`；否则单一 VM dedup interval 无法覆盖所有目标的精确 HA 语义。
 8. runtime RBAC 是按实例独立还是允许共享；无论哪种，都是 Helm/管理员资源，不是 Prometheus Operator 生成资源。
