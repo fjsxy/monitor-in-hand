@@ -18,9 +18,10 @@ import (
 )
 
 var (
-	testEnvironment *envtest.Environment
-	testClient      client.Client
-	testScheme      *runtime.Scheme
+	testEnvironment    *envtest.Environment
+	environmentStarted bool
+	testClient         client.Client
+	testScheme         *runtime.Scheme
 )
 
 func TestController(t *testing.T) {
@@ -41,12 +42,13 @@ var _ = BeforeSuite(func() {
 	testEnvironment = &envtest.Environment{CRDDirectoryPaths: []string{crdPath}}
 	config, err := testEnvironment.Start()
 	Expect(err).NotTo(HaveOccurred())
+	environmentStarted = true
 	testClient, err = client.New(config, client.Options{Scheme: testScheme})
 	Expect(err).NotTo(HaveOccurred())
 })
 
 var _ = AfterSuite(func() {
-	if testEnvironment != nil {
+	if environmentStarted {
 		Expect(testEnvironment.Stop()).To(Succeed())
 	}
 })
