@@ -1,0 +1,19 @@
+{
+  "name": "monitor-in-hand-agent-orchestration",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sandcastle": "tsx .sandcastle/main.mts",
+    "sandcastle:build": "sandcastle docker build-image --image-name sandcastle:monitor-op",
+    "sandcastle:smoke": "tsx .sandcastle/smoke.mts",
+    "sandcastle:test": "tsx --test .sandcastle/*.test.mts",
+    "sandcastle:check": "npm run sandcastle:test && tsc -p .sandcastle/tsconfig.json"
+  },
+  "devDependencies": {
+    "@ai-hero/sandcastle": "0.12.0",
+    "@standard-schema/spec": "1.1.0",
+    "@types/node": "26.6.3",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}

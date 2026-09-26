@@ -25,6 +25,9 @@ Dockerfile.cross
 *.swo
 *~
 
+# Node.js tooling used by Sandcastle
+node_modules/
+
 # Local agent and pinned development tools
 .agents/
 .tools/

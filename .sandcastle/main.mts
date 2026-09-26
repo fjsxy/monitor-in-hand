@@ -1,0 +1,335 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import * as sandcastle from "@ai-hero/sandcastle";
+import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
+import {
+  branchForIssue,
+  promptArgsForIssue,
+  selectFrontier,
+  type IssueRecord,
+} from "./orchestration.mts";
+
+const EXPECTED_REMOTE = "https://github.com/fjsxy/monitor-in-hand";
+const READY_LABEL = "ready-for-agent";
+const IMAGE_NAME = "sandcastle:monitor-op";
+const repoRoot = process.cwd();
+
+function command(commandName: string, args: string[]): string {
+  return execFileSync(commandName, args, {
+    cwd: repoRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function readLocalEnv(): Record<string, string> {
+  const envPath = resolve(repoRoot, ".sandcastle/.env");
+  if (!existsSync(envPath)) return {};
+
+  return Object.fromEntries(
+    readFileSync(envPath, "utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#") && line.includes("="))
+      .map((line) => {
+        const separator = line.indexOf("=");
+        const key = line.slice(0, separator).trim();
+        const value = line.slice(separator + 1).trim().replace(/^(['"])(.*)\1$/, "$2");
+        return [key, value];
+      }),
+  );
+}
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function assertPreconditions(): {
+  baseBranch: string;
+  codexAuthFile: string;
+  currentUser: string;
+  ghToken: string;
+} {
+  if (resolve(repoRoot) !== resolve(command("git", ["rev-parse", "--show-toplevel"]))) {
+    throw new Error("请从仓库根目录运行 npm run sandcastle。 ");
+  }
+
+  const remote = command("git", ["remote", "get-url", "origin"])
+    .replace(/\.git$/, "");
+  if (remote !== EXPECTED_REMOTE) {
+    throw new Error(`origin 不匹配，拒绝执行 GitHub 写操作：${remote}`);
+  }
+
+  if (command("git", ["status", "--porcelain"])) {
+    throw new Error("工作区不干净；请先提交或暂存现有修改，再运行 Sandcastle。");
+  }
+
+  const baseBranch = command("git", ["branch", "--show-current"]);
+  if (!baseBranch) throw new Error("当前处于 detached HEAD，无法创建 ticket 分支。");
+
+  const localEnv = readLocalEnv();
+  const codexAuthFile = resolveCodexAuthFile(
+    process.env.CODEX_AUTH_FILE || localEnv.CODEX_AUTH_FILE,
+  );
+
+  const ghToken =
+    process.env.GH_TOKEN || localEnv.GH_TOKEN || command("gh", ["auth", "token"]);
+  const currentUser = command("gh", ["api", "user", "--jq", ".login"]);
+
+  return { baseBranch, codexAuthFile, currentUser, ghToken };
+}
+
+function fetchIssues(): IssueRecord[] {
+  return JSON.parse(
+    command("gh", [
+      "issue",
+      "list",
+      "--state",
+      "all",
+      "--limit",
+      "1000",
+      "--json",
+      "number,title,body,state,labels,assignees",
+    ]),
+  ) as IssueRecord[];
+}
+
+function existingPullRequest(branch: string): string | undefined {
+  const url = command("gh", [
+    "pr",
+    "list",
+    "--state",
+    "open",
+    "--head",
+    branch,
+    "--json",
+    "url",
+    "--jq",
+    ".[0].url // \"\"",
+  ]);
+  return url || undefined;
+}
+
+function claimIssue(issue: IssueRecord, currentUser: string): void {
+  const assignees = JSON.parse(
+    command("gh", ["issue", "view", String(issue.number), "--json", "assignees"]),
+  ).assignees as Array<{ login: string }>;
+
+  if (assignees.some((assignee) => assignee.login !== currentUser)) {
+    throw new Error(`#${issue.number} 已由其他用户认领。`);
+  }
+
+  if (assignees.length === 0) {
+    command("gh", [
+      "issue",
+      "edit",
+      String(issue.number),
+      "--add-assignee",
+      "@me",
+    ]);
+  }
+
+  const verified = JSON.parse(
+    command("gh", ["issue", "view", String(issue.number), "--json", "assignees"]),
+  ).assignees as Array<{ login: string }>;
+  if (!verified.some((assignee) => assignee.login === currentUser)) {
+    throw new Error(`#${issue.number} 认领回读失败。`);
+  }
+}
+
+function publishPullRequest(
+  issue: IssueRecord,
+  branch: string,
+  baseBranch: string,
+): string {
+  command("git", ["push", "--set-upstream", "origin", branch]);
+
+  const existing = existingPullRequest(branch);
+  if (existing) return existing;
+
+  return command("gh", [
+    "pr",
+    "create",
+    "--base",
+    baseBranch,
+    "--head",
+    branch,
+    "--title",
+    issue.title,
+    "--body",
+    [
+      `Closes #${issue.number}`,
+      "",
+      "由 Sandcastle 在隔离 worktree/sandbox 中实现并复核。",
+      "Issue 仅在 PR 合并后关闭；CI 与验收结论以 GitHub 为准。",
+    ].join("\n"),
+  ]);
+}
+
+async function executeIssue(
+  issue: IssueRecord,
+  baseBranch: string,
+  codexAuthFile: string,
+  agent: ReturnType<typeof sandcastle.codex>,
+  maxIterations: number,
+): Promise<{ issue: number; status: string; detail?: string }> {
+  const branch = branchForIssue(issue.number);
+  const promptArgs = promptArgsForIssue(issue, branch, baseBranch);
+  const stagedAuth = stageCodexAuth(codexAuthFile);
+
+  try {
+    const sandbox = await sandcastle.createSandbox({
+      branch,
+      sandbox: docker({ imageName: IMAGE_NAME, mounts: [stagedAuth.mount] }),
+      hooks: {
+        sandbox: {
+          onSandboxReady: [
+            {
+              command: "codex login status && go mod download",
+              timeoutMs: 300_000,
+            },
+          ],
+        },
+      },
+      copyToWorktree: [".agents"],
+    });
+
+    try {
+      const implementation = await sandbox.run({
+        name: `issue-${issue.number}-implement`,
+        agent,
+        maxIterations,
+        promptFile: "./.sandcastle/implement-prompt.md",
+        promptArgs,
+      });
+
+      if (!implementation.completionSignal) {
+        return {
+          issue: issue.number,
+          status: "incomplete",
+          detail: "implementer 未发出完成信号，分支保留但不会创建 PR",
+        };
+      }
+
+      if (implementation.commits.length === 0) {
+        return {
+          issue: issue.number,
+          status: "no-commits",
+          detail: "implementer 报告完成但没有产生 commit",
+        };
+      }
+
+      const review = await sandbox.run({
+        name: `issue-${issue.number}-review`,
+        agent,
+        maxIterations: 1,
+        promptFile: "./.sandcastle/review-prompt.md",
+        promptArgs,
+      });
+
+      if (!review.completionSignal) {
+        return {
+          issue: issue.number,
+          status: "review-incomplete",
+          detail: "reviewer 未发出完成信号，分支保留但不会创建 PR",
+        };
+      }
+    } finally {
+      const closeResult = await sandbox.close();
+      if (closeResult.preservedWorktreePath) {
+        console.warn(
+          `#${issue.number} 存在未提交修改，worktree 已保留：${closeResult.preservedWorktreePath}`,
+        );
+      }
+    }
+  } finally {
+    stagedAuth.cleanup();
+  }
+
+  const prUrl = publishPullRequest(issue, branch, baseBranch);
+  return { issue: issue.number, status: "pull-request", detail: prUrl };
+}
+
+async function main(): Promise<void> {
+  const { baseBranch, codexAuthFile, currentUser, ghToken } = assertPreconditions();
+  const localEnv = readLocalEnv();
+  const model =
+    process.env.SANDCASTLE_MODEL ||
+    localEnv.SANDCASTLE_MODEL ||
+    "gpt-5.6-sol";
+  const maxParallel = positiveInteger(
+    process.env.SANDCASTLE_MAX_PARALLEL || localEnv.SANDCASTLE_MAX_PARALLEL,
+    3,
+  );
+  const maxIterations = positiveInteger(
+    process.env.SANDCASTLE_MAX_ITERATIONS || localEnv.SANDCASTLE_MAX_ITERATIONS,
+    3,
+  );
+
+  const issues = fetchIssues();
+  const frontier = selectFrontier(issues, currentUser, maxParallel).filter(
+    (issue) => !existingPullRequest(branchForIssue(issue.number)),
+  );
+
+  if (frontier.length === 0) {
+    console.log(`没有可执行的 ${READY_LABEL} frontier ticket。`);
+    return;
+  }
+
+  console.log(
+    `本轮将在 ${baseBranch} 基础上并行处理：${frontier
+      .map((issue) => `#${issue.number}`)
+      .join(", ")}`,
+  );
+
+  const claimed: IssueRecord[] = [];
+  for (const issue of frontier) {
+    try {
+      claimIssue(issue, currentUser);
+      claimed.push(issue);
+      console.log(`已认领 #${issue.number}。`);
+    } catch (error) {
+      console.warn(`#${issue.number} 认领失败，跳过：${String(error)}`);
+    }
+  }
+
+  if (claimed.length === 0) {
+    throw new Error("本轮 frontier ticket 均未能成功认领。");
+  }
+
+  const agent = sandcastle.codex(model, {
+    effort: "high",
+    env: {
+      GH_TOKEN: ghToken,
+    },
+  });
+
+  const settled = await Promise.allSettled(
+    claimed.map((issue) =>
+      executeIssue(issue, baseBranch, codexAuthFile, agent, maxIterations),
+    ),
+  );
+
+  let failed = false;
+  for (const [index, result] of settled.entries()) {
+    const issue = claimed[index]!;
+    if (result.status === "rejected") {
+      failed = true;
+      console.error(`#${issue.number}: failed — ${String(result.reason)}`);
+      continue;
+    }
+    if (result.value.status !== "pull-request") failed = true;
+    console.log(
+      `#${issue.number}: ${result.value.status}${
+        result.value.detail ? ` — ${result.value.detail}` : ""
+      }`,
+    );
+  }
+
+  if (failed) process.exitCode = 1;
+}
+
+await main();
