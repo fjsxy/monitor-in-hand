@@ -22,7 +22,7 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(resourceKinds(objects)).To(ConsistOf(
 			"ServiceAccount",
 			"ClusterRole",
-			"RoleBinding",
+			"ClusterRoleBinding",
 			"Deployment",
 		))
 
@@ -72,8 +72,20 @@ var _ = Describe("Operator Helm chart", func() {
 		objects := renderChart()
 		role := objectByKind(objects, "ClusterRole")
 		rules := nested(role, "rules")
+		binding := objectByKind(objects, "ClusterRoleBinding")
 
 		Expect(rules).To(Equal(generatedRBACRules()))
+		Expect(nestedMap(binding, "metadata")).NotTo(HaveKey("namespace"))
+		Expect(nestedMap(binding, "roleRef")).To(SatisfyAll(
+			HaveKeyWithValue("apiGroup", "rbac.authorization.k8s.io"),
+			HaveKeyWithValue("kind", "ClusterRole"),
+			HaveKeyWithValue("name", "monitor-in-hand-manager-role"),
+		))
+		Expect(nested(binding, "subjects")).To(ConsistOf(SatisfyAll(
+			HaveKeyWithValue("kind", "ServiceAccount"),
+			HaveKeyWithValue("name", "test-release-monitor-in-hand"),
+			HaveKeyWithValue("namespace", "monitor-system"),
+		)))
 		Expect(string(mustRenderChart())).NotTo(ContainSubstring("monitoring.coreos.com"))
 	})
 
