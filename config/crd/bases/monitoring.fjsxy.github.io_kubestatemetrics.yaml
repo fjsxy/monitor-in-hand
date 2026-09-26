@@ -183,8 +183,16 @@ spec:
                 format: int64
                 type: integer
               phase:
+                description: KubeStateMetricsPhase summarizes the reconciliation state
+                  of a managed instance.
+                enum:
+                - Reconciling
+                - Ready
+                - Degraded
                 type: string
             type: object
+        required:
+        - spec
         type: object
     served: true
     storage: true

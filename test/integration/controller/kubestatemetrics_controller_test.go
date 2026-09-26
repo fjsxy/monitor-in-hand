@@ -9,7 +9,9 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/version"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -41,6 +43,21 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: name}})
 		Expect(err).NotTo(HaveOccurred())
 	}
+
+	DescribeTable("IT-KSM-005 在 admission 阶段拒绝缺少必填声明的 CR",
+		func(object map[string]any) {
+			instance := &unstructured.Unstructured{Object: object}
+			instance.SetAPIVersion("monitoring.fjsxy.github.io/v1alpha1")
+			instance.SetKind("KubeStateMetrics")
+			instance.SetName("invalid-" + suffix)
+
+			err := testClient.Create(ctx, instance)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		},
+		Entry("整个 spec 缺失", map[string]any{}),
+		Entry("spec 缺少 targetNamespace", map[string]any{"spec": map[string]any{}}),
+	)
 
 	It("IT-KSM-001 创建默认 Deployment 受管实例并从真实 workload status 报告可用性", func() {
 		namespace := "it-ksm-success-" + suffix
@@ -92,7 +109,7 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		reconcile(name, "v1.28.15")
 		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 		Expect(actual.Status.AvailablePods).To(Equal(int32(1)))
-		Expect(actual.Status.Phase).To(Equal("Ready"))
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseReady))
 		Expect(condition(actual, "Ready").Status).To(Equal(metav1.ConditionTrue))
 		Expect(condition(actual, "Progressing").Status).To(Equal(metav1.ConditionFalse))
 		Expect(condition(actual, "Degraded").Status).To(Equal(metav1.ConditionFalse))
@@ -116,7 +133,7 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 			actual := &monitoringv1alpha1.KubeStateMetrics{}
 			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 			Expect(actual.Status.ObservedGeneration).To(Equal(actual.Generation))
-			Expect(actual.Status.Phase).To(Equal("Degraded"))
+			Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseDegraded))
 			Expect(condition(actual, "Degraded").Reason).To(Equal(wantReason))
 			Expect(actual.Status.ManagedResources).To(BeEmpty())
 			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "ksm-" + name}, &appsv1.Deployment{})).To(MatchError(ContainSubstring("not found")))

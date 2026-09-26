@@ -12,6 +12,7 @@
 | `IT-KSM-002` | #51 | envtest | 1.27 拒绝、1.28 缺依赖 | observedGeneration 与稳定 reason 正确，受管身份零写入 | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-003` | #51 | envtest | API Server 1.28 | 首次成功后修改 targetNamespace 返回 `InvalidSpec`，新 Namespace 零写入 | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-004` | #51 | envtest | API Server 1.28 | 同名非受管身份返回 `ResourceConflict`；冲突对象保持原样且其余计划资源零写入 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-005` | #51 | envtest | API Server 1.28 | admission 拒绝缺少整个 `spec` 或缺少必填 `targetNamespace` 的声明 | Ginkgo failure、API error | `make test-integration` |
 | `HELM-006` | #51 | Helm/生成物 | Chart | Helm CRD 与 Kubebuilder 生成源逐字同步，并包含 cluster scope、v1alpha1 与三个 defaults | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
 | `HELM-007` | #51 | Helm/RBAC | Chart | manager 具有 CR status 与默认 Deployment 调谐权限，且不含 Prometheus Operator API 权限 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
 | `E2E-119-KSM-001` | #51 | kind E2E | Kubernetes 1.19.16 | 最小 CR 实际运行 kube-state-metrics 2.3.0；验证 Deployment/Service/RBAC/labels/owner/status | 完整集群对象、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=1.19 ...` |

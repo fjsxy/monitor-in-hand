@@ -9,6 +9,15 @@ const (
 	DeploymentModeDeployment DeploymentMode = "Deployment"
 )
 
+// KubeStateMetricsPhase summarizes the reconciliation state of a managed instance.
+type KubeStateMetricsPhase string
+
+const (
+	KubeStateMetricsPhaseReconciling KubeStateMetricsPhase = "Reconciling"
+	KubeStateMetricsPhaseReady       KubeStateMetricsPhase = "Ready"
+	KubeStateMetricsPhaseDegraded    KubeStateMetricsPhase = "Degraded"
+)
+
 // KubeStateMetricsDeploymentSpec selects the workload topology.
 type KubeStateMetricsDeploymentSpec struct {
 	// Mode is the selected workload topology.
@@ -54,7 +63,8 @@ type KubeStateMetricsStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// +optional
-	Phase string `json:"phase,omitempty"`
+	// +kubebuilder:validation:Enum=Reconciling;Ready;Degraded
+	Phase KubeStateMetricsPhase `json:"phase,omitempty"`
 	// +optional
 	// +listType=map
 	// +listMapKey=type
@@ -84,7 +94,7 @@ type KubeStateMetrics struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   KubeStateMetricsSpec   `json:"spec,omitempty"`
+	Spec   KubeStateMetricsSpec   `json:"spec"`
 	Status KubeStateMetricsStatus `json:"status,omitempty"`
 }
 

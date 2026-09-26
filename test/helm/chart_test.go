@@ -148,6 +148,7 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(nested(crd, "spec", "scope")).To(Equal("Cluster"))
 		Expect(nested(crd, "spec", "group")).To(Equal("monitoring.fjsxy.github.io"))
 		Expect(nested(crd, "spec", "versions", "0", "name")).To(Equal("v1alpha1"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "required")).To(ContainElement("spec"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "enabled", "default")).To(BeTrue())
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "suspended", "default")).To(BeFalse())
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "default", "mode")).To(Equal("Deployment"))

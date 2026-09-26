@@ -208,7 +208,7 @@ func hasManagingOwner(resource client.Object, expected metav1.OwnerReference) bo
 func (r *KubeStateMetricsReconciler) updateProblemStatus(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, problem *ksm.Problem) error {
 	before := instance.Status.DeepCopy()
 	instance.Status.ObservedGeneration = instance.Generation
-	instance.Status.Phase = "Degraded"
+	instance.Status.Phase = monitoringv1alpha1.KubeStateMetricsPhaseDegraded
 	setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, problem.Reason, problem.Message)
 	setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionFalse, problem.Reason, problem.Message)
 	setCondition(&instance.Status, instance.Generation, "Degraded", metav1.ConditionTrue, problem.Reason, problem.Message)
@@ -237,12 +237,12 @@ func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, in
 	instance.Status.AvailablePods = availablePods
 	instance.Status.ManagedResources = managedResourceReferences(plan.Resources)
 	if availablePods >= 1 {
-		instance.Status.Phase = "Ready"
+		instance.Status.Phase = monitoringv1alpha1.KubeStateMetricsPhaseReady
 		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionTrue, "ReconcileSucceeded", "受管实例已就绪")
 		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionFalse, "ReconcileSucceeded", "无需继续推进")
 		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "MinimumReplicasAvailable", "单副本 Deployment 可用")
 	} else {
-		instance.Status.Phase = "Reconciling"
+		instance.Status.Phase = monitoringv1alpha1.KubeStateMetricsPhaseReconciling
 		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, "DeploymentProgressing", "等待单副本 Deployment 可用")
 		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionTrue, "DeploymentProgressing", "等待单副本 Deployment 可用")
 		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, "MinimumReplicasUnavailable", "单副本 Deployment 尚不可用")
