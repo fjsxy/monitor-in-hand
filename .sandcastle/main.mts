@@ -2,7 +2,6 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as sandcastle from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
 import {
   branchForIssue,
@@ -10,10 +9,10 @@ import {
   selectFrontier,
   type IssueRecord,
 } from "./orchestration.mts";
+import { createIssueSandboxProvider } from "./sandbox.mts";
 
 const EXPECTED_REMOTE = "https://github.com/fjsxy/monitor-in-hand";
 const READY_LABEL = "ready-for-agent";
-const IMAGE_NAME = "sandcastle:monitor-op";
 const repoRoot = process.cwd();
 
 function command(commandName: string, args: string[]): string {
@@ -173,6 +172,7 @@ async function executeIssue(
   issue: IssueRecord,
   baseBranch: string,
   codexAuthFile: string,
+  ghToken: string,
   agent: ReturnType<typeof sandcastle.codex>,
   maxIterations: number,
 ): Promise<{ issue: number; status: string; detail?: string }> {
@@ -183,12 +183,13 @@ async function executeIssue(
   try {
     const sandbox = await sandcastle.createSandbox({
       branch,
-      sandbox: docker({ imageName: IMAGE_NAME, mounts: [stagedAuth.mount] }),
+      sandbox: createIssueSandboxProvider(ghToken, stagedAuth.mount),
       hooks: {
         sandbox: {
           onSandboxReady: [
             {
-              command: "codex login status && go mod download",
+              command:
+                "codex login status && gh auth status && go mod download",
               timeoutMs: 300_000,
             },
           ],
@@ -300,16 +301,18 @@ async function main(): Promise<void> {
     throw new Error("本轮 frontier ticket 均未能成功认领。");
   }
 
-  const agent = sandcastle.codex(model, {
-    effort: "high",
-    env: {
-      GH_TOKEN: ghToken,
-    },
-  });
+  const agent = sandcastle.codex(model, { effort: "high" });
 
   const settled = await Promise.allSettled(
     claimed.map((issue) =>
-      executeIssue(issue, baseBranch, codexAuthFile, agent, maxIterations),
+      executeIssue(
+        issue,
+        baseBranch,
+        codexAuthFile,
+        ghToken,
+        agent,
+        maxIterations,
+      ),
     ),
   );
 

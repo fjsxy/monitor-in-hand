@@ -1,14 +1,20 @@
 import { execFileSync } from "node:child_process";
 import * as sandcastle from "@ai-hero/sandcastle";
 import type { AgentProvider } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
 import { promptArgsForIssue } from "./orchestration.mts";
+import { createIssueSandboxProvider } from "./sandbox.mts";
 
 const branch = `codex/sandcastle-smoke-${process.pid}`;
 const targetBranch = execFileSync("git", ["branch", "--show-current"], {
   encoding: "utf8",
 }).trim();
+const ghToken =
+  process.env.GH_TOKEN ||
+  execFileSync("gh", ["auth", "token"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
 const stagedAuth = stageCodexAuth(
   resolveCodexAuthFile(process.env.CODEX_AUTH_FILE),
 );
@@ -40,16 +46,13 @@ function branchExists(): boolean {
 try {
   sandbox = await sandcastle.createSandbox({
     branch,
-    sandbox: docker({
-      imageName: "sandcastle:monitor-op",
-      mounts: [stagedAuth.mount],
-    }),
+    sandbox: createIssueSandboxProvider(ghToken, stagedAuth.mount),
     hooks: {
       sandbox: {
         onSandboxReady: [
           {
             command:
-              "codex login status && go version && helm version --short && codex --version",
+              "codex login status && gh auth status && go version && helm version --short && codex --version",
           },
         ],
       },
@@ -58,7 +61,7 @@ try {
   });
 
   const result = await sandbox.exec(
-    "codex login status 2>&1 && git branch --show-current && id",
+    "codex login status 2>&1 && test \"$(gh issue view 51 --json number --jq .number)\" = 51 && git branch --show-current && id",
   );
   if (result.exitCode !== 0) {
     throw new Error(result.stderr || "sandbox smoke command failed");
