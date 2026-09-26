@@ -33,6 +33,36 @@ make smoke-install
 
 `make smoke-install` 创建独立的临时 kind v1.28.15 集群，构建并加载本地镜像，验证 Deployment、leader-election Lease、`/healthz`、`/readyz`、JSON 日志和单实例安装约束，完成后删除该临时集群。传入 `KIND_NODE_IMAGE` 可验证其他目标版本。
 
+## 双版本外部测试环境
+
+一期外部测试环境通过相同 fixture 分别创建 Kubernetes `v1.19.16` 与 `v1.28.15` 独立 kind 集群。每次运行必须提供唯一、最长 32 字符的 DNS label 作为 `TEST_RUN_ID`：
+
+```bash
+make test-env-up KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119
+make test-env-verify KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119
+make test-env-down KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119
+```
+
+`test-env-up` 安装并等待以下固定基线：
+
+- Prometheus Operator 与 config-reloader `v0.83.0`
+- Prometheus `v2.55.1`
+- VictoriaMetrics Cluster `v1.152.0`
+- node-exporter `v1.12.0` 测试 target
+- blackbox-exporter `v0.28.0` Probe prober
+
+所有容器使用 multi-arch digest；Prometheus Operator 使用官方完整 `bundle.yaml`，下载后必须匹配仓库记录的 SHA-256。固定版本、digest 与 node image 位于 `test/fixtures/testenv/versions.env`。
+
+`test-env-verify` 从 Kubernetes 公共接口验证精确 server patch、Linux 节点架构与 Ready、API ready、Operator watch scope/RBAC、五类 CRD 的 served version 和所需 schema、Agent runtime RBAC、最小 `PrometheusAgent` 的 `Reconciled`/`Available` conditions、生成 StatefulSet 的固定镜像，以及 VictoriaMetrics、target 和 prober endpoints。
+
+清理前会核对 `kube-system/monitor-in-hand-test-run` 中的 test-run 身份和 Kubernetes minor；不匹配时拒绝删除。失败后先运行以下命令保存诊断，再清理：
+
+```bash
+make test-env-evidence KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119
+```
+
+证据写入 `artifacts/test-env/`。CI 的两个 matrix legs 独立并行，单个集群内的有状态步骤保持串行；失败时先上传证据，再按身份清理集群。
+
 ## Helm values
 
 Chart 只开放以下配置：

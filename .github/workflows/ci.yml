@@ -57,3 +57,47 @@ jobs:
           HELM_BIN: helm
           KIND_NODE_IMAGE: ${{ matrix.node_image }}
         run: hack/smoke-install.sh
+
+  test-environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kubernetes: "1.19"
+            kubectl: "v1.19.16"
+            run_id_suffix: "119"
+          - kubernetes: "1.28"
+            kubectl: "v1.28.15"
+            run_id_suffix: "128"
+    env:
+      KUBERNETES_VERSION: ${{ matrix.kubernetes }}
+      TEST_RUN_ID: ci-${{ github.run_id }}-${{ matrix.run_id_suffix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1.12.0
+        with:
+          install_only: true
+          version: v0.33.0
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ matrix.kubectl }}
+      - name: 创建并验收外部测试环境
+        run: |
+          make test-env-up
+          make test-env-verify
+      - name: 失败时保存测试环境证据
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: make test-env-evidence
+      - name: 上传测试环境证据
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-environment-${{ matrix.run_id_suffix }}-${{ github.run_id }}
+          path: artifacts/test-env/
+          if-no-files-found: warn
+      - name: 清理本次测试环境
+        if: ${{ always() }}
+        run: make test-env-down

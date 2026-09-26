@@ -66,14 +66,17 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test test-unit test-helm typecheck lint-chart verify-generated smoke-install
-test: manifests verify-generated generate fmt typecheck test-unit test-helm ## Run all tests.
+.PHONY: test test-unit test-helm test-testenv typecheck lint-chart verify-generated smoke-install test-env-up test-env-verify test-env-evidence test-env-down
+test: manifests verify-generated generate fmt typecheck test-unit test-helm test-testenv ## Run all tests.
 
 test-unit: ## Run control-plane unit tests.
 	go test ./internal/... ./cmd/...
 
 test-helm: ## Run Helm contract tests.
 	HELM_BIN="$(HELM)" go test ./test/helm
+
+test-testenv: ## Run the external test-environment CLI contract tests.
+	go test ./test/testenv
 
 typecheck: vet ## Compile all Go packages.
 	go build ./...
@@ -87,6 +90,18 @@ verify-generated: manifests ## Verify Helm RBAC is synchronized from Kubebuilder
 
 smoke-install: ## Run the isolated kind installation smoke test.
 	./hack/smoke-install.sh
+
+test-env-up: ## Create the pinned external test environment for one supported Kubernetes minor.
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh up
+
+test-env-verify: ## Verify the external test environment through its Kubernetes interfaces.
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh verify
+
+test-env-evidence: ## Save diagnostics for a failed external test-environment run.
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh evidence
+
+test-env-down: ## Delete the test environment only when its run identity matches.
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh down
 
 GOLANGCI_LINT = $(shell pwd)/bin/golangci-lint
 GOLANGCI_LINT_VERSION ?= v1.54.2

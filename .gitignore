@@ -28,3 +28,4 @@ Dockerfile.cross
 # Local agent and pinned development tools
 .agents/
 .tools/
+artifacts/
