@@ -78,7 +78,7 @@ while (($# > 0)); do
 done
 
 if ! command -v jq >/dev/null 2>&1; then
-  printf '%s\n' '{"level":"error","check":"tooling","status":"fail","reason":"ToolUnavailable","message":"缺少必需命令 jq","details":{}}' >&2
+  printf '%s\n' '{"level":"error","check":"tooling","status":"fail","reason":"ToolUnavailable","message":"缺少必需命令 jq","details":{}}'
   exit 1
 fi
 
@@ -86,7 +86,15 @@ if [[ -z "${agent_namespace}" || -z "${agent_service_account}" || -z "${config_n
   fail_input "--agent-namespace、--agent-service-account、--config-namespaces 和 --discovery-namespaces 均为必填参数"
 fi
 
+dns_label_regex='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
 dns_subdomain_regex='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+validate_dns_label() {
+  local value=$1 description=$2
+  if ((${#value} > 63)) || [[ ! "${value}" =~ ${dns_label_regex} ]]; then
+    fail_input "${description} 必须是合法的 Kubernetes DNS label：${value}"
+  fi
+}
+
 validate_dns_subdomain() {
   local value=$1 description=$2
   if ((${#value} > 253)) || [[ ! "${value}" =~ ${dns_subdomain_regex} ]]; then
@@ -104,13 +112,13 @@ validate_namespace_scope() {
     if [[ -z "${namespace}" || "${namespace}" == "*" ]]; then
       fail_input "${description} 必须是逗号分隔的 namespace，或单独使用 *"
     fi
-    validate_dns_subdomain "${namespace}" "${description}"
+    validate_dns_label "${namespace}" "${description}"
   done
 }
 
-validate_dns_subdomain "${agent_namespace}" "Agent namespace"
+validate_dns_label "${agent_namespace}" "Agent namespace"
 validate_dns_subdomain "${agent_service_account}" "Agent runtime ServiceAccount"
-validate_dns_subdomain "${operator_namespace}" "Prometheus Operator namespace"
+validate_dns_label "${operator_namespace}" "Prometheus Operator namespace"
 validate_dns_subdomain "${operator_deployment}" "Prometheus Operator Deployment"
 validate_namespace_scope "${config_namespaces}" "采集配置 namespace 范围"
 validate_namespace_scope "${discovery_namespaces}" "discovery namespace 范围"
@@ -142,9 +150,16 @@ if ! version_json=$(kubectl_call version --output json 2>&1); then
     "$(jq --null-input --arg error "${version_json}" '{error: $error}')"
   finish_failed
 fi
-server_major=$(jq --raw-output '.serverVersion.major // ""' <<<"${version_json}")
-server_minor=$(jq --raw-output '.serverVersion.minor // "" | sub("[^0-9].*$"; "")' <<<"${version_json}")
-server_git_version=$(jq --raw-output '.serverVersion.gitVersion // "unknown"' <<<"${version_json}")
+if ! version_fields=$(jq --raw-output --exit-status '
+    [.serverVersion.major, (.serverVersion.minor | sub("[^0-9].*$"; "")), .serverVersion.gitVersion] |
+    select(length == 3 and all(.[]; type == "string" and length > 0)) |
+    @tsv
+  ' <<<"${version_json}" 2>&1); then
+  record_failure kubernetes-version fail InvalidKubernetesVersionResponse "Kubernetes server version 响应无法解析" \
+    "$(jq --null-input --arg error "${version_fields}" '{error: $error}')"
+  finish_failed
+fi
+IFS=$'\t' read -r server_major server_minor server_git_version <<<"${version_fields}"
 minor="${server_major}.${server_minor}"
 case "${minor}" in
   1.19)
@@ -215,13 +230,23 @@ check_api_resources() {
 }
 
 check_crd_schema() {
-  local crd=$1 version=$2 paths_json=$3 response served missing
+  local crd=$1 version=$2 paths_json=$3 response version_facts served missing
   if ! response=$(kubectl_call get customresourcedefinition "${crd}" --output json 2>&1); then
     record_failure crd-schema fail CRDNotFound "CRD ${crd} 不存在或不可读" \
       "$(jq --null-input --arg crd "${crd}" --arg error "${response}" '{crd: $crd, error: $error}')"
     return
   fi
-  served=$(jq --raw-output --arg version "${version}" '[.spec.versions[]? | select(.name == $version and .served == true)] | length > 0' <<<"${response}" 2>/dev/null || printf false)
+  if ! version_facts=$(jq --compact-output --exit-status --arg version "${version}" '
+      if (.spec.versions | type) != "array" then error("spec.versions must be an array") else
+        [.spec.versions[] | select(.name == $version)] as $matches |
+        {exists: ($matches | length > 0), served: ($matches | any(.served == true))}
+      end
+    ' <<<"${response}" 2>&1); then
+    record_failure crd-schema fail InvalidCRDSchema "CRD ${crd} 响应无法解析" \
+      "$(jq --null-input --arg crd "${crd}" --arg version "${version}" --arg error "${version_facts}" '{crd: $crd, version: $version, error: $error}')"
+    return
+  fi
+  served=$(jq --raw-output '.served' <<<"${version_facts}")
   if [[ "${served}" != true ]]; then
     record_failure crd-schema fail CRDVersionNotServed "CRD ${crd} 未 served ${version}" \
       "$(jq --null-input --arg crd "${crd}" --arg version "${version}" '{crd: $crd, version: $version}')"
@@ -230,9 +255,9 @@ check_crd_schema() {
   if ! missing=$(jq --compact-output --arg version "${version}" --argjson paths "${paths_json}" '
       (.spec.versions[] | select(.name == $version and .served == true) | .schema.openAPIV3Schema) as $schema |
       [$paths[] | select(. as $path | ($schema | getpath($path | split("."))) == null)]
-    ' <<<"${response}" 2>/dev/null); then
+    ' <<<"${response}" 2>&1); then
     record_failure crd-schema fail InvalidCRDSchema "CRD ${crd} 的 ${version} schema 无法解析" \
-      "$(jq --null-input --arg crd "${crd}" --arg version "${version}" '{crd: $crd, version: $version}')"
+      "$(jq --null-input --arg crd "${crd}" --arg version "${version}" --arg error "${missing}" '{crd: $crd, version: $version, error: $error}')"
     return
   fi
   if [[ "${missing}" != '[]' ]]; then
@@ -339,8 +364,29 @@ if ! operator_json=$(kubectl_call --namespace "${operator_namespace}" get deploy
     "$(jq --null-input --arg namespace "${operator_namespace}" --arg deployment "${operator_deployment}" --arg error "${operator_json}" '{namespace: $namespace, deployment: $deployment, error: $error}')"
   operator_available=false
 else
-  operator_service_account=$(jq --raw-output '.spec.template.spec.serviceAccountName // "default"' <<<"${operator_json}")
-  operator_args=$(jq --compact-output '([.spec.template.spec.containers[]? | select(.name == "prometheus-operator") | (.args // [])][0]) // (.spec.template.spec.containers[0].args // [])' <<<"${operator_json}")
+  if ! operator_facts=$(jq --compact-output --exit-status '
+      .spec.template.spec as $pod |
+      if ($pod | type) != "object" or ($pod.containers | type) != "array" or ($pod.containers | length) == 0 then
+        error("spec.template.spec.containers must be a non-empty array")
+      else
+        ([ $pod.containers[] | select(.name == "prometheus-operator") ][0] // $pod.containers[0]) as $container |
+        ($container.args // []) as $args |
+        if ($args | type) != "array" or any($args[]; type != "string") then
+          error("Prometheus Operator container args must be an array of strings")
+        elif (($pod.serviceAccountName // "default") | type) != "string" then
+          error("serviceAccountName must be a string")
+        else
+          {serviceAccountName: ($pod.serviceAccountName // "default"), args: $args}
+        end
+      end
+    ' <<<"${operator_json}" 2>&1); then
+    record_failure operator-watch-scope fail InvalidPrometheusOperatorDeployment "Prometheus Operator Deployment 响应无法解析" \
+      "$(jq --null-input --arg namespace "${operator_namespace}" --arg deployment "${operator_deployment}" --arg error "${operator_facts}" '{namespace: $namespace, deployment: $deployment, error: $error}')"
+    operator_available=false
+  else
+    operator_service_account=$(jq --raw-output '.serviceAccountName' <<<"${operator_facts}")
+    operator_args=$(jq --compact-output '.args' <<<"${operator_facts}")
+  fi
 fi
 
 flag_values() {
@@ -452,6 +498,9 @@ if [[ "${operator_available}" == true ]]; then
     for resource in servicemonitors.monitoring.coreos.com podmonitors.monitoring.coreos.com probes.monitoring.coreos.com scrapeconfigs.monitoring.coreos.com; do
       for verb in get list watch; do check_permission operator-rbac "${operator_subject}" "${verb}" "${resource}" "${namespace}"; done
     done
+    for resource in secrets configmaps; do
+      for verb in get list watch; do check_permission operator-rbac "${operator_subject}" "${verb}" "${resource}" "${namespace}"; done
+    done
   done
 fi
 
@@ -459,15 +508,16 @@ agent_subject="system:serviceaccount:${agent_namespace}:${agent_service_account}
 scope_to_array "${discovery_namespaces}"; discovery_scope_values=("${SCOPE_VALUES[@]}")
 if [[ "${discovery_namespaces}" == "*" ]]; then discovery_scope_values=("*"); fi
 for namespace in "${discovery_scope_values[@]}"; do
-  for resource in services endpoints pods configmaps ingresses.networking.k8s.io endpointslices.discovery.k8s.io; do
+  for resource in services endpoints pods ingresses.networking.k8s.io endpointslices.discovery.k8s.io; do
     for verb in get list watch; do check_permission runtime-rbac "${agent_subject}" "${verb}" "${resource}" "${namespace}"; done
   done
+  check_permission runtime-rbac "${agent_subject}" get configmaps "${namespace}"
 done
 check_nonresource_permission runtime-rbac "${agent_subject}" get /metrics
 if ((failures > 0)); then finish_failed; fi
 
 cleanup_probe() {
-  local current current_uid current_token delete_options delete_output remaining cleanup_error deadline
+  local current current_facts current_uid current_token delete_options delete_output remaining cleanup_error deadline
   if ! current=$(kubectl_call --namespace "${agent_namespace}" get prometheusagent "${probe_name}" --ignore-not-found --output json 2>&1); then
     record_failure reconcile-cleanup fail ProbeCleanupReadFailed "无法在清理前读取临时探针 ${agent_namespace}/${probe_name}" \
       "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${probe_name}" --arg error "${current}" '{namespace: $namespace, name: $name, error: $error}')"
@@ -478,8 +528,17 @@ cleanup_probe() {
     record_failure reconcile-cleanup fail ProbeDisappeared "临时探针 ${agent_namespace}/${probe_name} 在清理前已不存在"
     return
   fi
-  current_uid=$(jq --raw-output '.metadata.uid // ""' <<<"${current}")
-  current_token=$(jq --raw-output '.metadata.annotations["monitoring.fjsxy.github.io/preflight-token"] // ""' <<<"${current}")
+  if ! current_facts=$(jq --compact-output --exit-status '
+      if type != "object" then error("probe response must be an object") else
+        {uid: (.metadata.uid // ""), token: (.metadata.annotations["monitoring.fjsxy.github.io/preflight-token"] // "")}
+      end
+    ' <<<"${current}" 2>&1); then
+    record_failure reconcile-cleanup fail InvalidProbeCleanupResponse "临时探针清理读取响应无法解析" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${probe_name}" --arg error "${current_facts}" '{namespace: $namespace, name: $name, error: $error}')"
+    return
+  fi
+  current_uid=$(jq --raw-output '.uid' <<<"${current_facts}")
+  current_token=$(jq --raw-output '.token' <<<"${current_facts}")
   if [[ "${current_token}" != "${probe_token}" || ( -n "${probe_uid}" && "${current_uid}" != "${probe_uid}" ) ]]; then
     probe_created=false
     record_failure reconcile-cleanup fail ProbeOwnershipLost "临时探针 ${agent_namespace}/${probe_name} 的 UID 或所有权 token 已变化，拒绝删除" \
@@ -503,6 +562,9 @@ cleanup_probe() {
       if [[ -z "${remaining}" ]]; then
         probe_created=false
         break
+      fi
+      if ! jq --exit-status 'type == "object"' <<<"${remaining}" >/dev/null 2>&1; then
+        cleanup_error="PrometheusAgent cleanup response is not valid JSON object"
       fi
     else
       cleanup_error=${remaining}
@@ -557,8 +619,17 @@ if ! probe_json=$(kubectl_call create --filename - --output json <<<"${probe_man
     sleep 1
   done
   if [[ -n "${recovered_probe}" ]]; then
-    recovered_token=$(jq --raw-output '.metadata.annotations["monitoring.fjsxy.github.io/preflight-token"] // ""' <<<"${recovered_probe}")
-    probe_uid=$(jq --raw-output '.metadata.uid // ""' <<<"${recovered_probe}")
+    if recovered_facts=$(jq --compact-output --exit-status '
+        if type != "object" then error("probe response must be an object") else
+          {uid: (.metadata.uid // ""), token: (.metadata.annotations["monitoring.fjsxy.github.io/preflight-token"] // "")}
+        end
+      ' <<<"${recovered_probe}" 2>&1); then
+      recovered_token=$(jq --raw-output '.token' <<<"${recovered_facts}")
+      probe_uid=$(jq --raw-output '.uid' <<<"${recovered_facts}")
+    else
+      recovered_token=
+      probe_uid=
+    fi
     if [[ "${recovered_token}" == "${probe_token}" && -n "${probe_uid}" ]]; then
       probe_created=true
       trap 'cleanup_on_exit $?' EXIT
@@ -566,7 +637,7 @@ if ! probe_json=$(kubectl_call create --filename - --output json <<<"${probe_man
       trap - EXIT
     else
       record_failure reconcile-cleanup fail ProbeOwnershipLost "创建失败后同名对象缺少预期 UID 或所有权 token，拒绝删除" \
-        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${probe_name}" --arg uid "${probe_uid}" '{namespace: $namespace, name: $name, uid: $uid}')"
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${probe_name}" --arg uid "${probe_uid}" --arg error "${recovered_facts:-}" '{namespace: $namespace, name: $name, uid: $uid, error: $error}')"
     fi
   else
     record_failure reconcile-cleanup fail ProbeCreateOutcomeUnknown "创建失败后未能在 ${timeout_seconds}s 内确定临时探针是否已在服务端创建" \
@@ -577,10 +648,20 @@ if ! probe_json=$(kubectl_call create --filename - --output json <<<"${probe_man
 fi
 probe_created=true
 trap 'cleanup_on_exit $?' EXIT
-response_name=$(jq --raw-output '.metadata.name // ""' <<<"${probe_json}")
-probe_uid=$(jq --raw-output '.metadata.uid // ""' <<<"${probe_json}")
+if create_facts=$(jq --compact-output --exit-status '
+    if type != "object" then error("probe response must be an object") else
+      {name: (.metadata.name // ""), uid: (.metadata.uid // "")}
+    end
+  ' <<<"${probe_json}" 2>&1); then
+  response_name=$(jq --raw-output '.name' <<<"${create_facts}")
+  probe_uid=$(jq --raw-output '.uid' <<<"${create_facts}")
+else
+  response_name=
+  probe_uid=
+fi
 if [[ "${response_name}" != "${probe_name}" || -z "${probe_uid}" ]]; then
-  record_failure reconcile-probe fail InvalidProbeCreateResponse "临时 PrometheusAgent 创建响应缺少或更改 name/UID"
+  record_failure reconcile-probe fail InvalidProbeCreateResponse "临时 PrometheusAgent 创建响应缺少或更改 name/UID" \
+    "$(jq --null-input --arg error "${create_facts:-}" '{error: $error}')"
   cleanup_probe
   trap - EXIT
   emit_diagnostic error summary fail PreflightFailed "部署预检失败" "$(jq --null-input --argjson failures "${failures}" '{failures: $failures}')"
@@ -590,13 +671,34 @@ probe_statefulset="prom-agent-${probe_name}"
 
 deadline=$(( $(date +%s) + timeout_seconds ))
 reconciled=false
+reconcile_response_valid=true
 last_agent='{}'
 last_statefulset='{}'
 while (( $(date +%s) <= deadline )); do
-  if agent_json=$(kubectl_call --namespace "${agent_namespace}" get prometheusagent "${probe_name}" --output json 2>/dev/null); then last_agent=${agent_json}; else agent_json='{}'; fi
-  if statefulset_json=$(kubectl_call --namespace "${agent_namespace}" get statefulset "${probe_statefulset}" --output json 2>/dev/null); then last_statefulset=${statefulset_json}; else statefulset_json='{}'; fi
-  condition_ready=$(jq --raw-output '.metadata.generation as $generation | any(.status.conditions[]?; .type == "Reconciled" and .status == "True" and .observedGeneration == $generation)' <<<"${agent_json}" 2>/dev/null || printf false)
-  statefulset_owned=$(jq --raw-output --arg uid "${probe_uid}" 'any(.metadata.ownerReferences[]?; .apiVersion == "monitoring.coreos.com/v1alpha1" and .kind == "PrometheusAgent" and .uid == $uid)' <<<"${statefulset_json}" 2>/dev/null || printf false)
+  if agent_json=$(kubectl_call --namespace "${agent_namespace}" get prometheusagent "${probe_name}" --output json 2>/dev/null); then
+    if ! jq --exit-status 'type == "object"' <<<"${agent_json}" >/dev/null 2>&1; then
+      record_failure reconcile-probe fail InvalidReconcileResponse "临时 PrometheusAgent 响应无法解析" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${probe_name}" '{namespace: $namespace, name: $name, resource: "PrometheusAgent"}')"
+      reconcile_response_valid=false
+      break
+    fi
+    last_agent=${agent_json}
+  else
+    agent_json='{}'
+  fi
+  if statefulset_json=$(kubectl_call --namespace "${agent_namespace}" get statefulset "${probe_statefulset}" --output json 2>/dev/null); then
+    if ! jq --exit-status 'type == "object"' <<<"${statefulset_json}" >/dev/null 2>&1; then
+      record_failure reconcile-probe fail InvalidReconcileResponse "临时 StatefulSet 响应无法解析" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${probe_statefulset}" '{namespace: $namespace, name: $name, resource: "StatefulSet"}')"
+      reconcile_response_valid=false
+      break
+    fi
+    last_statefulset=${statefulset_json}
+  else
+    statefulset_json='{}'
+  fi
+  condition_ready=$(jq --raw-output '.metadata.generation as $generation | any(.status.conditions[]?; .type == "Reconciled" and .status == "True" and .observedGeneration == $generation)' <<<"${agent_json}")
+  statefulset_owned=$(jq --raw-output --arg uid "${probe_uid}" 'any(.metadata.ownerReferences[]?; .apiVersion == "monitoring.coreos.com/v1alpha1" and .kind == "PrometheusAgent" and .uid == $uid)' <<<"${statefulset_json}")
   if [[ "${condition_ready}" == true && "${statefulset_owned}" == true ]]; then reconciled=true; break; fi
   sleep 2
 done
@@ -604,7 +706,7 @@ done
 if [[ "${reconciled}" == true ]]; then
   record_pass reconcile-probe pass MinimumReconcileSucceeded "Prometheus Operator 已调谐临时 PrometheusAgent 并创建由其 UID 所有的 StatefulSet" \
     "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${probe_name}" --arg uid "${probe_uid}" --arg statefulSet "${probe_statefulset}" '{namespace: $namespace, name: $name, uid: $uid, statefulSet: $statefulSet}')"
-else
+elif [[ "${reconcile_response_valid}" == true ]]; then
   record_failure reconcile-probe fail MinimumReconcileTimedOut "Prometheus Operator 未在 ${timeout_seconds}s 内完成最小 reconcile" \
     "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${probe_name}" --arg uid "${probe_uid}" --arg statefulSet "${probe_statefulset}" --argjson agent "${last_agent}" --argjson statefulSetObject "${last_statefulset}" '{namespace: $namespace, name: $name, uid: $uid, statefulSet: $statefulSet, agentStatus: ($agent.status // {}), statefulSetObserved: ($statefulSetObject.metadata.name // null)}')"
 fi

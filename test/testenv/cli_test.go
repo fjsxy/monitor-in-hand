@@ -54,6 +54,27 @@ var _ = Describe("测试依赖基线公共入口", func() {
 		))
 	})
 
+	It("部署预检以退出码 2 拒绝含点或超长的 namespace", func() {
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+
+		for _, namespace := range []string{"monitoring.invalid", strings.Repeat("a", 64)} {
+			command := exec.Command(
+				filepath.Join(root, "hack", "preflight.sh"),
+				"--agent-namespace", namespace,
+				"--agent-service-account", "agent",
+				"--config-namespaces", "monitoring",
+				"--discovery-namespaces", "monitoring",
+			)
+			output, err := command.CombinedOutput()
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.(*exec.ExitError).ExitCode()).To(Equal(2))
+			expectJSONDiagnostics(output)
+			Expect(string(output)).To(ContainSubstring(`"reason":"InvalidInput"`))
+		}
+	})
+
 	It("部署预检拒绝范围外的 server minor 且不创建探针", func() {
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
@@ -154,7 +175,11 @@ set -eu
 printf '%s\n' "$*" >>"${PREFLIGHT_CALLS}"
 case "$*" in
   "version --output json")
-    printf '%s\n' '{"serverVersion":{"major":"1","minor":"19","gitVersion":"v1.19.16"}}'
+    if [[ "${PREFLIGHT_VERSION_MALFORMED:-}" == 1 ]]; then
+      printf '%s\n' '{invalid'
+    else
+      printf '%s\n' '{"serverVersion":{"major":"1","minor":"19","gitVersion":"v1.19.16"}}'
+    fi
     ;;
   "get namespace "*" --output name")
     printf '%s\n' "namespace/${3}"
@@ -169,6 +194,10 @@ case "$*" in
     printf '%s\n' '{"resources":[{"name":"servicemonitors"},{"name":"podmonitors"},{"name":"probes"}]}'
     ;;
   "get customresourcedefinition "*" --output json")
+    if [[ "${PREFLIGHT_CRD_MALFORMED:-}" == 1 ]]; then
+      printf '%s\n' '{invalid'
+      exit 0
+    fi
     version=v1
     case "$3" in prometheusagents.*|scrapeconfigs.*) version=v1alpha1 ;; esac
     schema=$(jq --null-input --arg version "${version}" '{spec:{versions:[{name:$version,served:true,schema:{openAPIV3Schema:{properties:{spec:{properties:{
@@ -194,14 +223,24 @@ case "$*" in
     fi
     ;;
   "--namespace prometheus-operator get deployment prometheus-operator --output json")
-    if [[ "${PREFLIGHT_WATCH_RESTRICTED:-}" == 1 ]]; then
+    if [[ "${PREFLIGHT_OPERATOR_MALFORMED:-}" == 1 ]]; then
+      printf '%s\n' '{"spec":{"template":{"spec":{"containers":"invalid"}}}}'
+    elif [[ "${PREFLIGHT_WATCH_RESTRICTED:-}" == 1 ]]; then
       printf '%s\n' '{"spec":{"template":{"spec":{"serviceAccountName":"prometheus-operator","containers":[{"name":"prometheus-operator","args":["--namespaces=other"]}]}}}}'
     else
       printf '%s\n' '{"spec":{"template":{"spec":{"serviceAccountName":"prometheus-operator","containers":[{"name":"prometheus-operator","args":[]}]}}}}'
     fi
     ;;
   "auth can-i "*)
+    if [[ "$*" == *"--as system:serviceaccount:monitoring:agent"* && ( "$*" == *"list configmaps"* || "$*" == *"watch configmaps"* ) ]]; then
+      printf '%s\n' no
+      exit 1
+    fi
     if [[ "${PREFLIGHT_RBAC_DENIED:-}" == 1 && "$*" == *"watch endpointslices.discovery.k8s.io"* ]]; then
+      printf '%s\n' no
+      exit 1
+    fi
+    if [[ "${PREFLIGHT_OPERATOR_CONFIG_RBAC_DENIED:-}" == 1 && "$*" == *"get secrets --namespace configuration"* ]]; then
       printf '%s\n' no
       exit 1
     fi
@@ -270,7 +309,7 @@ esac
 			filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring",
 			"--agent-service-account", "agent",
-			"--config-namespaces", "monitoring",
+			"--config-namespaces", "configuration",
 			"--discovery-namespaces", "monitoring",
 			"--timeout-seconds", "5",
 		)
@@ -314,7 +353,7 @@ esac
 			filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring",
 			"--agent-service-account", "agent",
-			"--config-namespaces", "monitoring",
+			"--config-namespaces", "configuration",
 			"--discovery-namespaces", "monitoring",
 			"--timeout-seconds", "1",
 		)
@@ -342,7 +381,7 @@ esac
 			filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring",
 			"--agent-service-account", "agent",
-			"--config-namespaces", "monitoring",
+			"--config-namespaces", "configuration",
 			"--discovery-namespaces", "monitoring",
 			"--timeout-seconds", "1",
 		)
@@ -370,7 +409,7 @@ esac
 			filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring",
 			"--agent-service-account", "agent",
-			"--config-namespaces", "monitoring",
+			"--config-namespaces", "configuration",
 			"--discovery-namespaces", "monitoring",
 			"--timeout-seconds", "1",
 		)
@@ -411,7 +450,7 @@ esac
 				filepath.Join(root, "hack", "preflight.sh"),
 				"--agent-namespace", "monitoring",
 				"--agent-service-account", "agent",
-				"--config-namespaces", "monitoring",
+				"--config-namespaces", "configuration",
 				"--discovery-namespaces", "monitoring",
 				"--timeout-seconds", "1",
 			)
@@ -444,6 +483,10 @@ esac
 			{name: "missing nested schema", env: "PREFLIGHT_SCHEMA_MISSING", reason: "RequiredSchemaFieldMissing"},
 			{name: "restricted watch scope", env: "PREFLIGHT_WATCH_RESTRICTED", reason: "WatchScopeRestricted"},
 			{name: "denied runtime RBAC", env: "PREFLIGHT_RBAC_DENIED", reason: "RBACDenied"},
+			{name: "denied operator config RBAC", env: "PREFLIGHT_OPERATOR_CONFIG_RBAC_DENIED", reason: "RBACDenied"},
+			{name: "malformed Kubernetes version", env: "PREFLIGHT_VERSION_MALFORMED", reason: "InvalidKubernetesVersionResponse"},
+			{name: "malformed CRD", env: "PREFLIGHT_CRD_MALFORMED", reason: "InvalidCRDSchema"},
+			{name: "malformed Operator deployment", env: "PREFLIGHT_OPERATOR_MALFORMED", reason: "InvalidPrometheusOperatorDeployment"},
 		}
 		for _, tc := range negativeCases {
 			By(tc.name)
@@ -452,7 +495,7 @@ esac
 				filepath.Join(root, "hack", "preflight.sh"),
 				"--agent-namespace", "monitoring",
 				"--agent-service-account", "agent",
-				"--config-namespaces", "monitoring",
+				"--config-namespaces", "configuration",
 				"--discovery-namespaces", "monitoring",
 				"--timeout-seconds", "1",
 			)
@@ -586,7 +629,7 @@ func expectJSONDiagnostics(output []byte) []map[string]any {
 	GinkgoHelper()
 	diagnostics := []map[string]any{}
 	for _, line := range strings.Split(string(output), "\n") {
-		if !strings.HasPrefix(line, "{") {
+		if line == "" {
 			continue
 		}
 		diagnostic := map[string]any{}
