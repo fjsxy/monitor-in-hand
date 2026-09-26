@@ -1,6 +1,10 @@
 package kubestatemetrics_test
 
 import (
+	"os"
+	"path/filepath"
+	"slices"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
@@ -8,6 +12,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/yaml"
 
 	monitoringv1alpha1 "github.com/fjsxy/monitor-in-hand/api/v1alpha1"
 	ksm "github.com/fjsxy/monitor-in-hand/internal/kubestatemetrics"
@@ -169,4 +174,40 @@ var _ = Describe("默认 Deployment 规划", func() {
 			HaveField("Message", ContainSubstring("previous")),
 		))
 	})
+
+	It("UT-KSM-005 Operator RBAC 覆盖两个 profile 下放的全部权限", func() {
+		manifest, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", "role.yaml"))
+		Expect(err).NotTo(HaveOccurred())
+		managerRole := &rbacv1.ClusterRole{}
+		Expect(yaml.Unmarshal(manifest, managerRole)).To(Succeed())
+
+		for _, version := range []string{"v1.19.16", "v1.28.15"} {
+			plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
+				KubernetesVersion:     version,
+				TargetNamespaceExists: true,
+			})
+			Expect(problem).To(BeNil())
+			for _, delegated := range plan.Profile.Rules {
+				for _, apiGroup := range delegated.APIGroups {
+					for _, resource := range delegated.Resources {
+						for _, verb := range delegated.Verbs {
+							Expect(policyRulesAllow(managerRole.Rules, apiGroup, resource, verb)).To(
+								BeTrue(), "Operator RBAC 未覆盖 Kubernetes %s 下放权限 %s %s/%s", version, verb, apiGroup, resource)
+						}
+					}
+				}
+			}
+		}
+	})
 })
+
+func policyRulesAllow(rules []rbacv1.PolicyRule, apiGroup, resource, verb string) bool {
+	for _, rule := range rules {
+		if (slices.Contains(rule.APIGroups, apiGroup) || slices.Contains(rule.APIGroups, "*")) &&
+			(slices.Contains(rule.Resources, resource) || slices.Contains(rule.Resources, "*")) &&
+			(slices.Contains(rule.Verbs, verb) || slices.Contains(rule.Verbs, "*")) {
+			return true
+		}
+	}
+	return false
+}
