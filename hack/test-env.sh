@@ -380,11 +380,24 @@ capture_evidence() {
   "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
     get prometheusagent,servicemonitor,podmonitor,probe,scrapeconfig --output yaml \
     >"${evidence_dir}/monitoring-resources.yaml" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" get kubestatemetrics --output yaml \
+    >"${evidence_dir}/kubestatemetrics.yaml" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" --namespace monitor-in-hand-system get all,lease --output yaml \
+    >"${evidence_dir}/monitor-in-hand-system.yaml" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" get clusterrole,clusterrolebinding \
+    --selector app.kubernetes.io/managed-by=monitor-in-hand --output yaml \
+    >"${evidence_dir}/managed-cluster-rbac.yaml" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" get \
+    deployment,service,serviceaccount --selector app.kubernetes.io/managed-by=monitor-in-hand --output yaml \
+    >"${evidence_dir}/managed-kubestatemetrics-resources.yaml" 2>&1 || true
 
   for deployment in prometheus-operator; do
     "${kubectl_bin}" --context "${context}" --namespace "${operator_namespace}" \
       logs "deployment/${deployment}" --all-containers >"${evidence_dir}/${deployment}.log" 2>&1 || true
   done
+  "${kubectl_bin}" --context "${context}" --namespace monitor-in-hand-system \
+    logs deployment/monitor-in-hand-monitor-in-hand --all-containers \
+    >"${evidence_dir}/monitor-in-hand.log" 2>&1 || true
   for deployment in metrics-target blackbox-exporter vminsert vmselect; do
     "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
       logs "deployment/${deployment}" --all-containers >"${evidence_dir}/${deployment}.log" 2>&1 || true
@@ -392,7 +405,7 @@ capture_evidence() {
   for pod in $("${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
     get pods --output 'jsonpath={.items[*].metadata.name}' 2>/dev/null); do
     case "${pod}" in
-      vmstorage-* | prom-agent-*)
+      vmstorage-* | prom-agent-* | ksm-*)
         "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
           logs "pod/${pod}" --all-containers >"${evidence_dir}/${pod}.log" 2>&1 || true
         ;;

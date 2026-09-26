@@ -51,8 +51,12 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=monitor-in-hand-manager-role paths="./..." output:rbac:artifacts:config=config/rbac
+	$(CONTROLLER_GEN) rbac:roleName=monitor-in-hand-manager-role crd paths="./..." \
+		output:rbac:artifacts:config=config/rbac \
+		output:crd:artifacts:config=config/crd/bases
+	mkdir -p charts/monitor-in-hand/crds
 	cp config/rbac/role.yaml charts/monitor-in-hand/generated/manager-role.yaml
+	cp config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml charts/monitor-in-hand/crds/
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -66,11 +70,14 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test test-unit test-helm test-testenv typecheck lint-chart verify-generated smoke-install test-env-up test-env-verify test-env-evidence test-env-down
-test: manifests verify-generated generate fmt typecheck test-unit test-helm test-testenv ## Run all tests.
+.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
+test: manifests verify-generated generate fmt typecheck test-unit test-integration test-helm test-testenv ## Run all tests.
 
 test-unit: ## Run control-plane unit tests.
 	go test ./internal/... ./cmd/...
+
+test-integration: envtest manifests ## Run controller integration tests against a real API server.
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./test/integration/...
 
 test-helm: ## Run Helm contract tests.
 	HELM_BIN="$(HELM)" go test ./test/helm
@@ -86,10 +93,14 @@ lint-chart: ## Lint the supported Helm installation artifact.
 
 verify-generated: manifests ## Verify Helm RBAC is synchronized from Kubebuilder markers.
 	cmp config/rbac/role.yaml charts/monitor-in-hand/generated/manager-role.yaml
-	git diff --exit-code -- config/rbac/role.yaml charts/monitor-in-hand/generated/manager-role.yaml
+	cmp config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml charts/monitor-in-hand/crds/monitoring.fjsxy.github.io_kubestatemetrics.yaml
+	git diff --exit-code -- config/rbac/role.yaml config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml charts/monitor-in-hand/generated/manager-role.yaml charts/monitor-in-hand/crds/monitoring.fjsxy.github.io_kubestatemetrics.yaml
 
 smoke-install: ## Run the isolated kind installation smoke test.
 	./hack/smoke-install.sh
+
+e2e-default-deployment: ## Verify the default managed KubeStateMetrics Deployment in an existing test environment.
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" ./hack/e2e-default-deployment.sh
 
 test-env-up: ## Create the pinned external test environment for one supported Kubernetes minor.
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh up
@@ -189,6 +200,7 @@ ENVTEST ?= $(LOCALBIN)/setup-envtest
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.2.1
 CONTROLLER_TOOLS_VERSION ?= v0.16.5
+ENVTEST_VERSION ?= release-0.16
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary. If wrong version is installed, it will be removed before downloading.
@@ -208,4 +220,4 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
 $(ENVTEST): $(LOCALBIN)
-	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION)

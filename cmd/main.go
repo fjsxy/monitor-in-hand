@@ -21,6 +21,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	monitoringv1alpha1 "github.com/fjsxy/monitor-in-hand/api/v1alpha1"
+	ksmcontroller "github.com/fjsxy/monitor-in-hand/internal/controller"
 	operatorruntime "github.com/fjsxy/monitor-in-hand/internal/operator"
 	// +kubebuilder:scaffold:imports
 )
@@ -35,6 +37,7 @@ type cliOptions struct {
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(monitoringv1alpha1.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -106,6 +109,12 @@ func run(ctx context.Context, healthProbeBindAddress, logLevelText string) error
 	apiDiscovery, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
 		return fmt.Errorf("创建 Kubernetes discovery client: %w", err)
+	}
+	if err := (&ksmcontroller.KubeStateMetricsReconciler{
+		Client:        mgr.GetClient(),
+		ServerVersion: apiDiscovery,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("注册 KubeStateMetrics controller: %w", err)
 	}
 	participation := operatorruntime.NewParticipationState()
 	if err := mgr.Add(participation); err != nil {

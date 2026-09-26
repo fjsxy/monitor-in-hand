@@ -46,11 +46,19 @@ var _ = Describe("双版本一期验收门禁", func() {
 			HaveKeyWithValue("with", HaveKeyWithValue("version", "${{ matrix.kubectl }}")),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("uses", "azure/setup-helm@v4"),
+			HaveKeyWithValue("with", HaveKeyWithValue("version", "v3.22.0")),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "创建并验收外部测试环境"),
 			HaveKeyWithValue("run", And(
 				ContainSubstring("make test-env-up"),
 				ContainSubstring("make test-env-verify"),
 			)),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("name", "E2E 默认 KubeStateMetrics Deployment"),
+			HaveKeyWithValue("run", ContainSubstring("make e2e-default-deployment")),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "失败时保存测试环境证据"),

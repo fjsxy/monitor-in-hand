@@ -2,6 +2,7 @@ package helm_test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -132,6 +133,42 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(nested(podSpec, "topologySpreadConstraints")).To(HaveLen(1))
 		Expect(nested(firstContainer(deployment), "resources", "requests", "cpu")).To(Equal("50m"))
 	})
+
+	It("HELM-006 携带与生成源同步的 KubeStateMetrics CRD", func() {
+		root := repositoryRoot()
+		generatedPath := filepath.Join(root, "config", "crd", "bases", "monitoring.fjsxy.github.io_kubestatemetrics.yaml")
+		chartPath := filepath.Join(root, "charts", "monitor-in-hand", "crds", "monitoring.fjsxy.github.io_kubestatemetrics.yaml")
+		generated, err := os.ReadFile(generatedPath)
+		Expect(err).NotTo(HaveOccurred())
+		chartCRD, err := os.ReadFile(chartPath)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chartCRD).To(Equal(generated))
+
+		crd := decodeYAMLFile(chartPath)
+		Expect(nested(crd, "spec", "scope")).To(Equal("Cluster"))
+		Expect(nested(crd, "spec", "group")).To(Equal("monitoring.fjsxy.github.io"))
+		Expect(nested(crd, "spec", "versions", "0", "name")).To(Equal("v1alpha1"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "enabled", "default")).To(BeTrue())
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "suspended", "default")).To(BeFalse())
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "default", "mode")).To(Equal("Deployment"))
+	})
+
+	It("HELM-007 只授予默认 Deployment 调谐所需业务权限", func() {
+		role := objectByKind(renderChart(), "ClusterRole")
+		rules := nested(role, "rules").([]any)
+
+		Expect(rules).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("apiGroups", ConsistOf("monitoring.fjsxy.github.io")),
+			HaveKeyWithValue("resources", ConsistOf("kubestatemetrics/status")),
+			HaveKeyWithValue("verbs", ConsistOf("get", "patch", "update")),
+		)))
+		Expect(rules).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("apiGroups", ConsistOf("apps")),
+			HaveKeyWithValue("resources", ConsistOf("deployments")),
+			HaveKeyWithValue("verbs", ConsistOf("create", "get", "list", "patch", "update", "watch")),
+		)))
+		Expect(string(mustRenderChart())).NotTo(ContainSubstring("monitoring.coreos.com"))
+	})
 })
 
 func renderChart(extraArgs ...string) []*unstructured.Unstructured {
@@ -213,9 +250,23 @@ func objectByKind(objects []*unstructured.Unstructured, kind string) map[string]
 }
 
 func nested(object map[string]any, fields ...string) any {
-	value, found, err := unstructured.NestedFieldNoCopy(object, fields...)
-	Expect(err).NotTo(HaveOccurred())
-	Expect(found).To(BeTrue(), "missing field %v", fields)
+	var value any = object
+	for _, field := range fields {
+		switch typed := value.(type) {
+		case map[string]any:
+			var found bool
+			value, found = typed[field]
+			Expect(found).To(BeTrue(), "missing field %v", fields)
+		case []any:
+			index := 0
+			_, err := fmt.Sscanf(field, "%d", &index)
+			Expect(err).NotTo(HaveOccurred(), "field %q is not a list index", field)
+			Expect(index).To(BeNumerically("<", len(typed)), "missing field %v", fields)
+			value = typed[index]
+		default:
+			Fail("cannot descend into field " + field)
+		}
+	}
 	return value
 }
 
