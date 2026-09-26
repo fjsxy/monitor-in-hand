@@ -49,6 +49,10 @@ var _ = Describe("双版本一期验收门禁", func() {
 			HaveKeyWithValue("name", "创建并验收外部测试环境"),
 			HaveKeyWithValue("run", And(
 				ContainSubstring("make test-env-up"),
+				ContainSubstring("make preflight"),
+				ContainSubstring("AGENT_SERVICE_ACCOUNT=prometheus-agent"),
+				ContainSubstring("AGENT_SERVICE_ACCOUNT=missing-preflight-sa"),
+				ContainSubstring(`"reason":"RuntimeServiceAccountNotFound"`),
 				ContainSubstring("make test-env-verify"),
 			)),
 		)))

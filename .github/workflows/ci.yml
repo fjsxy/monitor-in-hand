@@ -86,6 +86,26 @@ jobs:
       - name: 创建并验收外部测试环境
         run: |
           make test-env-up
+          make preflight \
+            AGENT_NAMESPACE=monitor-in-hand-test \
+            AGENT_SERVICE_ACCOUNT=prometheus-agent \
+            CONFIG_NAMESPACES=monitor-in-hand-test \
+            DISCOVERY_NAMESPACES=monitor-in-hand-test \
+            OPERATOR_NAMESPACE=prometheus-operator \
+            OPERATOR_DEPLOYMENT=prometheus-operator \
+            PREFLIGHT_TIMEOUT_SECONDS=180
+          if negative_output=$(make preflight \
+            AGENT_NAMESPACE=monitor-in-hand-test \
+            AGENT_SERVICE_ACCOUNT=missing-preflight-sa \
+            CONFIG_NAMESPACES=monitor-in-hand-test \
+            DISCOVERY_NAMESPACES=monitor-in-hand-test \
+            OPERATOR_NAMESPACE=prometheus-operator \
+            OPERATOR_DEPLOYMENT=prometheus-operator 2>&1); then
+            echo "缺少 runtime ServiceAccount 的预检未按预期失败" >&2
+            exit 1
+          fi
+          printf '%s\n' "${negative_output}"
+          grep -Fq '"reason":"RuntimeServiceAccountNotFound"' <<<"${negative_output}"
           make test-env-verify
       - name: 失败时保存测试环境证据
         if: ${{ failure() }}

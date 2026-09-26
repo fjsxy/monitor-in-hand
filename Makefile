@@ -66,7 +66,7 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test test-unit test-helm test-testenv typecheck lint-chart verify-generated smoke-install test-env-up test-env-verify test-env-evidence test-env-down
+.PHONY: test test-unit test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight test-env-up test-env-verify test-env-evidence test-env-down
 test: manifests verify-generated generate fmt typecheck test-unit test-helm test-testenv ## Run all tests.
 
 test-unit: ## Run control-plane unit tests.
@@ -90,6 +90,17 @@ verify-generated: manifests ## Verify Helm RBAC is synchronized from Kubebuilder
 
 smoke-install: ## Run the isolated kind installation smoke test.
 	./hack/smoke-install.sh
+
+preflight: ## Strictly qualify a cluster before creating a native PrometheusAgent.
+	./hack/preflight.sh \
+		--agent-namespace "$(AGENT_NAMESPACE)" \
+		--agent-service-account "$(AGENT_SERVICE_ACCOUNT)" \
+		--config-namespaces "$(CONFIG_NAMESPACES)" \
+		--discovery-namespaces "$(DISCOVERY_NAMESPACES)" \
+		$(if $(OPERATOR_NAMESPACE),--operator-namespace "$(OPERATOR_NAMESPACE)") \
+		$(if $(OPERATOR_DEPLOYMENT),--operator-deployment "$(OPERATOR_DEPLOYMENT)") \
+		$(if $(KUBE_CONTEXT),--context "$(KUBE_CONTEXT)") \
+		$(if $(PREFLIGHT_TIMEOUT_SECONDS),--timeout-seconds "$(PREFLIGHT_TIMEOUT_SECONDS)")
 
 test-env-up: ## Create the pinned external test environment for one supported Kubernetes minor.
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh up
