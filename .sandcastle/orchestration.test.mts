@@ -88,7 +88,8 @@ test("分支名稳定且使用项目要求的 codex 前缀", () => {
 });
 
 test("prompt 模板中的变量都有调度参数", () => {
-  const args = promptArgsForIssue(issue(51), "codex/issue-51", "main");
+  const args = promptArgsForIssue(issue(51), "codex/issue-51");
+  const builtInArgs = new Set(["SOURCE_BRANCH", "TARGET_BRANCH"]);
 
   for (const path of [
     ".sandcastle/implement-prompt.md",
@@ -104,9 +105,16 @@ test("prompt 模板中的变量都有调度参数", () => {
     ];
 
     assert.deepEqual(
-      variables.filter((variable) => !(variable in args)),
+      variables.filter(
+        (variable) => !builtInArgs.has(variable) && !(variable in args),
+      ),
       [],
       `${path} 存在未提供的模板变量`,
     );
   }
+});
+
+test("promptArgs 不覆盖 Sandcastle 内置的 TARGET_BRANCH", () => {
+  const args = promptArgsForIssue(issue(51), "codex/issue-51");
+  assert.equal("TARGET_BRANCH" in args, false);
 });

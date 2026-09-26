@@ -1,13 +1,32 @@
 import { execFileSync } from "node:child_process";
 import * as sandcastle from "@ai-hero/sandcastle";
+import type { AgentProvider } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
+import { promptArgsForIssue } from "./orchestration.mts";
 
 const branch = `codex/sandcastle-smoke-${process.pid}`;
+const targetBranch = execFileSync("git", ["branch", "--show-current"], {
+  encoding: "utf8",
+}).trim();
 const stagedAuth = stageCodexAuth(
   resolveCodexAuthFile(process.env.CODEX_AUTH_FILE),
 );
 let sandbox: Awaited<ReturnType<typeof sandcastle.createSandbox>> | undefined;
+
+const fakeAgent: AgentProvider = {
+  name: "sandcastle-smoke",
+  env: {},
+  captureSessions: false,
+  buildPrintCommand: ({ prompt }) => {
+    const expectedDiff = `git diff ${targetBranch}...${branch}`;
+    if (!prompt.includes(expectedDiff) || prompt.includes("{{TARGET_BRANCH}}")) {
+      throw new Error("Sandcastle built-in prompt arguments were not substituted");
+    }
+    return { command: "printf '%s\\n' '<promise>COMPLETE</promise>'" };
+  },
+  parseStreamLine: (line) => [{ type: "text", text: line }],
+};
 
 function branchExists(): boolean {
   try {
@@ -43,6 +62,20 @@ try {
   );
   if (result.exitCode !== 0) {
     throw new Error(result.stderr || "sandbox smoke command failed");
+  }
+
+  const run = await sandbox.run({
+    name: "prompt-argument-smoke",
+    agent: fakeAgent,
+    maxIterations: 1,
+    promptFile: "./.sandcastle/review-prompt.md",
+    promptArgs: promptArgsForIssue(
+      { number: 0, title: "Sandcastle smoke" },
+      branch,
+    ),
+  });
+  if (!run.completionSignal) {
+    throw new Error("Sandcastle prompt argument smoke did not complete");
   }
 
   process.stdout.write(result.stdout);

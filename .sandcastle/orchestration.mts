@@ -70,12 +70,10 @@ export function branchForIssue(issueNumber: number): string {
 export function promptArgsForIssue(
   issue: Pick<IssueRecord, "number" | "title">,
   branch: string,
-  targetBranch: string,
 ): Record<string, string> {
   return {
     TASK_ID: String(issue.number),
     ISSUE_TITLE: issue.title,
     BRANCH: branch,
-    TARGET_BRANCH: targetBranch,
   };
 }

@@ -177,7 +177,7 @@ async function executeIssue(
   maxIterations: number,
 ): Promise<{ issue: number; status: string; detail?: string }> {
   const branch = branchForIssue(issue.number);
-  const promptArgs = promptArgsForIssue(issue, branch, baseBranch);
+  const promptArgs = promptArgsForIssue(issue, branch);
   const stagedAuth = stageCodexAuth(codexAuthFile);
 
   try {
