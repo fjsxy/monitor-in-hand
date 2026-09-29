@@ -125,6 +125,8 @@ var _ = Describe("原生 PrometheusAgent 采集配置", Serial, func() {
 				actualJobs := gh59JobNames(parsePrometheusConfig(generated))
 				expectedJobs := expectedSelectorJobs(selectorType.jobPrefix, selectorType.name, namespaceState)
 				Expect(actualJobs).To(ConsistOf(expectedJobs))
+
+				By(fmt.Sprintf("%s 清理 %s/%s 临时 Agent", scenarioID, selectorType.name, namespaceState))
 				deleteResource(ctx, "prometheusagent", agentName, testNamespace)
 			}
 		}
@@ -399,10 +401,13 @@ spec:
 
 func waitForAgentAPIs(ctx context.Context, requiredJobs []string) agentAPIResults {
 	GinkgoHelper()
+	// 先建立只在当前场景存活的端口转发，使两个原生 Agent API 共享同一观察窗口。
 	port, stop := startPortForward(ctx)
 	DeferCleanup(stop)
 	client := &http.Client{Timeout: 5 * time.Second}
 	var body string
+
+	// 等待每个预期 scrape pool 都产生真实 up target，并保留完整响应作为失败证据。
 	Eventually(func(g Gomega) {
 		response, err := client.Get("http://127.0.0.1:" + strconv.Itoa(port) + "/api/v1/targets")
 		g.Expect(err).NotTo(HaveOccurred())
@@ -423,6 +428,8 @@ func waitForAgentAPIs(ctx context.Context, requiredJobs []string) agentAPIResult
 		}
 	}, 5*time.Minute, 3*time.Second).Should(Succeed())
 	var statusConfig string
+
+	// targets 收敛后读取运行时已加载配置，避免只依赖 Operator 生成的 Secret 判断成功。
 	Eventually(func(g Gomega) {
 		response, err := client.Get("http://127.0.0.1:" + strconv.Itoa(port) + "/api/v1/status/config")
 		g.Expect(err).NotTo(HaveOccurred())
@@ -438,6 +445,7 @@ func waitForAgentAPIs(ctx context.Context, requiredJobs []string) agentAPIResult
 
 func startPortForward(ctx context.Context) (int, func()) {
 	GinkgoHelper()
+	// 启动 kubectl 子进程并同时接收 stdout/stderr，因为不同 kubectl 版本的监听提示流不同。
 	command := exec.CommandContext(ctx, "kubectl", "--context", config.kubeContext, "--namespace", testNamespace,
 		"port-forward", "pod/prom-agent-fixture-0", "0:9090")
 	stdout, err := command.StdoutPipe()
@@ -446,6 +454,8 @@ func startPortForward(ctx context.Context) (int, func()) {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(command.Start()).To(Succeed())
 	lines := make(chan string, 8)
+
+	// 并发汇聚两条输出流，直到取得 kubectl 动态分配的本地 IPv4 端口。
 	readLines := func(reader io.Reader) {
 		scanner := bufio.NewScanner(reader)
 		for scanner.Scan() {
@@ -467,6 +477,8 @@ func startPortForward(ctx context.Context) (int, func()) {
 		port = value
 		return value > 0
 	}))))
+
+	// 把子进程终止与回收封装成场景清理函数，防止残留端口转发影响后续断言。
 	return port, func() {
 		if command.Process != nil {
 			_ = command.Process.Kill()
