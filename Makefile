@@ -72,7 +72,7 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-kubestatemetrics e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
+.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-collection e2e-kubestatemetrics e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
 test: manifests verify-generated generate fmt typecheck test-unit test-integration test-helm test-testenv ## Run all tests.
 
 test-unit: ## Run control-plane unit tests.
@@ -107,6 +107,8 @@ preflight: ## Strictly qualify a cluster before creating a native PrometheusAgen
 		--agent-service-account "$(AGENT_SERVICE_ACCOUNT)" \
 		--config-namespaces "$(CONFIG_NAMESPACES)" \
 		--discovery-namespaces "$(DISCOVERY_NAMESPACES)" \
+		$(if $(AGENT_MANIFEST),--agent-manifest "$(AGENT_MANIFEST)") \
+		$(if $(COLLECTION_CONFIG_MANIFEST),--collection-config-manifest "$(COLLECTION_CONFIG_MANIFEST)") \
 		$(if $(OPERATOR_NAMESPACE),--operator-namespace "$(OPERATOR_NAMESPACE)") \
 		$(if $(OPERATOR_DEPLOYMENT),--operator-deployment "$(OPERATOR_DEPLOYMENT)") \
 		$(if $(KUBE_CONTEXT),--context "$(KUBE_CONTEXT)") \
@@ -118,6 +120,13 @@ e2e-preflight: ## Verify strict deployment preflight against the current pinned 
 		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=20m \
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/preflight" \
 		./test/e2e/preflight
+
+e2e-collection: ## Verify native PrometheusAgent collection selection and targets.
+	mkdir -p "$(E2E_REPORT_DIR)/collection"
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" \
+		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=25m \
+		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/collection" \
+		./test/e2e/collection
 
 e2e-kubestatemetrics: ## Verify KubeStateMetrics deployment modes against real managed workloads.
 	mkdir -p "$(E2E_REPORT_DIR)/kubestatemetrics"

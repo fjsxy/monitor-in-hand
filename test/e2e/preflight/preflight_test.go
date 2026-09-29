@@ -100,17 +100,64 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 			WithTransform(func(item diagnostic) string { return item.Reason }, Equal("PreflightFailed")),
 		)))
 	}, SpecTimeout(5*time.Minute))
+
+	It(fmt.Sprintf("[%s] 用计划 manifest 验证四类 selector、支持 discovery 与引用范围", stableScenarioID("GH59-001")), func(ctx SpecContext) {
+		scenarioID := stableScenarioID("GH59-001")
+		By(scenarioID + " 准备包含四类配置和六种 ScrapeConfig discovery 的计划")
+		manifestDir := GinkgoT().TempDir()
+		agentPath := filepath.Join(manifestDir, "agent.yaml")
+		configsPath := filepath.Join(manifestDir, "configs.yaml")
+		Expect(os.WriteFile(agentPath, []byte(plannedAgentManifest), 0o600)).To(Succeed())
+		Expect(os.WriteFile(configsPath, []byte(plannedCollectionConfigs), 0o600)).To(Succeed())
+
+		By(scenarioID + " 通过公开 Make 入口执行严格计划预检")
+		output, err := runPreflight(ctx, "prometheus-agent",
+			"AGENT_MANIFEST="+agentPath,
+			"COLLECTION_CONFIG_MANIFEST="+configsPath,
+		)
+		AddReportEntry("planned-preflight-output", output, ReportEntryVisibilityFailureOrVerbose)
+		Expect(err).NotTo(HaveOccurred(), output)
+		diagnostics := parseDiagnostics(output)
+		Expect(diagnostics).To(ContainElement(SatisfyAll(
+			WithTransform(func(item diagnostic) string { return item.Check }, Equal("collection-configuration")),
+			WithTransform(func(item diagnostic) string { return item.Reason }, Equal("CollectionConfigsSelected")),
+		)))
+		Expect(diagnostics).To(ContainElement(SatisfyAll(
+			WithTransform(func(item diagnostic) string { return item.Check }, Equal("summary")),
+			WithTransform(func(item diagnostic) string { return item.Reason }, Equal("PreflightPassed")),
+		)))
+	}, SpecTimeout(10*time.Minute))
+
+	It(fmt.Sprintf("[%s] 不把上游合法的空 object selector 报告为一期支持", stableScenarioID("GH59-002")), func(ctx SpecContext) {
+		scenarioID := stableScenarioID("GH59-002")
+		manifestPath := filepath.Join(GinkgoT().TempDir(), "agent.yaml")
+		Expect(os.WriteFile(manifestPath, []byte(emptySelectorAgentManifest), 0o600)).To(Succeed())
+
+		By(scenarioID + " 对空 object selector 执行严格计划预检")
+		output, err := runPreflight(ctx, "prometheus-agent", "AGENT_MANIFEST="+manifestPath)
+		AddReportEntry("empty-selector-preflight-output", output, ReportEntryVisibilityFailureOrVerbose)
+		Expect(err).To(HaveOccurred(), "空 object selector 不得通过一期计划预检")
+		diagnostics := parseDiagnostics(output)
+		Expect(diagnostics).To(ContainElement(SatisfyAll(
+			WithTransform(func(item diagnostic) string { return item.Check }, Equal("collection-configuration")),
+			WithTransform(func(item diagnostic) string { return item.Reason }, Equal("EmptyObjectSelectorUnsupported")),
+		)))
+	}, SpecTimeout(2*time.Minute))
 })
 
 func stableScenarioID(sequence string) string {
 	ids := map[string]map[string]string{
 		"1.19": {
-			"001": "E2E-119-PREFLIGHT-001",
-			"002": "E2E-119-PREFLIGHT-002",
+			"001":      "E2E-119-PREFLIGHT-001",
+			"002":      "E2E-119-PREFLIGHT-002",
+			"GH59-001": "E2E-119-PREFLIGHT-GH59-001",
+			"GH59-002": "E2E-119-PREFLIGHT-GH59-002",
 		},
 		"1.28": {
-			"001": "E2E-128-PREFLIGHT-001",
-			"002": "E2E-128-PREFLIGHT-002",
+			"001":      "E2E-128-PREFLIGHT-001",
+			"002":      "E2E-128-PREFLIGHT-002",
+			"GH59-001": "E2E-128-PREFLIGHT-GH59-001",
+			"GH59-002": "E2E-128-PREFLIGHT-GH59-002",
 		},
 	}
 	if versionIDs, supported := ids[os.Getenv("KUBERNETES_VERSION")]; supported {
@@ -121,22 +168,73 @@ func stableScenarioID(sequence string) string {
 	return "E2E-UNSUPPORTED-PREFLIGHT-" + sequence
 }
 
-func runPreflight(ctx context.Context, serviceAccount string) (string, error) {
+func runPreflight(ctx context.Context, serviceAccount string, extraMakeArgs ...string) (string, error) {
 	// 始终通过项目公开 Make 入口执行预检，确保 E2E 覆盖用户实际调用路径。
-	command := exec.CommandContext(ctx, "make", "preflight",
+	makeArgs := []string{"preflight",
 		"AGENT_NAMESPACE=monitor-in-hand-test",
-		"AGENT_SERVICE_ACCOUNT="+serviceAccount,
+		"AGENT_SERVICE_ACCOUNT=" + serviceAccount,
 		"CONFIG_NAMESPACES=monitor-in-hand-test",
 		"DISCOVERY_NAMESPACES=monitor-in-hand-test",
 		"OPERATOR_NAMESPACE=prometheus-operator",
 		"OPERATOR_DEPLOYMENT=prometheus-operator",
-		"KUBE_CONTEXT="+config.kubeContext,
-		"PREFLIGHT_TIMEOUT_SECONDS=180",
-	)
+		"KUBE_CONTEXT=" + config.kubeContext,
+		"PREFLIGHT_TIMEOUT_SECONDS=180"}
+	makeArgs = append(makeArgs, extraMakeArgs...)
+	command := exec.CommandContext(ctx, "make", makeArgs...)
 	command.Dir = config.repoRoot
 	output, err := command.CombinedOutput()
 	return string(output), err
 }
+
+const plannedAgentManifest = `
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata: {name: planned, namespace: monitor-in-hand-test}
+spec:
+  serviceAccountName: prometheus-agent
+  serviceMonitorSelector: {matchLabels: {monitoring.fjsxy.github.io/gh59: selected}}
+  podMonitorSelector: {matchLabels: {monitoring.fjsxy.github.io/gh59: selected}}
+  probeSelector: {matchLabels: {monitoring.fjsxy.github.io/gh59: selected}}
+  scrapeConfigSelector: {matchLabels: {monitoring.fjsxy.github.io/gh59: selected}}
+`
+
+const plannedCollectionConfigs = `
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: {name: planned, namespace: monitor-in-hand-test, labels: {monitoring.fjsxy.github.io/gh59: selected}}
+spec: {selector: {}, endpoints: [{port: metrics}]}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata: {name: planned, namespace: monitor-in-hand-test, labels: {monitoring.fjsxy.github.io/gh59: selected}}
+spec: {selector: {}, podMetricsEndpoints: [{port: metrics}]}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata: {name: planned, namespace: monitor-in-hand-test, labels: {monitoring.fjsxy.github.io/gh59: selected}}
+spec: {prober: {url: blackbox-exporter:9115}, targets: {staticConfig: {static: [http://example]}}}
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata: {name: planned, namespace: monitor-in-hand-test, labels: {monitoring.fjsxy.github.io/gh59: selected}}
+spec:
+  staticConfigs: [{targets: [metrics-target:9100]}]
+  kubernetesSDConfigs:
+    - {role: Pod}
+    - {role: Service}
+    - {role: Endpoints}
+    - {role: EndpointSlice}
+    - {role: Ingress}
+`
+
+const emptySelectorAgentManifest = `
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata: {name: planned, namespace: monitor-in-hand-test}
+spec:
+  serviceAccountName: prometheus-agent
+  serviceMonitorSelector: {}
+`
 
 func parseDiagnostics(output string) []diagnostic {
 	// Make 会回显 recipe；只将可解析的 NDJSON 行作为预检诊断记录。

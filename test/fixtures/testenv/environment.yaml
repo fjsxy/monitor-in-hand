@@ -19,8 +19,11 @@ metadata:
     app.kubernetes.io/managed-by: monitor-in-hand-test-fixture
 rules:
   - apiGroups: [""]
-    resources: ["services", "endpoints", "pods", "configmaps"]
+    resources: ["services", "endpoints", "pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
@@ -83,6 +86,7 @@ metadata:
   name: metrics-target
   namespace: monitor-in-hand-test
   labels:
+    app.kubernetes.io/name: metrics-target
     monitoring.fjsxy.github.io/test-fixture: "true"
 spec:
   selector:
@@ -91,6 +95,29 @@ spec:
     - name: metrics
       port: 9100
       targetPort: metrics
+    - name: web
+      port: 80
+      targetPort: metrics
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: metrics-target
+  namespace: monitor-in-hand-test
+  labels:
+    monitoring.fjsxy.github.io/test-fixture: "true"
+spec:
+  rules:
+    - host: metrics-target.monitor-in-hand-test.svc
+      http:
+        paths:
+          - path: /metrics
+            pathType: Exact
+            backend:
+              service:
+                name: metrics-target
+                port:
+                  name: web
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -356,6 +383,86 @@ spec:
   staticConfigs:
     - targets:
         - metrics-target.monitor-in-hand-test.svc:9100
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: fixture-pod
+  namespace: monitor-in-hand-test
+  labels:
+    monitoring.fjsxy.github.io/test-fixture: "true"
+spec:
+  kubernetesSDConfigs:
+    - role: Pod
+      namespaces:
+        names: [monitor-in-hand-test]
+      selectors:
+        - role: Pod
+          label: monitoring.fjsxy.github.io/test-fixture=true
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: fixture-service
+  namespace: monitor-in-hand-test
+  labels:
+    monitoring.fjsxy.github.io/test-fixture: "true"
+spec:
+  kubernetesSDConfigs:
+    - role: Service
+      namespaces:
+        names: [monitor-in-hand-test]
+      selectors:
+        - role: Service
+          label: monitoring.fjsxy.github.io/test-fixture=true
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: fixture-endpoints
+  namespace: monitor-in-hand-test
+  labels:
+    monitoring.fjsxy.github.io/test-fixture: "true"
+spec:
+  kubernetesSDConfigs:
+    - role: Endpoints
+      namespaces:
+        names: [monitor-in-hand-test]
+      selectors:
+        - role: Service
+          label: monitoring.fjsxy.github.io/test-fixture=true
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: fixture-endpointslice
+  namespace: monitor-in-hand-test
+  labels:
+    monitoring.fjsxy.github.io/test-fixture: "true"
+spec:
+  kubernetesSDConfigs:
+    - role: EndpointSlice
+      namespaces:
+        names: [monitor-in-hand-test]
+      selectors:
+        - role: Service
+          label: monitoring.fjsxy.github.io/test-fixture=true
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: fixture-ingress
+  namespace: monitor-in-hand-test
+  labels:
+    monitoring.fjsxy.github.io/test-fixture: "true"
+spec:
+  kubernetesSDConfigs:
+    - role: Ingress
+      namespaces:
+        names: [monitor-in-hand-test]
+      selectors:
+        - role: Ingress
+          label: monitoring.fjsxy.github.io/test-fixture=true
 ---
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: PrometheusAgent

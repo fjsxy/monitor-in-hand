@@ -6,6 +6,8 @@ agent_namespace=
 agent_service_account=
 config_namespaces=
 discovery_namespaces=
+agent_manifest=
+collection_config_manifests=()
 operator_namespace=prometheus-operator
 operator_deployment=prometheus-operator
 kube_context=
@@ -16,6 +18,9 @@ probe_created=false
 probe_name=
 probe_uid=
 probe_statefulset=
+agent_json=
+collection_configs_json='[]'
+RENDERED_MANIFESTS=
 
 emit_diagnostic() {
   local level=$1 check=$2 status=$3 reason=$4 message=$5 details='{}'
@@ -44,6 +49,8 @@ Usage: hack/preflight.sh \
   --agent-service-account NAME \
   --config-namespaces NAMESPACE[,NAMESPACE...]|* \
   --discovery-namespaces NAMESPACE[,NAMESPACE...]|* \
+  [--agent-manifest FILE] \
+  [--collection-config-manifest FILE]... \
   [--operator-namespace NAMESPACE] \
   [--operator-deployment NAME] \
   [--context KUBE_CONTEXT] \
@@ -68,6 +75,8 @@ while (($# > 0)); do
     --agent-service-account) require_option_value "$@"; agent_service_account=$2; shift 2 ;;
     --config-namespaces) require_option_value "$@"; config_namespaces=$2; shift 2 ;;
     --discovery-namespaces) require_option_value "$@"; discovery_namespaces=$2; shift 2 ;;
+    --agent-manifest) require_option_value "$@"; agent_manifest=$2; shift 2 ;;
+    --collection-config-manifest) require_option_value "$@"; collection_config_manifests+=("$2"); shift 2 ;;
     --operator-namespace) require_option_value "$@"; operator_namespace=$2; shift 2 ;;
     --operator-deployment) require_option_value "$@"; operator_deployment=$2; shift 2 ;;
     --context) require_option_value "$@"; kube_context=$2; shift 2 ;;
@@ -85,6 +94,17 @@ fi
 if [[ -z "${agent_namespace}" || -z "${agent_service_account}" || -z "${config_namespaces}" || -z "${discovery_namespaces}" ]]; then
   fail_input "--agent-namespace、--agent-service-account、--config-namespaces 和 --discovery-namespaces 均为必填参数"
 fi
+if ((${#collection_config_manifests[@]} > 0)) && [[ -z "${agent_manifest}" ]]; then
+  fail_input "--collection-config-manifest 必须与 --agent-manifest 一起使用"
+fi
+if [[ -n "${agent_manifest}" && ! -f "${agent_manifest}" ]]; then
+  fail_input "Agent manifest 不存在或不是文件：${agent_manifest}"
+fi
+for manifest in "${collection_config_manifests[@]}"; do
+  if [[ ! -f "${manifest}" ]]; then
+    fail_input "采集配置 manifest 不存在或不是文件：${manifest}"
+  fi
+done
 
 dns_label_regex='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
 dns_subdomain_regex='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
@@ -144,6 +164,107 @@ finish_failed() {
     "$(jq --null-input --argjson failures "${failures}" '{failures: $failures}')"
   exit 1
 }
+
+render_manifest_documents() {
+  local manifest=$1 rendered
+  if ! rendered=$(kubectl_call create --dry-run=client --filename "${manifest}" --output json 2>&1); then
+    record_failure collection-configuration fail ManifestUnreadable "无法读取或解析 manifest ${manifest}" \
+      "$(jq --null-input --arg manifest "${manifest}" --arg error "${rendered}" '{manifest: $manifest, error: $error}')"
+    return 1
+  fi
+  if ! RENDERED_MANIFESTS=$(jq --compact-output --slurp '
+      [ .[] | if .kind == "List" then .items[] else . end ]
+    ' <<<"${rendered}" 2>/dev/null); then
+    record_failure collection-configuration fail ManifestUnreadable "manifest ${manifest} 未渲染为有效 Kubernetes JSON 对象" \
+      "$(jq --null-input --arg manifest "${manifest}" '{manifest: $manifest}')"
+    return 1
+  fi
+}
+
+validate_collection_plan() {
+  local rendered agent_count invalid_identity empty_selectors unsupported manifest
+  [[ -n "${agent_manifest}" ]] || return 0
+
+  if ! render_manifest_documents "${agent_manifest}"; then return; fi
+  rendered=${RENDERED_MANIFESTS}
+  agent_count=$(jq '[.[] | select(.apiVersion == "monitoring.coreos.com/v1alpha1" and .kind == "PrometheusAgent")] | length' <<<"${rendered}")
+  if [[ "${agent_count}" != 1 || "$(jq 'length' <<<"${rendered}")" != 1 ]]; then
+    record_failure collection-configuration fail InvalidAgentManifest "Agent manifest 必须只包含一个 monitoring.coreos.com/v1alpha1 PrometheusAgent" \
+      "$(jq --null-input --arg manifest "${agent_manifest}" --argjson agentCount "${agent_count}" '{manifest: $manifest, agentCount: $agentCount}')"
+    return
+  fi
+  agent_json=$(jq '.[0]' <<<"${rendered}")
+  if ! invalid_identity=$(jq --exit-status --compact-output \
+      --arg namespace "${agent_namespace}" --arg serviceAccount "${agent_service_account}" '
+        select((.metadata.namespace // "default") != $namespace or (.spec.serviceAccountName // "") != $serviceAccount) |
+        {manifestNamespace: (.metadata.namespace // "default"), manifestServiceAccount: (.spec.serviceAccountName // "")}
+      ' <<<"${agent_json}"); then
+    invalid_identity=
+  fi
+  if [[ -n "${invalid_identity}" ]]; then
+    record_failure collection-configuration fail AgentIdentityMismatch "Agent manifest 的 namespace 或 runtime ServiceAccount 与预检输入不一致" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --arg serviceAccount "${agent_service_account}" --argjson actual "${invalid_identity}" '{expected: {namespace: $namespace, serviceAccount: $serviceAccount}, actual: $actual}')"
+  fi
+
+  empty_selectors=$(jq --compact-output '
+      ["serviceMonitorSelector", "podMonitorSelector", "probeSelector", "scrapeConfigSelector"] as $fields |
+      [$fields[] as $field |
+        select(.spec | has($field)) |
+        select((.spec[$field] | type) == "object") |
+        select(((.spec[$field].matchLabels // {}) | length) == 0 and ((.spec[$field].matchExpressions // []) | length) == 0) |
+        $field]
+    ' <<<"${agent_json}")
+  if [[ "${empty_selectors}" != '[]' ]]; then
+    record_failure collection-configuration fail EmptyObjectSelectorUnsupported "空 object selector 是上游能力，但不属于一期支持子集" \
+      "$(jq --null-input --argjson fields "${empty_selectors}" '{fields: $fields}')"
+  elif jq --exit-status '
+      [.spec.serviceMonitorSelector, .spec.podMonitorSelector, .spec.probeSelector, .spec.scrapeConfigSelector] |
+      all(. == null)
+    ' <<<"${agent_json}" >/dev/null; then
+    record_pass collection-configuration pass ZeroCollectionConfigurationSupported "四类 object selector 均为 nil，属于合法零配置状态"
+  else
+    record_pass collection-configuration pass ExplicitObjectSelectors "计划中的非 nil object selector 均为明确的非空 LabelSelector"
+  fi
+
+  for manifest in "${collection_config_manifests[@]}"; do
+    if render_manifest_documents "${manifest}"; then
+      rendered=${RENDERED_MANIFESTS}
+      collection_configs_json=$(jq --compact-output --argjson current "${collection_configs_json}" '$current + .' <<<"${rendered}")
+    fi
+  done
+  if ((failures > 0)); then return; fi
+
+  unsupported=$(jq --compact-output '
+      def unsupported_sources:
+        ["fileSDConfigs", "httpSDConfigs", "consulSDConfigs", "dnsSDConfigs", "ec2SDConfigs",
+         "azureSDConfigs", "gceSDConfigs", "openstackSDConfigs", "digitalOceanSDConfigs",
+         "kumaSDConfigs", "eurekaSDConfigs", "dockerSDConfigs", "linodeSDConfigs",
+         "hetznerSDConfigs", "nomadSDConfigs", "dockerSwarmSDConfigs", "puppetDBSDConfigs",
+         "lightsailSDConfigs", "ovhcloudSDConfigs", "scalewaySDConfigs", "ionosSDConfigs"];
+      [ .[] |
+        select(.apiVersion == "monitoring.coreos.com/v1alpha1" and .kind == "ScrapeConfig") |
+        . as $config |
+        ([unsupported_sources[] as $field | select($config.spec | has($field)) | $field]) as $fields |
+        ([($config.spec.kubernetesSDConfigs // [])[]?.role |
+          select(. != "Pod" and . != "Service" and . != "Endpoints" and . != "EndpointSlice" and . != "Ingress")]) as $roles |
+        ([($config.spec.kubernetesSDConfigs // [])[]? |
+          select(.attachMetadata.node == true) | .role]) as $nodeMetadataRoles |
+        select(($fields | length) > 0 or ($roles | length) > 0 or ($nodeMetadataRoles | length) > 0) |
+        {namespace: (.metadata.namespace // "default"), name: .metadata.name,
+         unsupportedFields: $fields, unsupportedKubernetesRoles: $roles,
+         nodeMetadataRoles: $nodeMetadataRoles}]
+    ' <<<"${collection_configs_json}")
+  if [[ "${unsupported}" != '[]' ]]; then
+    record_failure collection-configuration fail UnsupportedScrapeConfigDiscovery "ScrapeConfig 使用了 Node、FileSD 或其他一期外 discovery" \
+      "$(jq --null-input --argjson configs "${unsupported}" '{configs: $configs, supported: ["static", "Pod", "Service", "Endpoints", "EndpointSlice", "Ingress"]}')"
+  else
+    record_pass collection-configuration pass SupportedScrapeConfigDiscovery "提供的 ScrapeConfig 仅使用一期支持的 discovery"
+  fi
+}
+
+# 先检查计划中无需访问集群即可判定的支持边界，避免无效配置触发临时 reconcile 探针。
+validate_collection_plan
+if ((failures > 0)); then finish_failed; fi
 
 # kubectl 可能把 client/server 版本偏差警告写到 stderr；只允许 stdout 进入 JSON 解析。
 version_stderr_file=$(mktemp "${TMPDIR:-/tmp}/monitor-in-hand-preflight-version.XXXXXX")
@@ -211,6 +332,131 @@ else
   record_failure runtime-service-account fail RuntimeServiceAccountNotFound "Agent runtime ServiceAccount ${agent_namespace}/${agent_service_account} 不存在或不可读" \
     "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${agent_service_account}" --arg error "${service_account_error}" '{namespace: $namespace, name: $name, error: $error}')"
 fi
+if ((failures > 0)); then finish_failed; fi
+
+validate_collection_selection() {
+  local namespaces_json report declared_scope refs_json reference namespace kind name path output
+  [[ -n "${agent_manifest}" ]] || return
+
+  if ! namespaces_json=$(kubectl_call get namespaces --output json 2>&1); then
+    record_failure collection-configuration fail NamespaceLabelsUnavailable "无法读取 Namespace labels 以解析 namespace selector" \
+      "$(jq --null-input --arg error "${namespaces_json}" '{error: $error}')"
+    return
+  fi
+  if ! jq --exit-status '(.items | type) == "array"' <<<"${namespaces_json}" >/dev/null 2>&1; then
+    record_failure collection-configuration fail NamespaceLabelsUnavailable "Namespace 列表响应无法解析"
+    return
+  fi
+
+  if [[ "${config_namespaces}" == "*" ]]; then
+    declared_scope='[]'
+  else
+    declared_scope=$(jq --compact-output --null-input --arg scope "${config_namespaces}" '$scope | split(",")')
+  fi
+  report=$(jq --compact-output --null-input \
+    --argjson agent "${agent_json}" \
+    --argjson configs "${collection_configs_json}" \
+    --argjson namespaces "${namespaces_json}" \
+    --arg configScope "${config_namespaces}" \
+    --argjson declaredScope "${declared_scope}" '
+      def selector_empty($selector):
+        (($selector.matchLabels // {}) | length) == 0 and (($selector.matchExpressions // []) | length) == 0;
+      def selector_matches($selector; $labels):
+        (($selector.matchLabels // {}) | to_entries |
+          all(. as $entry | ($labels[$entry.key] // null) == $entry.value)) and
+        (($selector.matchExpressions // []) | all(
+          . as $expression |
+          if $expression.operator == "In" then
+            (($labels[$expression.key] // null) as $value | ($expression.values // []) | index($value) != null)
+          elif $expression.operator == "NotIn" then
+            (($labels | has($expression.key)) and (($expression.values // []) | index($labels[$expression.key]) == null))
+          elif $expression.operator == "Exists" then
+            ($labels | has($expression.key))
+          elif $expression.operator == "DoesNotExist" then
+            ($labels | has($expression.key) | not)
+          else false end));
+      def fields_for_kind($kind):
+        if $kind == "ServiceMonitor" then ["serviceMonitorSelector", "serviceMonitorNamespaceSelector"]
+        elif $kind == "PodMonitor" then ["podMonitorSelector", "podMonitorNamespaceSelector"]
+        elif $kind == "Probe" then ["probeSelector", "probeNamespaceSelector"]
+        elif $kind == "ScrapeConfig" then ["scrapeConfigSelector", "scrapeConfigNamespaceSelector"]
+        else [null, null] end;
+      def namespace_labels($name):
+        ([ $namespaces.items[] | select(.metadata.name == $name) | (.metadata.labels // {}) ][0] // {});
+      def namespace_selected($selector; $namespace):
+        if $selector == null then $namespace == ($agent.metadata.namespace // "default")
+        elif selector_empty($selector) then true
+        else selector_matches($selector; namespace_labels($namespace)) end;
+      def selected_namespaces($selector):
+        if $selector == null then [($agent.metadata.namespace // "default")]
+        elif selector_empty($selector) then [$namespaces.items[].metadata.name]
+        else [$namespaces.items[] | select(selector_matches($selector; (.metadata.labels // {}))) | .metadata.name] end;
+
+      (["ServiceMonitor", "PodMonitor", "Probe", "ScrapeConfig"] |
+        map(. as $kind | fields_for_kind($kind) as $fields |
+          select($agent.spec[$fields[0]] != null) |
+          {kind: $kind, objectField: $fields[0], namespaceField: $fields[1],
+           namespaces: selected_namespaces($agent.spec[$fields[1]])})) as $enabled |
+      ([ $configs[] as $config |
+        fields_for_kind($config.kind) as $fields |
+        ($agent.spec[$fields[0]] // null) as $objectSelector |
+        ($agent.spec[$fields[1]] // null) as $namespaceSelector |
+        select($fields[0] == null or $objectSelector == null or
+          (selector_matches($objectSelector; ($config.metadata.labels // {})) | not) or
+          (namespace_selected($namespaceSelector; ($config.metadata.namespace // "default")) | not)) |
+        {apiVersion: $config.apiVersion, kind: $config.kind,
+         namespace: ($config.metadata.namespace // "default"), name: $config.metadata.name}]) as $unselected |
+      ([ $enabled[] | select(.kind as $kind | [$configs[].kind] | index($kind) == null) | .kind]) as $missingKinds |
+      ([$enabled[].namespaces[]] | unique) as $requiredNamespaces |
+      ($requiredNamespaces |
+        if $configScope == "*" then [] else map(select(. as $namespace | $declaredScope | index($namespace) == null)) end) as $uncoveredNamespaces |
+      {unselected: $unselected, missingKinds: $missingKinds,
+       requiredNamespaces: $requiredNamespaces, uncoveredNamespaces: $uncoveredNamespaces}
+    ')
+
+  if [[ "$(jq '.unselected | length' <<<"${report}")" != 0 || "$(jq '.missingKinds | length' <<<"${report}")" != 0 ]]; then
+    record_failure collection-configuration fail CollectionConfigCoverageIncomplete "提供的采集配置没有完整对应四类独立 selector，或包含未被选中的对象" "${report}"
+  else
+    record_pass collection-configuration pass CollectionConfigsSelected "提供的四类采集配置分别被对应 object/namespace selector 选中" "${report}"
+  fi
+  if [[ "$(jq '.uncoveredNamespaces | length' <<<"${report}")" != 0 ]]; then
+    record_failure collection-configuration fail CollectionNamespaceScopeIncomplete "配置 namespace 范围未覆盖 namespace selector 的原生选择结果" "${report}"
+  else
+    record_pass collection-configuration pass CollectionNamespaceScopeCovered "配置 namespace 范围覆盖 nil、空对象或非空 namespace selector 的原生选择结果" \
+      "$(jq '{requiredNamespaces}' <<<"${report}")"
+  fi
+
+  # 所有 key selector 都按声明它的 Agent 或采集配置 namespace 解析，逐一验证实际对象可读。
+  refs_json=$(jq --compact-output --null-input --argjson agent "${agent_json}" --argjson configs "${collection_configs_json}" '
+      def key_selector_refs($document; $namespace):
+        [$document.spec | paths(objects | select((.name? | type) == "string" and (.key? | type) == "string")) as $path |
+          getpath($path) as $selector |
+          ($path | map(tostring) | join(".")) as $fieldPath |
+          {namespace: $namespace,
+           kind: (if ($fieldPath | ascii_downcase | contains("configmap")) then "configmap" else "secret" end),
+           name: $selector.name, path: $fieldPath}];
+      (key_selector_refs($agent; ($agent.metadata.namespace // "default")) +
+       [($agent.spec.secrets // [])[] | {namespace: ($agent.metadata.namespace // "default"), kind: "secret", name: ., path: "spec.secrets"}] +
+       [($agent.spec.configMaps // [])[] | {namespace: ($agent.metadata.namespace // "default"), kind: "configmap", name: ., path: "spec.configMaps"}] +
+       [$configs[] as $config | key_selector_refs($config; ($config.metadata.namespace // "default"))[]]) |
+      unique_by([.namespace, .kind, .name])
+    ')
+  while IFS= read -r reference; do
+    [[ -n "${reference}" ]] || continue
+    namespace=$(jq --raw-output '.namespace' <<<"${reference}")
+    kind=$(jq --raw-output '.kind' <<<"${reference}")
+    name=$(jq --raw-output '.name' <<<"${reference}")
+    path=$(jq --raw-output '.path' <<<"${reference}")
+    if output=$(kubectl_call --namespace "${namespace}" get "${kind}" "${name}" --output name 2>&1); then
+      record_pass collection-reference pass ReferencedAssetReadable "${kind} ${namespace}/${name} 在声明对象的 namespace 中可读" "${reference}"
+    else
+      record_failure collection-reference fail ReferencedAssetUnavailable "${kind} ${namespace}/${name} 必须存在于声明对象的同一 namespace 且可读" \
+        "$(jq --null-input --argjson reference "${reference}" --arg error "${output}" '{reference: $reference, error: $error}')"
+    fi
+  done < <(jq --compact-output '.[]' <<<"${refs_json}")
+}
+
+validate_collection_selection
 if ((failures > 0)); then finish_failed; fi
 
 check_api_resources() {
