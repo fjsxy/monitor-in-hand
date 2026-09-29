@@ -307,6 +307,62 @@ esac
 		))
 	})
 
+	It("[UT-PREFLIGHT-GH59-008] Secret/ConfigMap 存在但缺少引用 key 时预检失败", func() {
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		for _, fixture := range []struct {
+			name, reference, expectedName, expectedKey string
+			configMapExists                            bool
+		}{
+			{
+				name:         "Secret",
+				reference:    `"basicAuth":{"password":{"name":"missing-credentials","key":"password"}}`,
+				expectedName: "missing-credentials",
+				expectedKey:  "password",
+			},
+			{
+				name:            "ConfigMap",
+				reference:       `"tlsConfig":{"ca":{"configMap":{"name":"missing-ca","key":"ca.crt"}}}`,
+				expectedName:    "missing-ca",
+				expectedKey:     "ca.crt",
+				configMapExists: true,
+			},
+		} {
+			By("准备引用同 namespace " + fixture.name + " 缺失 key 的 ServiceMonitor")
+			fakeBin := GinkgoT().TempDir()
+			agentManifest := filepath.Join(fakeBin, "agent.yaml")
+			configManifest := filepath.Join(fakeBin, "config.yaml")
+			Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+			Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+			writeCollectionValidationKubectl(fakeBin,
+				`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","serviceMonitorSelector":{"matchLabels":{"mih":"selected"}}}}`,
+				`{"apiVersion":"monitoring.coreos.com/v1","kind":"ServiceMonitor","metadata":{"name":"selected","namespace":"monitoring","labels":{"mih":"selected"}},"spec":{"endpoints":[{`+fixture.reference+`}]}}`,
+				false,
+				fixture.configMapExists,
+			)
+
+			By("通过公开预检入口执行 " + fixture.name + " 引用 key 覆盖检查")
+			command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+				"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+				"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
+				"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+			)
+			command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+			output, err := command.CombinedOutput()
+
+			By("验证对象存在仍因缺少引用 key 非零退出")
+			Expect(err).To(HaveOccurred(), string(output))
+			Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
+			expectJSONDiagnostics(output)
+			Expect(string(output)).To(SatisfyAll(
+				ContainSubstring(`"reason":"ReferencedAssetKeyUnavailable"`),
+				ContainSubstring(`"namespace":"monitoring"`),
+				ContainSubstring(`"name":"`+fixture.expectedName+`"`),
+				ContainSubstring(`"key":"`+fixture.expectedKey+`"`),
+			))
+		}
+	})
+
 	It("[UT-PREFLIGHT-GH59-005] Namespace LabelSelector 的 NotIn 匹配缺少该 label 的 namespace", func() {
 		By("准备位于无 excluded label namespace 的 PodMonitor")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -370,11 +426,15 @@ esac
 	})
 })
 
-func writeCollectionValidationKubectl(fakeBin, agentJSON, configJSON string, rejectSecret bool) {
+func writeCollectionValidationKubectl(fakeBin, agentJSON, configJSON string, rejectSecret bool, configMapExists ...bool) {
 	GinkgoHelper()
 	rejectSecretValue := "0"
 	if rejectSecret {
 		rejectSecretValue = "1"
+	}
+	configMapExistsValue := "0"
+	if len(configMapExists) > 0 && configMapExists[0] {
+		configMapExistsValue = "1"
 	}
 	script := `#!/usr/bin/env bash
 set -eu
@@ -390,14 +450,18 @@ case "$*" in
   "--namespace prometheus-operator get deployment prometheus-operator --output json")
     jq --null-input --arg args "${PREFLIGHT_OPERATOR_ARGS:-}" '{spec:{template:{spec:{serviceAccountName:"prometheus-operator",containers:[{name:"prometheus-operator",args:(if $args == "" then [] else [$args] end)}]}}}}'
     ;;
-  "--namespace monitoring get secret missing-credentials --output name")
+  "--namespace monitoring get secret missing-credentials --output json")
     if [[ "${PREFLIGHT_REJECT_SECRET}" == 1 ]]; then
       printf '%s\n' 'secret not found' >&2
       exit 1
     fi
-    printf '%s\n' 'secret/missing-credentials'
+    printf '%s\n' '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"missing-credentials","namespace":"monitoring"},"data":{"username":"dXNlcg=="}}'
     ;;
-  "--namespace monitoring get configmap missing-ca --output name")
+  "--namespace monitoring get configmap missing-ca --output json")
+    if [[ "${PREFLIGHT_CONFIGMAP_EXISTS}" == 1 ]]; then
+      printf '%s\n' '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"missing-ca","namespace":"monitoring"},"data":{"other-key":"value"}}'
+      exit 0
+    fi
     printf '%s\n' 'configmap exists only in another namespace' >&2
     exit 1
     ;;
@@ -408,6 +472,7 @@ esac
 	GinkgoT().Setenv("PREFLIGHT_AGENT_JSON", agentJSON)
 	GinkgoT().Setenv("PREFLIGHT_CONFIG_JSON", configJSON)
 	GinkgoT().Setenv("PREFLIGHT_REJECT_SECRET", rejectSecretValue)
+	GinkgoT().Setenv("PREFLIGHT_CONFIGMAP_EXISTS", configMapExistsValue)
 }
 
 func readManifestObjects(path string) []map[string]any {

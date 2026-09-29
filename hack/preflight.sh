@@ -338,7 +338,7 @@ fi
 if ((failures > 0)); then finish_failed; fi
 
 validate_collection_selection() {
-  local namespaces_json report declared_scope refs_json reference namespace kind name path output
+  local namespaces_json report declared_scope refs_json reference namespace kind name key path output
   [[ -n "${agent_manifest}" ]] || return
 
   # 读取实时 Namespace labels，作为解析 nil、空对象与非空 namespace selector 的事实输入。
@@ -443,7 +443,7 @@ validate_collection_selection() {
       "$(jq '{requiredNamespaces}' <<<"${report}")"
   fi
 
-  # 所有 key selector 都按声明它的 Agent 或采集配置 namespace 解析，逐一验证实际对象可读。
+  # 所有 key selector 都按声明对象的 namespace 解析，并验证对象可读且引用 key 存在。
   refs_json=$(jq --compact-output --null-input --argjson agent "${agent_json}" --argjson configs "${collection_configs_json}" '
       def key_selector_refs($document; $namespace):
         [$document.spec | paths(objects | select((.name? | type) == "string" and (.key? | type) == "string")) as $path |
@@ -451,21 +451,26 @@ validate_collection_selection() {
           ($path | map(tostring) | join(".")) as $fieldPath |
           {namespace: $namespace,
            kind: (if ($fieldPath | ascii_downcase | contains("configmap")) then "configmap" else "secret" end),
-           name: $selector.name, path: $fieldPath}];
+           name: $selector.name, key: $selector.key, path: $fieldPath}];
       (key_selector_refs($agent; ($agent.metadata.namespace // "default")) +
-       [($agent.spec.secrets // [])[] | {namespace: ($agent.metadata.namespace // "default"), kind: "secret", name: ., path: "spec.secrets"}] +
-       [($agent.spec.configMaps // [])[] | {namespace: ($agent.metadata.namespace // "default"), kind: "configmap", name: ., path: "spec.configMaps"}] +
+       [($agent.spec.secrets // [])[] | {namespace: ($agent.metadata.namespace // "default"), kind: "secret", name: ., key: null, path: "spec.secrets"}] +
+       [($agent.spec.configMaps // [])[] | {namespace: ($agent.metadata.namespace // "default"), kind: "configmap", name: ., key: null, path: "spec.configMaps"}] +
        [$configs[] as $config | key_selector_refs($config; ($config.metadata.namespace // "default"))[]]) |
-      unique_by([.namespace, .kind, .name])
+      unique_by([.namespace, .kind, .name, .key])
     ')
   while IFS= read -r reference; do
     [[ -n "${reference}" ]] || continue
     namespace=$(jq --raw-output '.namespace' <<<"${reference}")
     kind=$(jq --raw-output '.kind' <<<"${reference}")
     name=$(jq --raw-output '.name' <<<"${reference}")
+    key=$(jq --raw-output '.key // empty' <<<"${reference}")
     path=$(jq --raw-output '.path' <<<"${reference}")
-    if output=$(kubectl_call --namespace "${namespace}" get "${kind}" "${name}" --output name 2>&1); then
-      record_pass collection-reference pass ReferencedAssetReadable "${kind} ${namespace}/${name} 在声明对象的 namespace 中可读" "${reference}"
+    if output=$(kubectl_call --namespace "${namespace}" get "${kind}" "${name}" --output json 2>&1); then
+      if [[ -n "${key}" ]] && ! jq --exit-status --arg key "${key}" '(.data // {}) | has($key)' <<<"${output}" >/dev/null 2>&1; then
+        record_failure collection-reference fail ReferencedAssetKeyUnavailable "${kind} ${namespace}/${name} 缺少引用的 key ${key}" "${reference}"
+      else
+        record_pass collection-reference pass ReferencedAssetReadable "${kind} ${namespace}/${name} 的同 namespace 引用可用" "${reference}"
+      fi
     else
       record_failure collection-reference fail ReferencedAssetUnavailable "${kind} ${namespace}/${name} 必须存在于声明对象的同一 namespace 且可读" \
         "$(jq --null-input --argjson reference "${reference}" --arg error "${output}" '{reference: $reference, error: $error}')"
