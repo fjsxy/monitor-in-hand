@@ -196,6 +196,195 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.ServiceAccount{})).To(MatchError(ContainSubstring("not found")))
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(MatchError(ContainSubstring("not found")))
 	})
+
+	It("IT-KSM-006 停用优先于无效声明并在 Disabled 后按最新声明恢复", func() {
+		By("准备一个已创建完整资源的受管实例")
+		namespace := "it-ksm-disable-" + suffix
+		name := "disable-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+
+		By("提交本会因 immutable targetNamespace 被拒绝的声明，同时停用实例")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.TargetNamespace = "missing-" + suffix
+		actual.Spec.Enabled = boolPointer(false)
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "invalid-version-that-must-not-be-read")
+
+		By("确认先报告 Disabling，且五类直接受管资源均已收到删除")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseDisabling))
+		Expect(condition(actual, "Progressing")).To(SatisfyAll(
+			HaveField("Status", metav1.ConditionTrue),
+			HaveField("Reason", "Disabling"),
+		))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(MatchError(ContainSubstring("not found")))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.Service{})).To(MatchError(ContainSubstring("not found")))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.ServiceAccount{})).To(MatchError(ContainSubstring("not found")))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRole{})).To(MatchError(ContainSubstring("not found")))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRoleBinding{})).To(MatchError(ContainSubstring("not found")))
+
+		By("再次调谐确认全部资源消失后进入 Disabled")
+		reconcile(name, "still-not-a-kubernetes-version")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseDisabled))
+		Expect(actual.Status.ManagedResources).To(BeEmpty())
+		Expect(condition(actual, "Ready")).To(SatisfyAll(HaveField("Status", metav1.ConditionFalse), HaveField("Reason", "Disabled")))
+
+		By("恢复有效的最新声明并重建完整受管资源")
+		actual.Spec.TargetNamespace = namespace
+		actual.Spec.Enabled = boolPointer(true)
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.ObservedGeneration).To(Equal(actual.Generation))
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseReconciling))
+		Expect(actual.Status.ManagedResources).To(HaveLen(5))
+	})
+
+	It("IT-KSM-007 挂起只停止 workload 并在恢复后重建 Deployment", func() {
+		By("准备一个已创建完整资源的受管实例")
+		namespace := "it-ksm-suspend-" + suffix
+		name := "suspend-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+
+		By("请求挂起并等待 workload controller 的删除得到确认")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Suspended = boolPointer(true)
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		reconcile(name, "v1.28.15")
+
+		By("验证 Deployment 消失而 Service、ServiceAccount 与 RBAC 全部保留")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(MatchError(ContainSubstring("not found")))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.Service{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.ServiceAccount{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRole{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRoleBinding{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseReady))
+		Expect(actual.Status.ManagedResources).To(HaveLen(4))
+		Expect(actual.Status.DesiredPods).To(BeZero())
+		Expect(actual.Status.AvailablePods).To(BeZero())
+		Expect(condition(actual, "Ready")).To(SatisfyAll(HaveField("Status", metav1.ConditionTrue), HaveField("Reason", "Suspended")))
+		Expect(condition(actual, "Available")).To(SatisfyAll(HaveField("Status", metav1.ConditionFalse), HaveField("Reason", "Suspended")))
+
+		By("取消挂起并按当前 generation 重建 workload controller")
+		actual.Spec.Suspended = boolPointer(false)
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.ObservedGeneration).To(Equal(actual.Generation))
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseReconciling))
+		Expect(actual.Status.ManagedResources).To(HaveLen(5))
+	})
+
+	It("IT-KSM-008 删除时由 finalizer 阻塞到全部直接受管资源消失", func() {
+		By("准备一个已创建完整资源的受管实例")
+		namespace := "it-ksm-delete-" + suffix
+		name := "delete-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+
+		By("在 workload 上设置测试 finalizer，制造一个可观察的删除阻塞")
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		deployment.Finalizers = append(deployment.Finalizers, "tests.monitor-in-hand/block-deletion")
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+
+		By("先写入无效普通字段再删除 CR，验证 deletionTimestamp 拥有最高优先级")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.TargetNamespace = "missing-" + suffix
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		Expect(testClient.Delete(ctx, actual)).To(Succeed())
+		reconcile(name, "invalid-version-that-must-not-be-read")
+
+		By("确认 CR 与 controller finalizer 保留，phase 为 Deleting，且阻塞资源仍在终止中")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.DeletionTimestamp.IsZero()).To(BeFalse())
+		Expect(actual.Finalizers).To(ContainElement("monitoring.fjsxy.github.io/kubestatemetrics-cleanup"))
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseDeleting))
+		Expect(condition(actual, "Progressing")).To(SatisfyAll(HaveField("Status", metav1.ConditionTrue), HaveField("Reason", "Deleting")))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		Expect(deployment.DeletionTimestamp.IsZero()).To(BeFalse())
+
+		By("解除受管资源阻塞并再次调谐，确认 finalizer 完成清理后 CR 消失")
+		deployment.Finalizers = nil
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+		reconcile(name, "still-invalid-and-must-not-be-read")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("IT-KSM-009 停用删除发出后重新启用会先等待旧资源全部消失", func() {
+		By("准备一个已创建完整资源的受管实例")
+		namespace := "it-ksm-interrupt-" + suffix
+		name := "interrupt-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+
+		By("用 Service finalizer 拉长停用删除窗口")
+		service := &corev1.Service{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		service.Finalizers = append(service.Finalizers, "tests.monitor-in-hand/block-disable")
+		Expect(testClient.Update(ctx, service)).To(Succeed())
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Enabled = boolPointer(false)
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "v1.28.15")
+
+		By("删除尚未完成时立刻重新启用，并确认不会与旧资源清理交错")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Enabled = boolPointer(true)
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseReconciling))
+		Expect(condition(actual, "Progressing").Reason).To(Equal("WaitingForDeletion"))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.DeletionTimestamp.IsZero()).To(BeFalse())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(MatchError(ContainSubstring("not found")))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRole{})).To(MatchError(ContainSubstring("not found")))
+
+		By("解除旧资源阻塞后，仅按最新 generation 重建完整资源")
+		service.Finalizers = nil
+		Expect(testClient.Update(ctx, service)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.ObservedGeneration).To(Equal(actual.Generation))
+		Expect(actual.Status.ManagedResources).To(HaveLen(5))
+	})
 })
 
 func condition(instance *monitoringv1alpha1.KubeStateMetrics, conditionType string) metav1.Condition {
@@ -207,3 +396,5 @@ func condition(instance *monitoringv1alpha1.KubeStateMetrics, conditionType stri
 	Fail("condition not found: " + conditionType)
 	return metav1.Condition{}
 }
+
+func boolPointer(value bool) *bool { return &value }

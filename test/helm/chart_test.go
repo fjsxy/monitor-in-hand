@@ -164,9 +164,12 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "enabled", "default")).To(BeTrue())
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "suspended", "default")).To(BeFalse())
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "default", "mode")).To(Equal("Deployment"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "status", "properties", "phase", "enum")).To(ConsistOf(
+			"Pending", "Deleting", "Disabling", "Disabled", "Reconciling", "Ready", "Degraded",
+		))
 	})
 
-	It("HELM-007 只授予默认 Deployment 调谐所需业务权限", func() {
+	It("HELM-007 只授予默认 Deployment 与生命周期调谐所需业务权限", func() {
 		role := objectByKind(renderChart(), "ClusterRole")
 		rules := nested(role, "rules").([]any)
 
@@ -176,9 +179,24 @@ var _ = Describe("Operator Helm chart", func() {
 			HaveKeyWithValue("verbs", ConsistOf("get", "patch", "update")),
 		)))
 		Expect(rules).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("apiGroups", ConsistOf("monitoring.fjsxy.github.io")),
+			HaveKeyWithValue("resources", ConsistOf("kubestatemetrics/finalizers")),
+			HaveKeyWithValue("verbs", ConsistOf("update")),
+		)))
+		Expect(rules).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("apiGroups", ConsistOf("apps")),
 			HaveKeyWithValue("resources", ConsistOf("deployments")),
-			HaveKeyWithValue("verbs", ConsistOf("create", "get", "list", "patch", "update", "watch")),
+			HaveKeyWithValue("verbs", ConsistOf("create", "delete", "get", "list", "patch", "update", "watch")),
+		)))
+		Expect(rules).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("apiGroups", ConsistOf("")),
+			HaveKeyWithValue("resources", ConsistOf("serviceaccounts", "services")),
+			HaveKeyWithValue("verbs", ConsistOf("create", "delete", "get", "list", "patch", "update", "watch")),
+		)))
+		Expect(rules).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("apiGroups", ConsistOf("rbac.authorization.k8s.io")),
+			HaveKeyWithValue("resources", ConsistOf("clusterrolebindings", "clusterroles")),
+			HaveKeyWithValue("verbs", ConsistOf("create", "delete", "get", "list", "patch", "update", "watch")),
 		)))
 		Expect(string(mustRenderChart())).NotTo(ContainSubstring("monitoring.coreos.com"))
 	})

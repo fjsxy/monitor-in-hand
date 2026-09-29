@@ -13,6 +13,10 @@ const (
 type KubeStateMetricsPhase string
 
 const (
+	KubeStateMetricsPhasePending     KubeStateMetricsPhase = "Pending"
+	KubeStateMetricsPhaseDeleting    KubeStateMetricsPhase = "Deleting"
+	KubeStateMetricsPhaseDisabling   KubeStateMetricsPhase = "Disabling"
+	KubeStateMetricsPhaseDisabled    KubeStateMetricsPhase = "Disabled"
 	KubeStateMetricsPhaseReconciling KubeStateMetricsPhase = "Reconciling"
 	KubeStateMetricsPhaseReady       KubeStateMetricsPhase = "Ready"
 	KubeStateMetricsPhaseDegraded    KubeStateMetricsPhase = "Degraded"
@@ -33,12 +37,12 @@ type KubeStateMetricsSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	TargetNamespace string `json:"targetNamespace"`
 
-	// Enabled defaults to true. Full disable lifecycle behavior is delivered separately.
+	// Enabled controls whether directly managed resources exist and defaults to true.
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
 
-	// Suspended defaults to false. Full suspend lifecycle behavior is delivered separately.
+	// Suspended stops the workload while retaining its Service, ServiceAccount, and RBAC.
 	// +kubebuilder:default=false
 	// +optional
 	Suspended *bool `json:"suspended,omitempty"`
@@ -63,7 +67,7 @@ type KubeStateMetricsStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// +optional
-	// +kubebuilder:validation:Enum=Reconciling;Ready;Degraded
+	// +kubebuilder:validation:Enum=Pending;Deleting;Disabling;Disabled;Reconciling;Ready;Degraded
 	Phase KubeStateMetricsPhase `json:"phase,omitempty"`
 	// +optional
 	// +listType=map

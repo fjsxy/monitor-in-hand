@@ -93,9 +93,14 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 	}
 
 	instanceID := stableInstanceID(instance.Name)
-	name := "ksm-" + instanceID
+	name := ManagedResourceName(instance.Name)
 	resources := deploymentResources(instance, profile, instanceID, name)
 	return &ResourcePlan{Profile: profile, InstanceID: instanceID, Name: name, Resources: resources}, nil
+}
+
+// ManagedResourceName returns the stable shared name of an instance's directly managed resources.
+func ManagedResourceName(instanceName string) string {
+	return "ksm-" + stableInstanceID(instanceName)
 }
 
 func profileFor(gitVersion string) (Profile, *Problem) {
