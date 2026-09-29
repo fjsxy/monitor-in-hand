@@ -27,7 +27,12 @@ function snapshot(headRefOid: string) {
 
 test("GitHub CI repair 锁定失败 head，运行 agent，带 lease 推送并回读新 head", async () => {
   const events: string[] = [];
-  const snapshots = [snapshot("failed-head"), snapshot("failed-head"), snapshot("repaired-head")];
+  const snapshots = [
+    snapshot("failed-head"),
+    snapshot("failed-head"),
+    snapshot("failed-head"),
+    snapshot("repaired-head"),
+  ];
   const operations = createGitHubMergeOperations(
     {
       baseBranch: "main",
@@ -65,6 +70,9 @@ test("GitHub CI repair 锁定失败 head，运行 agent，带 lease 推送并回
       pushRepairedBranch(pr, expectedHeadOid) {
         events.push(`push:${pr.branch}:${expectedHeadOid}`);
       },
+      async delayBeforeRefetch() {
+        events.push("delay");
+      },
     },
   );
 
@@ -81,6 +89,8 @@ test("GitHub CI repair 锁定失败 head，运行 agent，带 lease 推送并回
     "agent:1:failed-head",
     "fetch",
     "push:codex/issue-56:failed-head",
+    "fetch",
+    "delay",
     "fetch",
   ]);
 });

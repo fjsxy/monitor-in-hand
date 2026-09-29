@@ -82,7 +82,10 @@ export interface CIRepairDependencies {
     pr: ReviewedPullRequest,
     expectedHeadOid: string,
   ): void;
+  delayBeforeRefetch(): Promise<void>;
 }
+
+const REPAIR_PUSH_VISIBILITY_ATTEMPTS = 30;
 
 function fetchPullRequest(number: number): PullRequestSnapshot {
   return JSON.parse(
@@ -414,6 +417,7 @@ export function createGitHubMergeOperations(
         `${pr.branch}:refs/heads/${pr.branch}`,
       ]);
     },
+    delayBeforeRefetch: () => delay(1_000),
   };
 
   return {
@@ -454,13 +458,32 @@ export function createGitHubMergeOperations(
       assertFailedHeadUnchanged();
       repairDependencies.pushRepairedBranch(pr, failure.headOid);
 
-      const published = repairDependencies.fetchPullRequest(pr.number);
-      if (
-        published.state !== "OPEN" ||
-        published.headRefOid !== result.repairedHeadOid ||
-        published.headRefOid === failure.headOid
+      let published: PullRequestSnapshot | undefined;
+      for (
+        let visibilityAttempt = 1;
+        visibilityAttempt <= REPAIR_PUSH_VISIBILITY_ATTEMPTS;
+        visibilityAttempt += 1
       ) {
-        throw new Error(`PR #${pr.number} repair 推送后 head 回读不一致。`);
+        const snapshot = repairDependencies.fetchPullRequest(pr.number);
+        if (
+          snapshot.state === "OPEN" &&
+          snapshot.headRefOid === result.repairedHeadOid
+        ) {
+          published = snapshot;
+          break;
+        }
+        if (
+          snapshot.state !== "OPEN" ||
+          snapshot.headRefOid !== failure.headOid
+        ) {
+          throw new Error(`PR #${pr.number} repair 推送后 head 回读不一致。`);
+        }
+        if (visibilityAttempt < REPAIR_PUSH_VISIBILITY_ATTEMPTS) {
+          await repairDependencies.delayBeforeRefetch();
+        }
+      }
+      if (!published) {
+        throw new Error(`PR #${pr.number} repair 推送后等待 head 可见超时。`);
       }
       console.log(
         `PR #${pr.number} repair 已推送 head ${published.headRefOid.slice(0, 12)}，等待新一轮 CI。`,
