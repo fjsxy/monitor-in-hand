@@ -40,6 +40,8 @@
 | `UT-KSM-GH56-008` | #56 | controller 边界 | 通用 | 检查终止中受管资源的 API 读取失败时，status 仍报告当前 generation 的 `SwitchingDeploymentMode` 和 `ObservationFailed` | Go test failure、status | `go test ./internal/controller` |
 | `UT-KSM-GH56-009` | #56 | controller 边界 | 通用 | 资源问题已识别但回写 status 前的实际 topology 观测又失败时，以 `ObservationFailed` 落盘切换阶段 | Go test failure、status | `go test ./internal/controller` |
 | `UT-EXAMPLE-GH59-001` | #59 | 示例/RBAC | 通用 | 原生 Agent 示例为四类配置使用非空 object/namespace selector，ScrapeConfig 覆盖 static 与五种一期 Kubernetes discovery；统一 runtime ClusterRole 包含所需资源与 `/metrics` 且不含 nodes | Ginkgo failure、示例 manifest | `go test ./test/testenv` |
+| `UT-COLLECTION-GH59-001` | #59 | E2E 支撑 | 通用 | kubectl 将授权结果写入 stdout、将集群级资源 scope warning 写入 stderr 时，两条流保持分离且拒绝退出状态不丢失 | Go testing failure、stdout/stderr、退出码 | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |
+| `UT-COLLECTION-GH59-002` | #59 | E2E 支撑 | 通用 | 从格式化 EventList JSON 结构化读取 `InvalidConfiguration` reason，且畸形 JSON 显式报错 | Go testing failure、Event JSON | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |
 | `UT-PREFLIGHT-GH59-001` | #59 | 预检 CLI | 通用 | 空 object selector 保持上游合法能力，但严格预检以非零退出拒绝将其报告为一期支持 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-002` | #59 | 预检 CLI | 通用 | Node、node metadata、FileSD、DNS、LightSail 代表的一期外 ScrapeConfig discovery 均被非零拒绝 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-003` | #59 | 预检 CLI | 通用 | 空 namespace selector 解析为 Operator watch scope 内全部 namespace，声明的配置范围覆盖不足时非零退出 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
