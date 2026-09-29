@@ -76,6 +76,10 @@ jobs:
       TEST_RUN_ID: ci-${{ github.run_id }}-${{ matrix.run_id_suffix }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.22.12
+          cache: true
       - uses: helm/kind-action@v1.12.0
         with:
           install_only: true
@@ -87,6 +91,15 @@ jobs:
         run: |
           make test-env-up
           make test-env-verify
+      - name: E2E 严格部署预检
+        run: make e2e-preflight
+      - name: 上传 E2E 测试报告
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-preflight-${{ matrix.run_id_suffix }}-${{ github.run_id }}
+          path: artifacts/e2e/
+          if-no-files-found: error
       - name: 失败时保存测试环境证据
         if: ${{ failure() }}
         continue-on-error: true
