@@ -114,6 +114,7 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 		output, err := runPreflight(ctx, "prometheus-agent",
 			"AGENT_MANIFEST="+agentPath,
 			"COLLECTION_CONFIG_MANIFEST="+configsPath,
+			"DISCOVERY_NAMESPACES=*",
 		)
 		AddReportEntry("planned-preflight-output", output, ReportEntryVisibilityFailureOrVerbose)
 		Expect(err).NotTo(HaveOccurred(), output)
@@ -123,6 +124,10 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 		Expect(diagnostics).To(ContainElement(SatisfyAll(
 			WithTransform(func(item diagnostic) string { return item.Check }, Equal("collection-configuration")),
 			WithTransform(func(item diagnostic) string { return item.Reason }, Equal("CollectionConfigsSelected")),
+		)))
+		Expect(diagnostics).To(ContainElement(SatisfyAll(
+			WithTransform(func(item diagnostic) string { return item.Check }, Equal("collection-configuration")),
+			WithTransform(func(item diagnostic) string { return item.Reason }, Equal("DiscoveryNamespaceScopeCovered")),
 		)))
 		Expect(diagnostics).To(ContainElement(SatisfyAll(
 			WithTransform(func(item diagnostic) string { return item.Check }, Equal("summary")),

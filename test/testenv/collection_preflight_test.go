@@ -43,18 +43,29 @@ var _ = Describe("采集配置部署预检", func() {
 		kinds := map[string]int{}
 		discoveries := map[string]bool{}
 		for _, object := range configObjects {
-			kind, _, _ := unstructured.NestedString(object, "kind")
+			kind, found, err := unstructured.NestedString(object, "kind")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeTrue())
 			kinds[kind]++
 			if kind != "ScrapeConfig" {
 				continue
 			}
-			staticConfigs, _, _ := unstructured.NestedSlice(object, "spec", "staticConfigs")
-			if len(staticConfigs) > 0 {
+			staticConfigs, found, err := unstructured.NestedSlice(object, "spec", "staticConfigs")
+			Expect(err).NotTo(HaveOccurred())
+			if found && len(staticConfigs) > 0 {
 				discoveries["Static"] = true
 			}
-			kubernetesConfigs, _, _ := unstructured.NestedSlice(object, "spec", "kubernetesSDConfigs")
+			kubernetesConfigs, found, err := unstructured.NestedSlice(object, "spec", "kubernetesSDConfigs")
+			Expect(err).NotTo(HaveOccurred())
+			if !found {
+				continue
+			}
 			for _, item := range kubernetesConfigs {
-				role, _, _ := unstructured.NestedString(item.(map[string]any), "role")
+				config, ok := item.(map[string]any)
+				Expect(ok).To(BeTrue())
+				role, found, err := unstructured.NestedString(config, "role")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(found).To(BeTrue())
 				discoveries[role] = true
 			}
 		}
@@ -218,7 +229,7 @@ esac
 		By("以不足的 config namespace 范围执行预检")
 		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
-			"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
+			"--config-namespaces", "monitoring", "--discovery-namespaces", "shared",
 			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
 		)
 		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
@@ -381,15 +392,21 @@ esac
 		By("执行包含 NotIn namespace selector 的计划预检")
 		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
-			"--config-namespaces", "*", "--discovery-namespaces", "monitoring",
+			"--config-namespaces", "*", "--discovery-namespaces", "shared",
 			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
 		)
 		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
-		output, _ := command.CombinedOutput()
+		output, err := command.CombinedOutput()
 
-		By("验证缺少 excluded label 的 shared namespace 仍被原生 NotIn 语义选中")
+		By("验证 selector 阶段成功，并在 fixture 未实现的后续 API discovery 边界明确失败")
+		Expect(err).To(HaveOccurred(), string(output))
+		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
 		expectJSONDiagnostics(output)
-		Expect(string(output)).To(ContainSubstring(`"reason":"CollectionConfigsSelected"`))
+		Expect(string(output)).To(SatisfyAll(
+			ContainSubstring(`"reason":"CollectionConfigsSelected"`),
+			ContainSubstring(`"reason":"APIGroupVersionNotServed"`),
+			Not(ContainSubstring(`"reason":"CollectionConfigCoverageIncomplete"`)),
+		))
 	})
 
 	It("[UT-PREFLIGHT-GH59-006] 空 namespace selector 只要求覆盖 Operator 实际 watch scope", func() {
@@ -411,18 +428,169 @@ esac
 		By("执行 Operator common watch scope 受限的计划预检")
 		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
-			"--config-namespaces", "monitoring,shared", "--discovery-namespaces", "monitoring",
+			"--config-namespaces", "monitoring,shared", "--discovery-namespaces", "shared",
 			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
 		)
 		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
-		output, _ := command.CombinedOutput()
+		output, err := command.CombinedOutput()
 
-		By("验证空 selector 的 requiredNamespaces 与 Operator watch scope 求交")
+		By("验证 selector 阶段成功，并在 fixture 未实现的后续 API discovery 边界明确失败")
+		Expect(err).To(HaveOccurred(), string(output))
+		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
 		expectJSONDiagnostics(output)
 		Expect(string(output)).To(SatisfyAll(
 			ContainSubstring(`"reason":"CollectionNamespaceScopeCovered"`),
+			ContainSubstring(`"reason":"APIGroupVersionNotServed"`),
 			Not(ContainSubstring(`"reason":"CollectionNamespaceScopeIncomplete"`)),
 		))
+	})
+
+	It("[UT-PREFLIGHT-GH59-009] 不把 static labels 中的 name/key 当作 Secret 引用", func() {
+		By("准备 labels 恰好包含 name/key 的合法静态 ScrapeConfig")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fakeBin := GinkgoT().TempDir()
+		agentManifest := filepath.Join(fakeBin, "agent.yaml")
+		configManifest := filepath.Join(fakeBin, "config.yaml")
+		Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		writeCollectionValidationKubectl(fakeBin,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","scrapeConfigSelector":{"matchLabels":{"mih":"selected"}}}}`,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring","labels":{"mih":"selected"}},"spec":{"staticConfigs":[{"targets":["example:9090"],"labels":{"name":"workload","key":"value"}}]}}`,
+			false,
+		)
+
+		By("执行引用识别阶段并保留 fixture 后续阶段的预期失败")
+		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+			"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
+			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+		)
+		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+		output, err := command.CombinedOutput()
+
+		By("验证静态 label 未触发伪引用，并在后续 API discovery 边界明确失败")
+		Expect(err).To(HaveOccurred(), string(output))
+		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
+		expectJSONDiagnostics(output)
+		Expect(string(output)).To(SatisfyAll(
+			ContainSubstring(`"reason":"DiscoveryNamespaceScopeCovered"`),
+			ContainSubstring(`"reason":"APIGroupVersionNotServed"`),
+			Not(ContainSubstring(`"reason":"ReferencedAssetUnavailable"`)),
+			Not(ContainSubstring(`"reason":"ReferencedAssetKeyUnavailable"`)),
+		))
+	})
+
+	It("[UT-PREFLIGHT-GH59-010] ScrapeConfig 省略 namespaces 时要求全 namespace discovery 覆盖", func() {
+		By("准备使用 Kubernetes discovery 原生全 namespace 默认值的 ScrapeConfig")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fakeBin := GinkgoT().TempDir()
+		agentManifest := filepath.Join(fakeBin, "agent.yaml")
+		configManifest := filepath.Join(fakeBin, "config.yaml")
+		Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		writeCollectionValidationKubectl(fakeBin,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","scrapeConfigSelector":{"matchLabels":{"mih":"selected"}}}}`,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring","labels":{"mih":"selected"}},"spec":{"kubernetesSDConfigs":[{"role":"Pod"}]}}`,
+			false,
+		)
+
+		By("以单 namespace discovery 声明执行严格预检")
+		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+			"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
+			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+		)
+		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+		output, err := command.CombinedOutput()
+
+		By("验证全 namespace 原生语义因 runtime RBAC 声明覆盖不足而非零退出")
+		Expect(err).To(HaveOccurred(), string(output))
+		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
+		expectJSONDiagnostics(output)
+		Expect(string(output)).To(SatisfyAll(
+			ContainSubstring(`"reason":"DiscoveryNamespaceScopeIncomplete"`),
+			ContainSubstring(`"requiredDiscoveryNamespaces":["*"]`),
+		))
+	})
+
+	It("[UT-PREFLIGHT-GH59-011] ScrapeConfig ownNamespace 指向 Agent namespace", func() {
+		By("准备位于其他配置 namespace、但 discovery 使用 Agent ownNamespace 的 ScrapeConfig")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fakeBin := GinkgoT().TempDir()
+		agentManifest := filepath.Join(fakeBin, "agent.yaml")
+		configManifest := filepath.Join(fakeBin, "config.yaml")
+		Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		writeCollectionValidationKubectl(fakeBin,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","scrapeConfigSelector":{"matchLabels":{"mih":"selected"}},"scrapeConfigNamespaceSelector":{}}}`,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"shared","labels":{"mih":"selected"}},"spec":{"kubernetesSDConfigs":[{"role":"Pod","namespaces":{"ownNamespace":true}}]}}`,
+			false,
+		)
+
+		By("以 Agent namespace 的 runtime discovery 覆盖执行计划检查")
+		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+			"--config-namespaces", "*", "--discovery-namespaces", "monitoring",
+			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+		)
+		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+		output, err := command.CombinedOutput()
+
+		By("验证 ownNamespace 不被误解为 ScrapeConfig 对象所在 namespace")
+		Expect(err).To(HaveOccurred(), string(output))
+		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
+		expectJSONDiagnostics(output)
+		Expect(string(output)).To(SatisfyAll(
+			ContainSubstring(`"reason":"DiscoveryNamespaceScopeCovered"`),
+			ContainSubstring(`"requiredDiscoveryNamespaces":["monitoring"]`),
+			ContainSubstring(`"reason":"APIGroupVersionNotServed"`),
+			Not(ContainSubstring(`"reason":"DiscoveryNamespaceScopeIncomplete"`)),
+		))
+	})
+
+	It("[UT-PREFLIGHT-GH59-012] ServiceMonitor、PodMonitor 与 Probe target namespace 必须被 runtime discovery 范围覆盖", func() {
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		for _, fixture := range []struct {
+			name, objectField, kind, spec string
+		}{
+			{name: "ServiceMonitor", objectField: "serviceMonitorSelector", kind: "ServiceMonitor", spec: `{"namespaceSelector":{"matchNames":["shared"]},"selector":{},"endpoints":[{"port":"metrics"}]}`},
+			{name: "PodMonitor", objectField: "podMonitorSelector", kind: "PodMonitor", spec: `{"namespaceSelector":{"matchNames":["shared"]},"selector":{},"podMetricsEndpoints":[{"port":"metrics"}]}`},
+			{name: "Probe ingress", objectField: "probeSelector", kind: "Probe", spec: `{"prober":{"url":"blackbox:9115"},"targets":{"ingress":{"namespaceSelector":{"matchNames":["shared"]},"selector":{}}}}`},
+		} {
+			By("准备发现 shared namespace target 的 " + fixture.name)
+			fakeBin := GinkgoT().TempDir()
+			agentManifest := filepath.Join(fakeBin, "agent.yaml")
+			configManifest := filepath.Join(fakeBin, "config.yaml")
+			Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+			Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+			writeCollectionValidationKubectl(fakeBin,
+				`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","`+fixture.objectField+`":{"matchLabels":{"mih":"selected"}}}}`,
+				`{"apiVersion":"monitoring.coreos.com/v1","kind":"`+fixture.kind+`","metadata":{"name":"selected","namespace":"monitoring","labels":{"mih":"selected"}},"spec":`+fixture.spec+`}`,
+				false,
+			)
+
+			By("以未覆盖 shared 的 runtime discovery 范围执行严格预检")
+			command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+				"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+				"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
+				"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+			)
+			command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+			output, err := command.CombinedOutput()
+
+			By("验证 " + fixture.name + " 的真实 target namespace 覆盖不足导致非零退出")
+			Expect(err).To(HaveOccurred(), string(output))
+			Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
+			expectJSONDiagnostics(output)
+			Expect(string(output)).To(SatisfyAll(
+				ContainSubstring(`"reason":"DiscoveryNamespaceScopeIncomplete"`),
+				ContainSubstring(`"requiredDiscoveryNamespaces":["shared"]`),
+			))
+		}
 	})
 })
 

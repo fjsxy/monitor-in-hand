@@ -338,7 +338,7 @@ fi
 if ((failures > 0)); then finish_failed; fi
 
 validate_collection_selection() {
-  local namespaces_json report declared_scope refs_json reference namespace kind name key path output
+  local namespaces_json report declared_scope declared_discovery_scope refs_json reference namespace kind name key path output
   [[ -n "${agent_manifest}" ]] || return
 
   # 读取实时 Namespace labels，作为解析 nil、空对象与非空 namespace selector 的事实输入。
@@ -357,6 +357,11 @@ validate_collection_selection() {
   else
     declared_scope=$(jq --compact-output --null-input --arg scope "${config_namespaces}" '$scope | split(",")')
   fi
+  if [[ "${discovery_namespaces}" == "*" ]]; then
+    declared_discovery_scope='[]'
+  else
+    declared_discovery_scope=$(jq --compact-output --null-input --arg scope "${discovery_namespaces}" '$scope | split(",")')
+  fi
   # 同时应用 object selector、namespace selector 与 Operator watch scope，生成必须覆盖的配置集合。
   report=$(jq --compact-output --null-input \
     --argjson agent "${agent_json}" \
@@ -365,7 +370,9 @@ validate_collection_selection() {
     --arg configScope "${config_namespaces}" \
     --arg operatorAllow "${general_allow:-}" \
     --arg operatorDeny "${general_deny:-}" \
-    --argjson declaredScope "${declared_scope}" '
+    --argjson declaredScope "${declared_scope}" \
+    --arg discoveryScope "${discovery_namespaces}" \
+    --argjson declaredDiscoveryScope "${declared_discovery_scope}" '
       def selector_empty($selector):
         (($selector.matchLabels // {}) | length) == 0 and (($selector.matchExpressions // []) | length) == 0;
       def selector_matches($selector; $labels):
@@ -407,6 +414,27 @@ validate_collection_selection() {
         else [$namespaces.items[] |
           select(operator_watches(.metadata.name) and selector_matches($selector; (.metadata.labels // {}))) |
           .metadata.name] end;
+      def target_namespaces($selector; $configNamespace):
+        if ($selector.any // false) == true then ["*"]
+        elif (($selector.matchNames // []) | length) > 0 then ($selector.matchNames | unique)
+        else [$configNamespace] end;
+      def kubernetes_discovery_namespaces($config; $agentNamespace):
+        [($config.spec.kubernetesSDConfigs // [])[] as $discovery |
+          ($discovery.namespaces // {}) as $selection |
+          if (($selection.names // []) | length) == 0 and (($selection.ownNamespace // false) | not) then "*"
+          else
+            (($selection.names // [])[]),
+            (if ($selection.ownNamespace // false) then $agentNamespace else empty end)
+          end];
+      def discovery_namespaces($config):
+        ($config.metadata.namespace // "default") as $configNamespace |
+        ($agent.metadata.namespace // "default") as $agentNamespace |
+        if $config.kind == "ServiceMonitor" or $config.kind == "PodMonitor" then
+          target_namespaces(($config.spec.namespaceSelector // {}); $configNamespace)
+        elif $config.kind == "Probe" and $config.spec.targets.ingress != null then
+          target_namespaces(($config.spec.targets.ingress.namespaceSelector // {}); $configNamespace)
+        elif $config.kind == "ScrapeConfig" then kubernetes_discovery_namespaces($config; $agentNamespace)
+        else [] end;
 
       (["ServiceMonitor", "PodMonitor", "Probe", "ScrapeConfig"] |
         map(. as $kind | fields_for_kind($kind) as $fields |
@@ -426,8 +454,15 @@ validate_collection_selection() {
       ([$enabled[].namespaces[]] | unique) as $requiredNamespaces |
       ($requiredNamespaces |
         if $configScope == "*" then [] else map(select(. as $namespace | $declaredScope | index($namespace) == null)) end) as $uncoveredNamespaces |
+      ([$configs[] | discovery_namespaces(.)[]] | unique) as $requiredDiscoveryNamespaces |
+      ($requiredDiscoveryNamespaces |
+        if $discoveryScope == "*" then []
+        elif index("*") != null then ["*"]
+        else map(select(. as $namespace | $declaredDiscoveryScope | index($namespace) == null)) end) as $uncoveredDiscoveryNamespaces |
       {unselected: $unselected, missingKinds: $missingKinds,
-       requiredNamespaces: $requiredNamespaces, uncoveredNamespaces: $uncoveredNamespaces}
+       requiredNamespaces: $requiredNamespaces, uncoveredNamespaces: $uncoveredNamespaces,
+       requiredDiscoveryNamespaces: $requiredDiscoveryNamespaces,
+       uncoveredDiscoveryNamespaces: $uncoveredDiscoveryNamespaces}
     ')
 
   # 将未选中对象、缺失类型和 namespace 覆盖差距分别转成稳定诊断。
@@ -442,15 +477,32 @@ validate_collection_selection() {
     record_pass collection-configuration pass CollectionNamespaceScopeCovered "配置 namespace 范围覆盖 nil、空对象或非空 namespace selector 的原生选择结果" \
       "$(jq '{requiredNamespaces}' <<<"${report}")"
   fi
+  if [[ "$(jq '.uncoveredDiscoveryNamespaces | length' <<<"${report}")" != 0 ]]; then
+    record_failure collection-configuration fail DiscoveryNamespaceScopeIncomplete "discovery namespace 范围未覆盖采集配置最终发现目标的原生范围" "${report}"
+  else
+    record_pass collection-configuration pass DiscoveryNamespaceScopeCovered "discovery namespace 范围覆盖采集配置最终发现目标的原生范围" \
+      "$(jq '{requiredDiscoveryNamespaces}' <<<"${report}")"
+  fi
 
   # 所有 key selector 都按声明对象的 namespace 解析，并验证对象可读且引用 key 存在。
   refs_json=$(jq --compact-output --null-input --argjson agent "${agent_json}" --argjson configs "${collection_configs_json}" '
+      def selector_kind($path):
+        ($path | map(tostring | ascii_downcase)) as $parts |
+        if ($parts | index("configmap")) != null then "configmap"
+        elif any($parts[];
+          . == "secret" or . == "keysecret" or . == "bearertokensecret" or
+          . == "clientsecret" or . == "credentials" or . == "username" or . == "password" or
+          . == "proxyconnectheader" or . == "accesskey" or . == "secretkey" or . == "tokenref" or
+          . == "applicationcredentialsecret" or . == "applicationsecret" or . == "consumerkey") then "secret"
+        else null end;
       def key_selector_refs($document; $namespace):
         [$document.spec | paths(objects | select((.name? | type) == "string" and (.key? | type) == "string")) as $path |
           getpath($path) as $selector |
           ($path | map(tostring) | join(".")) as $fieldPath |
+          selector_kind($path) as $kind |
+          select($kind != null) |
           {namespace: $namespace,
-           kind: (if ($fieldPath | ascii_downcase | contains("configmap")) then "configmap" else "secret" end),
+           kind: $kind,
            name: $selector.name, key: $selector.key, path: $fieldPath}];
       (key_selector_refs($agent; ($agent.metadata.namespace // "default")) +
        [($agent.spec.secrets // [])[] | {namespace: ($agent.metadata.namespace // "default"), kind: "secret", name: ., key: null, path: "spec.secrets"}] +
