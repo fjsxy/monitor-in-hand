@@ -1225,7 +1225,11 @@ func metricHasLabels(body []byte, expectation metricExpectation) bool {
 }
 
 func assertMetricsBody(ctx SpecContext, serviceName string, verify func([]byte) error) {
-	// 先预留本地端口并启动到受管 Service 的转发进程。
+	assertTargetMetricsBody(ctx, "service/"+serviceName, 8080, verify)
+}
+
+func assertTargetMetricsBody(ctx SpecContext, target string, remotePort int, verify func([]byte) error) {
+	// 先预留本地端口并启动到指定受管 endpoint 的转发进程。
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	Expect(err).NotTo(HaveOccurred())
 	port := listener.Addr().(*net.TCPAddr).Port
@@ -1233,7 +1237,7 @@ func assertMetricsBody(ctx SpecContext, serviceName string, verify func([]byte) 
 
 	logBuffer := &bytes.Buffer{}
 	command := exec.CommandContext(ctx, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
-		"port-forward", "service/"+serviceName, fmt.Sprintf("%d:8080", port))
+		"port-forward", target, fmt.Sprintf("%d:%d", port, remotePort))
 	command.Stdout = logBuffer
 	command.Stderr = logBuffer
 	Expect(command.Start()).To(Succeed())

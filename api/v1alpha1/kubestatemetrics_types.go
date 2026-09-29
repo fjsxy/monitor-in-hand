@@ -52,7 +52,8 @@ type KubeStateMetricsMetricFilter struct {
 type DeploymentMode string
 
 const (
-	DeploymentModeDeployment DeploymentMode = "Deployment"
+	DeploymentModeDeployment         DeploymentMode = "Deployment"
+	DeploymentModeStatefulSetSharded DeploymentMode = "StatefulSetSharded"
 )
 
 // NamespaceFilterMode identifies how an instance selects namespaces to collect.
@@ -92,13 +93,24 @@ const (
 	KubeStateMetricsPhaseDegraded    KubeStateMetricsPhase = "Degraded"
 )
 
-// KubeStateMetricsDeploymentSpec selects the workload topology.
+// KubeStateMetricsStatefulSetShardedSpec configures the experimental sharded topology.
+type KubeStateMetricsStatefulSetShardedSpec struct {
+	// Shards is the number of automated kube-state-metrics shards and must be at least two.
+	Shards int32 `json:"shards"`
+}
+
+// KubeStateMetricsDeploymentSpec is a discriminated union selected by Mode.
 type KubeStateMetricsDeploymentSpec struct {
 	// Mode is the selected workload topology.
 	// +kubebuilder:default=Deployment
-	// +kubebuilder:validation:Enum=Deployment
+	// +kubebuilder:validation:Enum=Deployment;StatefulSetSharded
 	// +optional
 	Mode DeploymentMode `json:"mode,omitempty"`
+
+	// StatefulSetSharded configures the experimental StatefulSetSharded mode.
+	// It must be present only when mode is StatefulSetSharded.
+	// +optional
+	StatefulSetSharded *KubeStateMetricsStatefulSetShardedSpec `json:"statefulSetSharded,omitempty"`
 }
 
 // KubeStateMetricsSpec declares one managed kube-state-metrics instance.

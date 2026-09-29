@@ -39,6 +39,31 @@ type replacingBeforeDeleteClient struct {
 	replaced bool
 }
 
+type transitionReadFailingClient struct {
+	client.Client
+}
+
+type existingRoleReadFailingClient struct {
+	client.Client
+}
+
+type existingStatefulSetReadFailingClient struct {
+	client.Client
+}
+
+type servicePreflightReadFailingClient struct {
+	client.Client
+}
+
+type secondServiceReadFailingClient struct {
+	client.Client
+	reads int
+}
+
+type deploymentObservationFailingClient struct {
+	client.Client
+}
+
 type fixedServerVersion struct{}
 
 func (fixedServerVersion) ServerVersion() (*version.Info, error) {
@@ -344,6 +369,57 @@ func TestMultiInstanceOwnershipAndDrift(t *testing.T) {
 	})
 }
 
+func (c transitionReadFailingClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*appsv1.Deployment); ok && key.Name == "ksm-switch-read-failure" {
+		return errors.New("injected transition read failure")
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+func (c existingRoleReadFailingClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	err := c.Client.Get(ctx, key, object, options...)
+	if err == nil {
+		if _, ok := object.(*rbacv1.Role); ok && key.Name == "ksm-switch-rbac-read-failure" {
+			return errors.New("injected RBAC read failure")
+		}
+	}
+	return err
+}
+
+func (c existingStatefulSetReadFailingClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	err := c.Client.Get(ctx, key, object, options...)
+	if err == nil {
+		if _, ok := object.(*appsv1.StatefulSet); ok && key.Name == "ksm-applied-workload-read-failure" {
+			return errors.New("injected applied workload read failure")
+		}
+	}
+	return err
+}
+
+func (c servicePreflightReadFailingClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*corev1.Service); ok && key.Name == "ksm-preflight-read-failure" {
+		return errors.New("injected ownership preflight read failure")
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+func (c *secondServiceReadFailingClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*corev1.Service); ok && key.Name == "ksm-terminating-read-failure" {
+		c.reads++
+		if c.reads == 2 {
+			return errors.New("injected terminating resource read failure")
+		}
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+func (c deploymentObservationFailingClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*appsv1.Deployment); ok && key.Name == "ksm-problem-observation-failure" {
+		return errors.New("injected problem-status observation failure")
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
 func TestPartialApplyKeepsOriginalNamespaceForDisableCleanup(t *testing.T) {
 	t.Run("UT-KSM-GH53-004 部分写入失败保留成功资源并在重试后收敛", func(t *testing.T) {
 		// 准备两个 Namespace，并模拟 ServiceAccount 已被 API 持久化但客户端收到写入失败。
@@ -520,6 +596,361 @@ func TestDeletionFailureKeepsFinalizerAndDeduplicatesEvent(t *testing.T) {
 		}
 	default:
 		t.Fatal("delete recovery did not emit an event")
+	}
+}
+
+func TestModeSwitchDeleteFailureReportsStage(t *testing.T) {
+	t.Run("UT-KSM-GH56-003 模式切换删除失败报告当前阶段", func(t *testing.T) {
+		// 准备已有 Deployment 的受管实例，并在切换到 StatefulSetSharded 的删除边界注入失败。
+		ctx := context.Background()
+		scheme := runtime.NewScheme()
+		if err := clientgoscheme.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "switch-delete-failure", UID: types.UID("uid-switch-delete-failure")},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+					StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+						Shards: 2,
+					},
+				},
+			},
+		}
+		controllerOwner := true
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "ksm-switch-delete-failure", Namespace: "monitoring",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: monitoringv1alpha1.GroupVersion.String(), Kind: "KubeStateMetrics",
+					Name: instance.Name, UID: instance.UID, Controller: &controllerOwner,
+				}},
+			},
+			Spec:   appsv1.DeploymentSpec{Replicas: int32Value(1)},
+			Status: appsv1.DeploymentStatus{AvailableReplicas: 1},
+		}
+		baseClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(instance, deployment, &appsv1.StatefulSet{}).
+			WithObjects(instance, deployment, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "monitoring"}}).
+			Build()
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+			Client: deleteFailingClient{Client: baseClient}, ServerVersion: fixedServerVersion{},
+		}
+
+		// 执行切换，验证失败 status 保留切换阶段、实际旧 workload 可用性与删除原因。
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: instance.Name}})
+		if err == nil || !strings.Contains(err.Error(), "injected delete failure") {
+			t.Fatalf("reconcile error = %v, want injected delete failure", err)
+		}
+		actual := getInstance(t, ctx, baseClient, instance.Name)
+		progressing := findCondition(actual.Status.Conditions, "Progressing")
+		if progressing.Status != metav1.ConditionTrue || progressing.Reason != ksm.ReasonSwitchingDeploymentMode {
+			t.Fatalf("Progressing = %#v, want True/%s", progressing, ksm.ReasonSwitchingDeploymentMode)
+		}
+		degraded := findCondition(actual.Status.Conditions, "Degraded")
+		if degraded.Status != metav1.ConditionTrue || degraded.Reason != ksm.ReasonDeleteFailed || !strings.Contains(degraded.Message, "删除旧 workload") {
+			t.Fatalf("Degraded = %#v, want True/DeleteFailed with transition stage", degraded)
+		}
+		if actual.Status.DeploymentMode != monitoringv1alpha1.DeploymentModeDeployment || actual.Status.DesiredPods != 1 || actual.Status.AvailablePods != 1 {
+			t.Fatalf("status workload = mode %s desired %d available %d, want existing Deployment 1/1",
+				actual.Status.DeploymentMode, actual.Status.DesiredPods, actual.Status.AvailablePods)
+		}
+		if err := baseClient.Get(ctx, client.ObjectKey{Namespace: "monitoring", Name: "ksm-switch-delete-failure"}, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("StatefulSet get error = %v, want NotFound", err)
+		}
+	})
+}
+
+func TestModeSwitchReadFailureReportsStage(t *testing.T) {
+	t.Run("UT-KSM-GH56-004 模式切换读取失败报告当前阶段", func(t *testing.T) {
+		// 准备一个从已观测 Deployment 切换到 StatefulSetSharded 的实例，在旧 workload 读取边界注入失败。
+		ctx := context.Background()
+		scheme := runtime.NewScheme()
+		if err := clientgoscheme.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "switch-read-failure", UID: types.UID("uid-switch-read-failure"), Generation: 2},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+					StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+						Shards: 2,
+					},
+				},
+			},
+			Status: monitoringv1alpha1.KubeStateMetricsStatus{
+				ObservedGeneration:     1,
+				AppliedTargetNamespace: "monitoring",
+				DeploymentMode:         monitoringv1alpha1.DeploymentModeDeployment,
+				DesiredPods:            1,
+				AvailablePods:          1,
+			},
+		}
+		baseClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(instance, &appsv1.Deployment{}, &appsv1.StatefulSet{}).
+			WithObjects(instance, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "monitoring"}}).
+			Build()
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+			Client: transitionReadFailingClient{Client: baseClient}, ServerVersion: fixedServerVersion{},
+		}
+
+		// 执行切换并验证不能观测旧 workload 时仍保留上次事实，同时暴露切换阶段与读取故障。
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: instance.Name}})
+		if err == nil || !strings.Contains(err.Error(), "injected transition read failure") {
+			t.Fatalf("reconcile error = %v, want injected transition read failure", err)
+		}
+		actual := getInstance(t, ctx, baseClient, instance.Name)
+		progressing := findCondition(actual.Status.Conditions, "Progressing")
+		if progressing.Status != metav1.ConditionTrue || progressing.Reason != ksm.ReasonSwitchingDeploymentMode || !strings.Contains(progressing.Message, "读取旧 workload") {
+			t.Fatalf("Progressing = %#v, want switching observation failure", progressing)
+		}
+		degraded := findCondition(actual.Status.Conditions, "Degraded")
+		if degraded.Status != metav1.ConditionTrue || degraded.Reason != ksm.ReasonObservationFailed {
+			t.Fatalf("Degraded = %#v, want True/%s", degraded, ksm.ReasonObservationFailed)
+		}
+		if actual.Status.ObservedGeneration != actual.Generation || actual.Status.DeploymentMode != monitoringv1alpha1.DeploymentModeDeployment || actual.Status.AvailablePods != 1 {
+			t.Fatalf("status = %#v, want current generation with last observed Deployment availability", actual.Status)
+		}
+		if err := baseClient.Get(ctx, client.ObjectKey{Namespace: "monitoring", Name: "ksm-switch-read-failure"}, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("StatefulSet get error = %v, want NotFound", err)
+		}
+	})
+}
+
+func TestModeSwitchRBACReadFailureReportsStage(t *testing.T) {
+	t.Run("UT-KSM-GH56-005 切换清理 RBAC 读取失败报告当前阶段", func(t *testing.T) {
+		// 准备已应用的分片状态和受管 Role，在切回 Deployment 的清理预检注入读取失败。
+		ctx := context.Background()
+		scheme := runtime.NewScheme()
+		if err := clientgoscheme.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "switch-rbac-read-failure", UID: types.UID("uid-switch-rbac-read-failure"), Generation: 2},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: "monitoring"},
+			Status: monitoringv1alpha1.KubeStateMetricsStatus{
+				ObservedGeneration: 1, AppliedTargetNamespace: "monitoring",
+				DeploymentMode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+				DesiredPods:    2, AvailablePods: 2,
+			},
+		}
+		controllerOwner := true
+		role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{
+			Name: "ksm-switch-rbac-read-failure", Namespace: "monitoring",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: monitoringv1alpha1.GroupVersion.String(), Kind: "KubeStateMetrics",
+				Name: instance.Name, UID: instance.UID, Controller: &controllerOwner,
+			}},
+		}}
+		baseClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(instance, &appsv1.Deployment{}, &appsv1.StatefulSet{}).
+			WithObjects(instance, role, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "monitoring"}}).
+			Build()
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+			Client: existingRoleReadFailingClient{Client: baseClient}, ServerVersion: fixedServerVersion{},
+		}
+
+		// 执行切换并验证清理预检失败也能落盘切换阶段和观测故障。
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: instance.Name}})
+		if err == nil || !strings.Contains(err.Error(), "injected RBAC read failure") {
+			t.Fatalf("reconcile error = %v, want injected RBAC read failure", err)
+		}
+		actual := getInstance(t, ctx, baseClient, instance.Name)
+		progressing := findCondition(actual.Status.Conditions, "Progressing")
+		if progressing.Status != metav1.ConditionTrue || progressing.Reason != ksm.ReasonSwitchingDeploymentMode {
+			t.Fatalf("Progressing = %#v, want True/%s", progressing, ksm.ReasonSwitchingDeploymentMode)
+		}
+		degraded := findCondition(actual.Status.Conditions, "Degraded")
+		if degraded.Status != metav1.ConditionTrue || degraded.Reason != ksm.ReasonObservationFailed || !strings.Contains(degraded.Message, "injected RBAC read failure") {
+			t.Fatalf("Degraded = %#v, want observation failure with RBAC read error", degraded)
+		}
+	})
+}
+
+func TestAppliedWorkloadReadFailureReportsStage(t *testing.T) {
+	t.Run("UT-KSM-GH56-006 已写入 workload 读取失败报告当前阶段", func(t *testing.T) {
+		// 准备全新分片实例，只在 StatefulSet 创建成功后的可用副本读取中注入失败。
+		ctx := context.Background()
+		scheme := runtime.NewScheme()
+		if err := clientgoscheme.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "applied-workload-read-failure", UID: types.UID("uid-applied-workload-read-failure"), Generation: 1},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode:               monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+					StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{Shards: 2},
+				},
+			},
+		}
+		baseClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(instance, &appsv1.Deployment{}, &appsv1.StatefulSet{}).
+			WithObjects(instance, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "monitoring"}}).
+			Build()
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+			Client: existingStatefulSetReadFailingClient{Client: baseClient}, ServerVersion: fixedServerVersion{},
+		}
+
+		// 执行调谐并验证写入后观测失败不会留下空白或成功 status。
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: instance.Name}})
+		if err == nil || !strings.Contains(err.Error(), "injected applied workload read failure") {
+			t.Fatalf("reconcile error = %v, want injected applied workload read failure", err)
+		}
+		actual := getInstance(t, ctx, baseClient, instance.Name)
+		progressing := findCondition(actual.Status.Conditions, "Progressing")
+		if progressing.Status != metav1.ConditionTrue || progressing.Reason != ksm.ReasonObservationFailed {
+			t.Fatalf("Progressing = %#v, want True/%s", progressing, ksm.ReasonObservationFailed)
+		}
+		degraded := findCondition(actual.Status.Conditions, "Degraded")
+		if degraded.Status != metav1.ConditionTrue || degraded.Reason != ksm.ReasonObservationFailed || !strings.Contains(degraded.Message, "injected applied workload read failure") {
+			t.Fatalf("Degraded = %#v, want observation failure with applied workload read error", degraded)
+		}
+	})
+}
+
+func TestOwnershipPreflightReadFailureReportsStage(t *testing.T) {
+	t.Run("UT-KSM-GH56-007 topology 所有权预检读取失败报告当前阶段", func(t *testing.T) {
+		// 准备从 Deployment 切换的声明状态，在任何写入之前的 Service 所有权预检中注入失败。
+		ctx := context.Background()
+		scheme := runtime.NewScheme()
+		if err := clientgoscheme.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		instance := shardedFailureTestInstance("preflight-read-failure")
+		baseClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(instance, &appsv1.Deployment{}, &appsv1.StatefulSet{}).
+			WithObjects(instance, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "monitoring"}}).
+			Build()
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+			Client: servicePreflightReadFailingClient{Client: baseClient}, ServerVersion: fixedServerVersion{},
+		}
+
+		// 执行切换并验证预检读取失败会落盘切换阶段，不会留下上一 generation。
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: instance.Name}})
+		assertGH56ObservationFailure(t, ctx, baseClient, instance, err, "injected ownership preflight read failure")
+	})
+}
+
+func TestTerminatingResourceReadFailureReportsStage(t *testing.T) {
+	t.Run("UT-KSM-GH56-008 终止中 topology 读取失败报告当前阶段", func(t *testing.T) {
+		// 准备从 Deployment 切换的声明状态，让 Service 所有权预检成功后在终止观测中注入失败。
+		ctx := context.Background()
+		scheme := runtime.NewScheme()
+		if err := clientgoscheme.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		instance := shardedFailureTestInstance("terminating-read-failure")
+		baseClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(instance, &appsv1.Deployment{}, &appsv1.StatefulSet{}).
+			WithObjects(instance, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "monitoring"}}).
+			Build()
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+			Client: &secondServiceReadFailingClient{Client: baseClient}, ServerVersion: fixedServerVersion{},
+		}
+
+		// 执行切换并验证终止中资源读取失败同样会落盘切换阶段。
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: instance.Name}})
+		assertGH56ObservationFailure(t, ctx, baseClient, instance, err, "injected terminating resource read failure")
+	})
+}
+
+func TestProblemStatusObservationFailureReportsStage(t *testing.T) {
+	t.Run("UT-KSM-GH56-009 写入问题 status 时 topology 观测失败报告当前阶段", func(t *testing.T) {
+		// 准备从 Deployment 切换的声明状态和一个外部同名 Service，再对问题 status 的实际 topology 观测注入失败。
+		ctx := context.Background()
+		scheme := runtime.NewScheme()
+		if err := clientgoscheme.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		instance := shardedFailureTestInstance("problem-observation-failure")
+		foreignService := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name: "ksm-problem-observation-failure", Namespace: "monitoring",
+		}}
+		baseClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(instance, &appsv1.Deployment{}, &appsv1.StatefulSet{}).
+			WithObjects(instance, foreignService, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "monitoring"}}).
+			Build()
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+			Client: deploymentObservationFailingClient{Client: baseClient}, ServerVersion: fixedServerVersion{},
+		}
+
+		// 执行切换并验证冲突 status 所需的二次观测失败会替换未落盘的 problem conditions。
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: instance.Name}})
+		assertGH56ObservationFailure(t, ctx, baseClient, instance, err, "injected problem-status observation failure")
+		if getErr := baseClient.Get(ctx, client.ObjectKey{Namespace: "monitoring", Name: "ksm-problem-observation-failure"}, &appsv1.StatefulSet{}); !apierrors.IsNotFound(getErr) {
+			t.Fatalf("StatefulSet get error = %v, want NotFound", getErr)
+		}
+	})
+}
+
+func shardedFailureTestInstance(name string) *monitoringv1alpha1.KubeStateMetrics {
+	return &monitoringv1alpha1.KubeStateMetrics{
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name), Generation: 2},
+		Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+			TargetNamespace: "monitoring",
+			Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+				Mode:               monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+				StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{Shards: 2},
+			},
+		},
+		Status: monitoringv1alpha1.KubeStateMetricsStatus{
+			ObservedGeneration: 1, AppliedTargetNamespace: "monitoring",
+			DeploymentMode: monitoringv1alpha1.DeploymentModeDeployment,
+			DesiredPods:    1, AvailablePods: 1,
+		},
+	}
+}
+
+func assertGH56ObservationFailure(t *testing.T, ctx context.Context, baseClient client.Client, instance *monitoringv1alpha1.KubeStateMetrics, reconcileErr error, expectedError string) {
+	t.Helper()
+	if reconcileErr == nil || !strings.Contains(reconcileErr.Error(), expectedError) {
+		t.Fatalf("reconcile error = %v, want %s", reconcileErr, expectedError)
+	}
+	actual := getInstance(t, ctx, baseClient, instance.Name)
+	progressing := findCondition(actual.Status.Conditions, "Progressing")
+	if progressing.Status != metav1.ConditionTrue || progressing.Reason != ksm.ReasonSwitchingDeploymentMode {
+		t.Fatalf("Progressing = %#v, want True/%s", progressing, ksm.ReasonSwitchingDeploymentMode)
+	}
+	degraded := findCondition(actual.Status.Conditions, "Degraded")
+	if degraded.Status != metav1.ConditionTrue || degraded.Reason != ksm.ReasonObservationFailed || !strings.Contains(degraded.Message, expectedError) {
+		t.Fatalf("Degraded = %#v, want observation failure containing %q", degraded, expectedError)
+	}
+	if actual.Status.ObservedGeneration != actual.Generation {
+		t.Fatalf("observedGeneration = %d, want %d", actual.Status.ObservedGeneration, actual.Generation)
 	}
 }
 
@@ -710,7 +1141,8 @@ func getInstance(t *testing.T, ctx context.Context, kubeClient client.Client, na
 	return instance
 }
 
-func boolValue(value bool) *bool { return &value }
+func boolValue(value bool) *bool    { return &value }
+func int32Value(value int32) *int32 { return &value }
 
 func drainEvents(recorder *record.FakeRecorder) {
 	for {

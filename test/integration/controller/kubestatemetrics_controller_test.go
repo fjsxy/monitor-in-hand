@@ -639,6 +639,257 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Entry("Kubernetes 1.19 profile", "v1.19.16", "119"),
 		Entry("Kubernetes 1.28 profile", "v1.28.15", "128"),
 	)
+
+	DescribeTable("IT-KSM-GH56-001 写入分片资源并从 StatefulSet status 报告实际可用性", func(gitVersion, caseSuffix string) {
+		By("准备一个三分片的 experimental StatefulSetSharded 受管实例")
+		namespace := "it-ksm-sharded-" + caseSuffix + "-" + suffix
+		name := "sharded-" + caseSuffix + "-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+					StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+						Shards: 3,
+					},
+				},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("执行调谐并验证 StatefulSet、无头 Service 与 namespaced RBAC")
+		reconcile(name, gitVersion)
+		statefulSet := &appsv1.StatefulSet{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, statefulSet)).To(Succeed())
+		Expect(*statefulSet.Spec.Replicas).To(Equal(int32(3)))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+		service := &corev1.Service{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.Spec.Selector).To(SatisfyAll(
+			HaveKeyWithValue("app.kubernetes.io/instance", name),
+			HaveKeyWithValue("monitor-in-hand/endpoint-group", "sharded"),
+			Not(HaveKey("app.kubernetes.io/version")),
+		))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &rbacv1.Role{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &rbacv1.RoleBinding{})).To(Succeed())
+
+		By("验证初始 status 与七个实际受管资源一致")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status).To(SatisfyAll(
+			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeStatefulSetSharded),
+			HaveField("DesiredPods", int32(3)),
+			HaveField("AvailablePods", int32(0)),
+			HaveField("ManagedResources", HaveLen(7)),
+		))
+
+		By("模拟全部 shard 可用并验证 Ready status")
+		statefulSet.Status.Replicas = 3
+		statefulSet.Status.ReadyReplicas = 3
+		statefulSet.Status.AvailableReplicas = 3
+		Expect(testClient.Status().Update(ctx, statefulSet)).To(Succeed())
+		reconcile(name, gitVersion)
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.AvailablePods).To(Equal(int32(3)))
+		Expect(actual.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseReady))
+	},
+		Entry("Kubernetes 1.19 profile", "v1.19.16", "119"),
+		Entry("Kubernetes 1.28 profile", "v1.28.15", "128"),
+	)
+
+	It("IT-KSM-GH56-002 模式往返切换始终先确认旧 workload 消失", func() {
+		By("准备已收敛的默认 Deployment，并用 finalizer 保留其终止阶段")
+		namespace := "it-ksm-switch-" + suffix
+		name := "switch-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		deployment.Finalizers = []string{"test.monitor-in-hand/switch"}
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+
+		By("切到分片模式，验证 Deployment 未消失前不暴露新拓扑")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+			StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+				Shards: 2,
+			},
+		}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		result := reconcile(name, "v1.28.15")
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		Expect(deployment.DeletionTimestamp.IsZero()).To(BeFalse())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.StatefulSet{})).To(Satisfy(apierrors.IsNotFound))
+		service := &corev1.Service{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.Spec.Selector).To(HaveKeyWithValue("monitor-in-hand/endpoint-group", "default"))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &rbacv1.Role{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Progressing").Reason).To(Equal(ksm.ReasonSwitchingDeploymentMode))
+
+		By("释放旧 Deployment，再创建分片拓扑并调整 Service/RBAC")
+		deployment.Finalizers = nil
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+		Eventually(func() error {
+			return testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})
+		}).Should(Satisfy(apierrors.IsNotFound))
+		reconcile(name, "v1.28.15")
+		statefulSet := &appsv1.StatefulSet{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, statefulSet)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.Spec.Selector).To(HaveKeyWithValue("monitor-in-hand/endpoint-group", "sharded"))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &rbacv1.Role{})).To(Succeed())
+
+		By("切回 Deployment，验证 StatefulSet 未消失前仍保持分片 Service/RBAC")
+		statefulSet.Finalizers = []string{"test.monitor-in-hand/switch"}
+		Expect(testClient.Update(ctx, statefulSet)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{Mode: monitoringv1alpha1.DeploymentModeDeployment}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		result = reconcile(name, "v1.28.15")
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, statefulSet)).To(Succeed())
+		Expect(statefulSet.DeletionTimestamp.IsZero()).To(BeFalse())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.Spec.Selector).To(HaveKeyWithValue("monitor-in-hand/endpoint-group", "sharded"))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &rbacv1.Role{})).To(Succeed())
+
+		By("释放旧 StatefulSet，清理分片 RBAC 后重建 Deployment")
+		statefulSet.Finalizers = nil
+		Expect(testClient.Update(ctx, statefulSet)).To(Succeed())
+		Eventually(func() error {
+			return testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.StatefulSet{})
+		}).Should(Satisfy(apierrors.IsNotFound))
+		reconcile(name, "v1.28.15")
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.StatefulSet{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &rbacv1.Role{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.Spec.Selector).To(HaveKeyWithValue("monitor-in-hand/endpoint-group", "default"))
+	})
+
+	It("IT-KSM-GH56-003 shards 小于二时只报告 InvalidSpec", func() {
+		By("通过真实 API Server 提交单分片声明")
+		namespace := "it-ksm-invalid-shards-" + suffix
+		name := "invalid-shards-" + suffix
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+					StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+						Shards: 1,
+					},
+				},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("验证 controller 报告稳定 InvalidSpec 且不写入任何资源")
+		reconcile(name, "v1.28.15")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Degraded").Reason).To(Equal(ksm.ReasonInvalidSpec))
+		Expect(condition(actual, "Degraded").Message).To(ContainSubstring("至少为 2"))
+		Expect(actual.Status.ManagedResources).To(BeEmpty())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "ksm-" + name}, &appsv1.StatefulSet{})).To(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("IT-KSM-GH56-004 切回 Deployment 时外部占用的分片 RBAC 阻断创建", func() {
+		By("准备已收敛的分片拓扑，并模拟 Role 不再属于当前受管实例")
+		namespace := "it-ksm-rbac-conflict-" + suffix
+		name := "rbac-conflict-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+					StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+						Shards: 2,
+					},
+				},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		role := &rbacv1.Role{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, role)).To(Succeed())
+		role.OwnerReferences = nil
+		role.Labels["preserve"] = "true"
+		Expect(testClient.Update(ctx, role)).To(Succeed())
+
+		By("请求切回 Deployment，先确认旧 StatefulSet 消失")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{Mode: monitoringv1alpha1.DeploymentModeDeployment}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		Eventually(func() error {
+			return testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.StatefulSet{})
+		}).Should(Satisfy(apierrors.IsNotFound))
+
+		By("验证清理预检报告 ResourceConflict，不删其他 RBAC 也不创建 Deployment")
+		result := reconcile(name, "v1.28.15")
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Degraded").Reason).To(Equal(ksm.ReasonResourceConflict))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, role)).To(Succeed())
+		Expect(role.Labels).To(HaveKeyWithValue("preserve", "true"))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &rbacv1.RoleBinding{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("IT-KSM-GH56-005 全新 Deployment 忽略无关的同名 namespaced RBAC", func() {
+		By("准备不属于任何受管分片拓扑的同名 Role/RoleBinding")
+		namespace := "it-ksm-fresh-deployment-" + suffix
+		name := "fresh-deployment-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		foreignRole := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace, Labels: map[string]string{"preserve": "true"}}}
+		foreignBinding := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace, Labels: map[string]string{"preserve": "true"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "external"},
+		}
+		Expect(testClient.Create(ctx, foreignRole)).To(Succeed())
+		Expect(testClient.Create(ctx, foreignBinding)).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("执行默认调谐，验证未应用过分片模式时不清理或占用这些 RBAC")
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.DeploymentMode).To(Equal(monitoringv1alpha1.DeploymentModeDeployment))
+		Expect(condition(actual, "Degraded").Status).To(Equal(metav1.ConditionFalse))
+		Expect(testClient.Get(ctx, client.ObjectKeyFromObject(foreignRole), foreignRole)).To(Succeed())
+		Expect(foreignRole.Labels).To(HaveKeyWithValue("preserve", "true"))
+		Expect(testClient.Get(ctx, client.ObjectKeyFromObject(foreignBinding), foreignBinding)).To(Succeed())
+		Expect(foreignBinding.Labels).To(HaveKeyWithValue("preserve", "true"))
+	})
+
 	It("IT-KSM-006 停用优先于无效声明并在 Disabled 后按最新声明恢复", func() {
 		By("准备一个已创建完整资源的受管实例")
 		namespace := "it-ksm-disable-" + suffix
