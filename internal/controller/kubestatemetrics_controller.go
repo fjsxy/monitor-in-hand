@@ -150,6 +150,12 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 			return ctrl.Result{RequeueAfter: cleanupRetryInterval}, nil
 		}
 	}
+	// 在首次写入前固定清理所需的 Namespace；即使后续只成功创建部分资源，停用和删除也能找到它们。
+	if instance.Status.AppliedTargetNamespace == "" {
+		if err := r.checkpointAppliedTargetNamespace(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// 所有写入都通过 owner 预检后才执行，保证同名非受管资源不会被部分接管。
 	for _, desired := range resources {
@@ -181,6 +187,7 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 }
 
 func (r *KubeStateMetricsReconciler) reconcileDisabled(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics) (ctrl.Result, error) {
+	// 持续发出全部直接受管资源的删除，并把失败或仍存在的资源暴露为可重试状态。
 	resources, err := r.deleteManagedResources(ctx, instance)
 	if err != nil {
 		statusErr := r.updateCleanupStatus(ctx, instance, resources, ksm.ReasonDisabling, err)
@@ -195,6 +202,7 @@ func (r *KubeStateMetricsReconciler) reconcileDisabled(ctx context.Context, inst
 		}
 		return ctrl.Result{RequeueAfter: cleanupRetryInterval}, nil
 	}
+	// 只有 API 已确认全部资源消失，停用才算完成。
 	if err := r.updateDisabledStatus(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -202,6 +210,7 @@ func (r *KubeStateMetricsReconciler) reconcileDisabled(ctx context.Context, inst
 }
 
 func (r *KubeStateMetricsReconciler) reconcileSuspended(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan) (ctrl.Result, error) {
+	// 挂起只收敛 workload controller 的删除，前序调谐已经确保非 workload 资源继续存在。
 	workload := workloadResources(plan.Resources)
 	resources, err := r.deleteOwnedResources(ctx, instance, workload)
 	if err != nil {
@@ -217,6 +226,7 @@ func (r *KubeStateMetricsReconciler) reconcileSuspended(ctx context.Context, ins
 		}
 		return ctrl.Result{RequeueAfter: cleanupRetryInterval}, nil
 	}
+	// 确认 workload 消失后才报告管理员可观察的 Suspended 契约。
 	if err := r.updateSuspendedStatus(ctx, instance, plan, nil, false, nil); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -227,6 +237,7 @@ func (r *KubeStateMetricsReconciler) reconcileDeletion(ctx context.Context, inst
 	if !controllerutil.ContainsFinalizer(instance, kubeStateMetricsFinalizer) {
 		return ctrl.Result{}, nil
 	}
+	// finalizer 期间持续主动删除并确认全部直接受管资源，任何失败都保留 finalizer 供后续重试。
 	resources, err := r.deleteManagedResources(ctx, instance)
 	if err != nil {
 		statusErr := r.updateDeletingStatus(ctx, instance, resources, err)
@@ -241,6 +252,7 @@ func (r *KubeStateMetricsReconciler) reconcileDeletion(ctx context.Context, inst
 		}
 		return ctrl.Result{RequeueAfter: cleanupRetryInterval}, nil
 	}
+	// 只有清理集合为空时才释放 CR；删除一旦开始，不再进入普通调谐路径。
 	if err := r.updateDeletingStatus(ctx, instance, nil, nil); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -259,6 +271,7 @@ func (r *KubeStateMetricsReconciler) deleteManagedResources(ctx context.Context,
 func (r *KubeStateMetricsReconciler) deleteOwnedResources(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, resources []client.Object) ([]monitoringv1alpha1.ManagedResourceReference, error) {
 	var found []monitoringv1alpha1.ManagedResourceReference
 	var deleteErrors []error
+	// 逐个读取稳定身份并核对 controller owner；同名非受管对象必须跳过，各资源错误则聚合后统一重试。
 	for _, identity := range resources {
 		current, err := emptyObjectFor(identity)
 		if err != nil {
@@ -305,6 +318,15 @@ func (r *KubeStateMetricsReconciler) terminatingManagedResources(ctx context.Con
 		}
 	}
 	return terminating, nil
+}
+
+func (r *KubeStateMetricsReconciler) checkpointAppliedTargetNamespace(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics) error {
+	before := instance.Status.DeepCopy()
+	instance.Status.AppliedTargetNamespace = instance.Spec.TargetNamespace
+	if err := r.writeStatusIfChanged(ctx, instance, *before); err != nil {
+		return fmt.Errorf("在写入受管资源前记录目标 Namespace %q: %w", instance.Spec.TargetNamespace, err)
+	}
+	return nil
 }
 
 func directManagedResources(instance *monitoringv1alpha1.KubeStateMetrics) []client.Object {
@@ -500,6 +522,7 @@ func (r *KubeStateMetricsReconciler) updateSuspendedStatus(ctx context.Context, 
 	instance.Status.DesiredPods = 0
 	instance.Status.AvailablePods = 0
 	instance.Status.ManagedResources = append(managedResourceReferences(nonWorkloadResources(plan.Resources)), workloads...)
+	// 删除失败、等待删除和完成挂起是互斥阶段，各自保持 Ready/Available/Degraded 的一致组合。
 	if cleanupErr != nil {
 		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, ksm.ReasonDeleteFailed, "删除 workload controller 失败")
 		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionTrue, ksm.ReasonSuspending, "持续重试删除 workload controller")
@@ -597,6 +620,7 @@ func (r *KubeStateMetricsReconciler) recordStatusEvent(instance *monitoringv1alp
 	}
 	oldFailure := failureReason(before.Conditions)
 	newFailure := failureReason(instance.Status.Conditions)
+	// Event 采用失败、恢复、phase、condition reason 的固定优先级，每次 status 写入最多产生一条。
 	if newFailure != "" && newFailure != oldFailure {
 		condition := apiMeta.FindStatusCondition(instance.Status.Conditions, "Degraded")
 		r.Recorder.Event(instance, corev1.EventTypeWarning, newFailure, condition.Message)

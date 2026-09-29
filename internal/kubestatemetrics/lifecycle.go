@@ -18,7 +18,7 @@ const (
 	ReasonWaitingForDeletion = "WaitingForDeletion"
 )
 
-// DerivePhase summarizes lifecycle state without creating a second mutable source of truth.
+// DerivePhase 从删除状态与 conditions 推导摘要，按删除、停用、故障、推进、就绪的业务优先级避免第二份可变状态源。
 func DerivePhase(instance *monitoringv1alpha1.KubeStateMetrics) monitoringv1alpha1.KubeStateMetricsPhase {
 	if !instance.DeletionTimestamp.IsZero() {
 		return monitoringv1alpha1.KubeStateMetricsPhaseDeleting
