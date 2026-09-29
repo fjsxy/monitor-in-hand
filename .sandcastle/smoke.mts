@@ -59,7 +59,7 @@ try {
         onSandboxReady: [
           {
             command:
-              "codex login status && gh auth status && go version && helm version --short && codex --version",
+              "codex login status && gh auth status && gh auth setup-git && git ls-remote --exit-code origin HEAD >/dev/null && go version && helm version --short && codex --version",
           },
         ],
       },

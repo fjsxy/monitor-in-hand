@@ -282,7 +282,7 @@ async function executeIssue(
           onSandboxReady: [
             {
               command:
-                "codex login status && gh auth status && go mod download",
+                "codex login status && gh auth status && gh auth setup-git && go mod download",
               timeoutMs: 300_000,
             },
           ],
