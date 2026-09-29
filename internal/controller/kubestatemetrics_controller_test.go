@@ -30,6 +30,10 @@ type deleteFailingClient struct {
 	client.Client
 }
 
+type partiallyFailingClient struct {
+	client.Client
+}
+
 type fixedServerVersion struct{}
 
 func (fixedServerVersion) ServerVersion() (*version.Info, error) {
@@ -41,6 +45,77 @@ func (c deleteFailingClient) Delete(ctx context.Context, object client.Object, o
 		return errors.New("injected delete failure")
 	}
 	return c.Client.Delete(ctx, object, options...)
+}
+
+func (c partiallyFailingClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
+	if _, ok := object.(*corev1.ServiceAccount); ok {
+		if err := c.Client.Create(ctx, object, options...); err != nil {
+			return err
+		}
+		return errors.New("injected ambiguous apply failure")
+	}
+	return c.Client.Create(ctx, object, options...)
+}
+
+func TestPartialApplyKeepsOriginalNamespaceForDisableCleanup(t *testing.T) {
+	// 准备两个 Namespace，并模拟 ServiceAccount 已被 API 持久化但客户端收到写入失败。
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := monitoringv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	instance := &monitoringv1alpha1.KubeStateMetrics{
+		ObjectMeta: metav1.ObjectMeta{Name: "partial-apply", UID: types.UID("uid-partial-apply")},
+		Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: "original"},
+	}
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(instance, &appsv1.Deployment{}).
+		WithObjects(instance,
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "original"}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "replacement"}},
+		).
+		Build()
+	reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+		Client:        partiallyFailingClient{Client: baseClient},
+		ServerVersion: fixedServerVersion{},
+	}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: instance.Name}}
+
+	// 部分写入失败后必须先持久化原 Namespace，确保清理身份不会随后续 spec 漂移。
+	if _, err := reconciler.Reconcile(ctx, request); err == nil || !strings.Contains(err.Error(), "injected ambiguous apply failure") {
+		t.Fatalf("reconcile error = %v, want injected ambiguous apply failure", err)
+	}
+	actual := getInstance(t, ctx, baseClient, instance.Name)
+	if actual.Status.AppliedTargetNamespace != "original" {
+		t.Fatalf("appliedTargetNamespace = %q, want original", actual.Status.AppliedTargetNamespace)
+	}
+	resourceKey := client.ObjectKey{Namespace: "original", Name: "ksm-" + instance.Name}
+	if err := baseClient.Get(ctx, resourceKey, &corev1.ServiceAccount{}); err != nil {
+		t.Fatalf("partially applied ServiceAccount missing: %v", err)
+	}
+
+	// 即使普通字段改到另一 Namespace，停用也必须旁路校验并主动清理旧 generation 的部分资源。
+	actual.Spec.TargetNamespace = "replacement"
+	actual.Spec.Enabled = boolValue(false)
+	if err := baseClient.Update(ctx, actual); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := reconciler.Reconcile(ctx, request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	actual = getInstance(t, ctx, baseClient, instance.Name)
+	if actual.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseDisabled {
+		t.Fatalf("phase = %q, want Disabled", actual.Status.Phase)
+	}
+	if err := baseClient.Get(ctx, resourceKey, &corev1.ServiceAccount{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("old ServiceAccount get error = %v, want NotFound", err)
+	}
 }
 
 func TestDeletionFailureKeepsFinalizerAndDeduplicatesEvent(t *testing.T) {
