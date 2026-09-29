@@ -137,7 +137,7 @@ hack/preflight.sh \
   --operator-deployment prometheus-operator
 ```
 
-`--config-namespaces` 是四类采集配置可能被选中的 namespace；`--discovery-namespaces` 是 Agent 一期 Kubernetes discovery 可能读取的 namespace。两者均接受逗号分隔列表，或单独的 `*` 表示要求覆盖全部 namespace。`--agent-manifest` 启用计划配置检查；每个可能被非 nil selector 选中的配置都必须通过可重复的 `--collection-config-manifest` 提供。预检接受 nil object selector（四类全 nil 也是合法零配置），拒绝把空 object selector、Node、FileSD 或其他一期外 discovery 误报为一期支持，并在声明对象自身 namespace 检查 Secret/ConfigMap 引用。默认查找 `prometheus-operator/prometheus-operator` Deployment；可用 `--context` 选择 kubeconfig context，用 `--timeout-seconds` 调整 1–900 秒的 reconcile 上限。完整输入见：
+`--config-namespaces` 是四类采集配置可能被选中的 namespace；`--discovery-namespaces` 是 Agent 一期 Kubernetes discovery 可能读取的 namespace。两者均接受逗号分隔列表，或单独的 `*` 表示要求覆盖全部 namespace。`--agent-manifest` 启用计划配置检查；每个可能被非 nil selector 选中的配置都必须通过可重复的 `--collection-config-manifest` 提供。预检接受 nil object selector（四类全 nil 也是合法零配置），拒绝把空 object selector、Node、FileSD 或其他一期外 discovery 误报为一期支持，并按 ServiceMonitor、PodMonitor、Probe 与 ScrapeConfig 的原生 target 范围核对 `--discovery-namespaces`。ScrapeConfig 的 Kubernetes discovery 省略 `namespaces` 时表示全部 namespace，因此必须声明 `*`；Secret/ConfigMap 引用则只在声明对象自身 namespace 检查。默认查找 `prometheus-operator/prometheus-operator` Deployment；可用 `--context` 选择 kubeconfig context，用 `--timeout-seconds` 调整 1–900 秒的 reconcile 上限。完整输入见：
 
 ```bash
 hack/preflight.sh --help
