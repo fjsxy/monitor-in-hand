@@ -139,7 +139,15 @@ spec:
 			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeStatefulSetSharded),
 			HaveField("DesiredPods", int32(2)),
 			HaveField("AvailablePods", int32(2)),
-			HaveField("ManagedResources", HaveLen(7)),
+			HaveField("ManagedResources", ConsistOf(
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "ServiceAccount", Namespace: targetNamespace, Name: shardedManagedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole", Name: shardedManagedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding", Name: shardedManagedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "Service", Namespace: targetNamespace, Name: shardedManagedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role", Namespace: targetNamespace, Name: shardedManagedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding", Namespace: targetNamespace, Name: shardedManagedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "apps/v1", Kind: "StatefulSet", Namespace: targetNamespace, Name: shardedManagedName},
+			)),
 		))
 
 		By("切回 Deployment，轮询期间拒绝两种 workload 同时存在")
@@ -231,16 +239,12 @@ func statefulShardedScenarioID(sequence string) string {
 
 func waitForShardedTopology(ctx SpecContext, instanceName, managedName string, shards int32) {
 	Eventually(func() error {
-		statefulSet, statefulErr := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", managedName)
-		deployment, deploymentErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", managedName)
-		if statefulErr == nil && deploymentErr == nil {
-			return fmt.Errorf("Deployment 与 StatefulSet 同时存在")
+		statefulSet, err := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", managedName)
+		if err != nil {
+			return err
 		}
-		if statefulErr != nil {
-			return statefulErr
-		}
-		if deploymentErr == nil || deployment != nil {
-			return fmt.Errorf("旧 Deployment 尚未消失")
+		if err := objectAbsent(ctx, targetNamespace, "deployment", managedName); err != nil {
+			return fmt.Errorf("确认旧 Deployment 已消失: %w", err)
 		}
 		if statefulSet.Status.ReadyReplicas != shards {
 			return fmt.Errorf("StatefulSet readyReplicas=%d，期望 %d", statefulSet.Status.ReadyReplicas, shards)
@@ -261,16 +265,12 @@ func waitForShardedTopology(ctx SpecContext, instanceName, managedName string, s
 
 func waitForDeploymentTopology(ctx SpecContext, instanceName, managedName string) {
 	Eventually(func() error {
-		deployment, deploymentErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", managedName)
-		statefulSet, statefulErr := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", managedName)
-		if deploymentErr == nil && statefulErr == nil {
-			return fmt.Errorf("Deployment 与 StatefulSet 同时存在")
+		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", managedName)
+		if err != nil {
+			return err
 		}
-		if deploymentErr != nil {
-			return deploymentErr
-		}
-		if statefulErr == nil || statefulSet != nil {
-			return fmt.Errorf("旧 StatefulSet 尚未消失")
+		if err := objectAbsent(ctx, targetNamespace, "statefulset", managedName); err != nil {
+			return fmt.Errorf("确认旧 StatefulSet 已消失: %w", err)
 		}
 		if deployment.Status.AvailableReplicas != 1 {
 			return fmt.Errorf("Deployment availableReplicas=%d，期望 1", deployment.Status.AvailableReplicas)

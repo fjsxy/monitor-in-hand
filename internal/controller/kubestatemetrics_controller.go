@@ -212,14 +212,14 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 		return ctrl.Result{}, nil
 	}
 
-	availablePods, err := r.workloadAvailablePods(ctx, instance.Spec.TargetNamespace, plan)
+	desiredPods, availablePods, err := r.workloadPodCounts(ctx, instance.Spec.TargetNamespace, plan)
 	if err != nil {
 		if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, err); statusErr != nil {
 			return ctrl.Result{}, fmt.Errorf("%v；并且更新 topology 观测失败 status: %w", err, statusErr)
 		}
 		return ctrl.Result{}, err
 	}
-	if err := r.updateSuccessStatus(ctx, instance, plan, availablePods); err != nil {
+	if err := r.updateSuccessStatus(ctx, instance, plan, desiredPods, availablePods); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
@@ -956,27 +956,27 @@ func (r *KubeStateMetricsReconciler) updateProblemStatus(ctx context.Context, in
 	return r.writeStatusIfChanged(ctx, instance, *before)
 }
 
-func (r *KubeStateMetricsReconciler) workloadAvailablePods(ctx context.Context, namespace string, plan *ksm.ResourcePlan) (int32, error) {
+func (r *KubeStateMetricsReconciler) workloadPodCounts(ctx context.Context, namespace string, plan *ksm.ResourcePlan) (int32, int32, error) {
 	key := client.ObjectKey{Namespace: namespace, Name: plan.Name}
 	switch plan.Mode {
 	case monitoringv1alpha1.DeploymentModeDeployment:
 		deployment := &appsv1.Deployment{}
 		if err := r.Get(ctx, key, deployment); err != nil {
-			return 0, fmt.Errorf("读取已应用 Deployment: %w", err)
+			return 0, 0, fmt.Errorf("读取已应用 Deployment: %w", err)
 		}
-		return deployment.Status.AvailableReplicas, nil
+		return pointerValue(deployment.Spec.Replicas), deployment.Status.AvailableReplicas, nil
 	case monitoringv1alpha1.DeploymentModeStatefulSetSharded:
 		statefulSet := &appsv1.StatefulSet{}
 		if err := r.Get(ctx, key, statefulSet); err != nil {
-			return 0, fmt.Errorf("读取已应用 StatefulSet: %w", err)
+			return 0, 0, fmt.Errorf("读取已应用 StatefulSet: %w", err)
 		}
-		return statefulSet.Status.ReadyReplicas, nil
+		return pointerValue(statefulSet.Spec.Replicas), statefulSet.Status.ReadyReplicas, nil
 	default:
-		return 0, fmt.Errorf("不支持的已规划部署模式 %q", plan.Mode)
+		return 0, 0, fmt.Errorf("不支持的已规划部署模式 %q", plan.Mode)
 	}
 }
 
-func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan, availablePods int32) error {
+func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan, desiredPods, availablePods int32) error {
 	before := instance.Status.DeepCopy()
 	instance.Status.ObservedGeneration = instance.Generation
 	instance.Status.AppliedTargetNamespace = instance.Spec.TargetNamespace
@@ -984,17 +984,31 @@ func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, in
 	instance.Status.DeploymentMode = plan.Mode
 	instance.Status.EffectiveCollectors = append([]string(nil), plan.EffectiveCollectors...)
 	instance.Status.EffectiveNamespaceCount = int32(len(plan.EffectiveNamespaces))
-	instance.Status.DesiredPods = plan.DesiredPods
+	instance.Status.DesiredPods = desiredPods
 	instance.Status.AvailablePods = availablePods
 	instance.Status.ManagedResources = managedResourceReferences(plan.Resources)
-	if availablePods >= plan.DesiredPods {
+	if availablePods >= desiredPods {
 		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionTrue, "ReconcileSucceeded", "受管实例已就绪")
 		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionFalse, "ReconcileSucceeded", "无需继续推进")
-		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "MinimumReplicasAvailable", fmt.Sprintf("%s 的 %d 个 Pod 全部可用", plan.Mode, plan.DesiredPods))
+		availableMessage := fmt.Sprintf("%s 的 %d 个 Pod 全部可用", plan.Mode, desiredPods)
+		if plan.Mode == monitoringv1alpha1.DeploymentModeDeployment {
+			availableMessage = "单副本 Deployment 可用"
+		}
+		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "MinimumReplicasAvailable", availableMessage)
 	} else {
-		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, "WorkloadProgressing", fmt.Sprintf("等待 %s 的 %d 个 Pod 可用", plan.Mode, plan.DesiredPods))
-		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionTrue, "WorkloadProgressing", fmt.Sprintf("当前可用 Pod %d/%d", availablePods, plan.DesiredPods))
-		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, "MinimumReplicasUnavailable", "受管 workload 尚未全部可用")
+		progressingReason := "WorkloadProgressing"
+		readyMessage := fmt.Sprintf("等待 %s 的 %d 个 Pod 可用", plan.Mode, desiredPods)
+		progressingMessage := fmt.Sprintf("当前可用 Pod %d/%d", availablePods, desiredPods)
+		availableMessage := "受管 workload 尚未全部可用"
+		if plan.Mode == monitoringv1alpha1.DeploymentModeDeployment {
+			progressingReason = "DeploymentProgressing"
+			readyMessage = "等待单副本 Deployment 可用"
+			progressingMessage = readyMessage
+			availableMessage = "单副本 Deployment 尚不可用"
+		}
+		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, progressingReason, readyMessage)
+		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionTrue, progressingReason, progressingMessage)
+		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, "MinimumReplicasUnavailable", availableMessage)
 	}
 	setCondition(&instance.Status, instance.Generation, "Degraded", metav1.ConditionFalse, "ReconcileSucceeded", "未发现调谐故障")
 	return r.writeStatusIfChanged(ctx, instance, *before)
@@ -1126,6 +1140,13 @@ func copyStringMap(source map[string]string) map[string]string {
 		result[key] = value
 	}
 	return result
+}
+
+func pointerValue(value *int32) int32 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (r *KubeStateMetricsReconciler) SetupWithManager(manager ctrl.Manager) error {
