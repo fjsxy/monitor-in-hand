@@ -106,7 +106,7 @@ spec:
       memory: 256Mi
 ```
 
-`collectors.mode` 仅支持 `Default`（`names` 必须为空）和 `Include`（非空、无重复且只能使用共同 catalog）；`metricFilter.mode` 仅支持 `All`、`Allow`、`Deny`。Allow/Deny pattern 必须非空、是合法 Go regexp 且不含逗号。解析后的 collector 列表通过 `status.effectiveCollectors` 报告。
+`collectors.mode` 仅支持 `Default`（`names` 必须为空）和 `Include`（非空、无重复且只能使用共同 catalog）；`metricFilter.mode` 仅支持 `All`、`Allow`、`Deny`。Allow/Deny pattern 必须非空、是合法 Go regexp 且不含逗号。解析后的 collector 列表通过 `status.effectiveCollectors` 报告。`podResources` 的 requests/limits 会完整下发；由于稳定 API 不开放 Pod `resourceClaims` 来源声明，非空 `podResources.claims` 会返回 `InvalidSpec`。
 
 ## 部署预检
 

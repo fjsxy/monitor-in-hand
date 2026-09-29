@@ -302,6 +302,16 @@ var _ = Describe("默认 Deployment 规划", func() {
 		Entry("Kubernetes 1.28", "v1.28.15"),
 	)
 
+	It("UT-KSM-012 在规划资源前拒绝缺少 Pod resourceClaims 声明的 claim", func() {
+		By("准备引用未开放 Pod resourceClaims 的容器资源声明")
+		instance := newInstance()
+		instance.Spec.PodResources = &corev1.ResourceRequirements{
+			Claims: []corev1.ResourceClaim{{Name: "accelerator"}},
+		}
+
+		expectInvalidSpecAcrossProfiles(instance, "podResources.claims")
+	})
+
 	It("UT-KSM-002 对未知 minor 返回 UnsupportedKubernetesVersion 且零资源", func() {
 		plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
 			KubernetesVersion:     "v1.27.9",

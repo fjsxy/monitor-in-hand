@@ -23,6 +23,7 @@
 | `UT-KSM-009` | #54 | 纯规划 | 1.19、1.28 | Allow/Deny 分别映射 metric allowlist/denylist，pattern 不被隐式锚定 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-KSM-010` | #54 | 纯规划 | 1.19、1.28 | 拒绝 mode/list 冲突、空项、非法 Go regexp 与含逗号项；合法零命中 pattern 不要求预知指标 catalog | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-KSM-011` | #54 | 纯规划 | 1.19、1.28 | 显式 `podResources` 完整下发 requests/limits，不伪造项目默认值 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-012` | #54 | 纯规划 | 1.19、1.28 | 非空 `podResources.claims` 因缺少 Pod `resourceClaims` 声明入口而在资源规划前返回 `InvalidSpec` | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `IT-KSM-006` | #54 | envtest | API Server 1.28；目标 profile 1.19、1.28 | API 配置贯通 Deployment args/resources 与 status effective collectors；已应用配置变为非法后 workload 不被重写 | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-007` | #54 | envtest | API Server 1.28 | 非法配置优先于缺失 Namespace 返回 InvalidSpec；零资源、无定时重试、相同 generation 不重复写 status，其他实例不受影响，新 generation 可恢复 | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-008` | #54 | envtest | API Server 1.28；目标 profile 1.19、1.28 | Deny filter 映射为两个版本 workload 的 metric denylist，effective collectors 与参数一致 | Ginkgo failure、API object | `make test-integration` |

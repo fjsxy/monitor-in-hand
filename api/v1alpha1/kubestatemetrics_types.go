@@ -110,6 +110,7 @@ type KubeStateMetricsSpec struct {
 
 	// PodResources is passed unchanged to the kube-state-metrics container.
 	// When omitted, the Operator does not inject requests or limits.
+	// Claims are rejected because the managed Pod API does not expose resourceClaims.
 	// +optional
 	PodResources *corev1.ResourceRequirements `json:"podResources,omitempty"`
 }
