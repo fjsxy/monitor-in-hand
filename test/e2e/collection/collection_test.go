@@ -188,7 +188,9 @@ var _ = Describe("原生 PrometheusAgent 采集配置", Serial, func() {
 			events, err = kubectlResult(ctx, "--namespace", testNamespace, "get", "events", "--field-selector",
 				"involvedObject.kind=ScrapeConfig,involvedObject.name=gh59-invalid", "--output", "json")
 			g.Expect(err).NotTo(HaveOccurred(), events)
-			g.Expect(events).To(ContainSubstring(`"reason":"InvalidConfiguration"`))
+			found, err := eventHasReason(events, "InvalidConfiguration")
+			g.Expect(err).NotTo(HaveOccurred(), events)
+			g.Expect(found).To(BeTrue(), events)
 		}, 3*time.Minute, 2*time.Second).Should(Succeed())
 		AddReportEntry("invalid-configuration-events", events, ReportEntryVisibilityFailureOrVerbose)
 
@@ -256,8 +258,38 @@ func kubectl(ctx context.Context, args ...string) string {
 
 func kubectlResult(ctx context.Context, args ...string) (string, error) {
 	commandArgs := append([]string{"--context", config.kubeContext}, args...)
-	output, err := exec.CommandContext(ctx, "kubectl", commandArgs...).CombinedOutput()
-	return string(output), err
+	return commandResult(exec.CommandContext(ctx, "kubectl", commandArgs...))
+}
+
+func commandResult(command *exec.Cmd) (string, error) {
+	// 将机器可判定的 stdout 与诊断 stderr 分流，避免 kubectl warning 污染授权结果或 JSON。
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	if err != nil && stderr.Len() > 0 {
+		return stdout.String(), fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), err
+}
+
+func eventHasReason(events, reason string) (bool, error) {
+	// 结构化读取 EventList，确保断言不依赖 kubectl 的 JSON 缩进格式。
+	var eventList struct {
+		Items []struct {
+			Reason string `json:"reason"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(events), &eventList); err != nil {
+		return false, fmt.Errorf("parse event list: %w", err)
+	}
+	for _, event := range eventList.Items {
+		if event.Reason == reason {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func waitForAgentConditions(ctx context.Context, name string) {
