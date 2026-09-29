@@ -64,6 +64,10 @@ var _ = Describe("双版本一期验收门禁", func() {
 			HaveKeyWithValue("run", ContainSubstring("make e2e-preflight")),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("name", "E2E PrometheusAgent 采集配置"),
+			HaveKeyWithValue("run", ContainSubstring("make e2e-collection")),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "E2E 默认 KubeStateMetrics Deployment"),
 			HaveKeyWithValue("run", ContainSubstring("make e2e-default-deployment")),
 		)))
@@ -98,6 +102,7 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(string(makefile)).To(ContainSubstring("--junit-report"))
 		Expect(string(makefile)).To(ContainSubstring("e2e-preflight:"))
 		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/preflight"`))
+		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/collection"`))
 		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/kubestatemetrics"`))
 		Expect(string(makefile)).NotTo(ContainSubstring("./hack/e2e-default-deployment.sh"))
 

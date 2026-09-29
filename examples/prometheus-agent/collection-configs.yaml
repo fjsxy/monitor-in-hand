@@ -1,0 +1,138 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: example
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  namespaceSelector:
+    matchNames: [applications]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: metrics-target
+  endpoints:
+    - port: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: example
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  namespaceSelector:
+    matchNames: [applications]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: metrics-target
+  podMetricsEndpoints:
+    - port: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: example
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  module: http_2xx
+  prober:
+    url: blackbox-exporter.monitoring.svc:9115
+  targets:
+    staticConfig:
+      static:
+        - http://metrics-target.applications.svc:9100/metrics
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: example-static
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  staticConfigs:
+    - targets: [metrics-target.applications.svc:9100]
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: example-pod
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  kubernetesSDConfigs:
+    - role: Pod
+      namespaces:
+        names: [applications]
+      selectors:
+        - role: Pod
+          label: app.kubernetes.io/name=metrics-target
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: example-service
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  kubernetesSDConfigs:
+    - role: Service
+      namespaces:
+        names: [applications]
+      selectors:
+        - role: Service
+          label: app.kubernetes.io/name=metrics-target
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: example-endpoints
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  kubernetesSDConfigs:
+    - role: Endpoints
+      namespaces:
+        names: [applications]
+      selectors:
+        - role: Service
+          label: app.kubernetes.io/name=metrics-target
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: example-endpointslice
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  kubernetesSDConfigs:
+    - role: EndpointSlice
+      namespaces:
+        names: [applications]
+      selectors:
+        - role: Service
+          label: app.kubernetes.io/name=metrics-target
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: example-ingress
+  namespace: monitoring
+  labels:
+    monitoring.fjsxy.github.io/agent: example
+spec:
+  kubernetesSDConfigs:
+    - role: Ingress
+      namespaces:
+        names: [applications]
+      selectors:
+        - role: Ingress
+          label: monitoring.fjsxy.github.io/metrics-target=true

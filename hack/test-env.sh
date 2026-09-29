@@ -322,12 +322,16 @@ verify_environment() {
   done
   "${kubectl_bin}" --context "${context}" auth can-i create statefulsets.apps \
     --all-namespaces --as "${operator_sa}" | grep -Fxq yes
-  for resource in services endpoints pods configmaps ingresses.networking.k8s.io endpointslices.discovery.k8s.io; do
+  for resource in services endpoints pods ingresses.networking.k8s.io endpointslices.discovery.k8s.io; do
     for verb in get list watch; do
       "${kubectl_bin}" --context "${context}" auth can-i "${verb}" "${resource}" \
         --all-namespaces --as "${agent_sa}" | grep -Fxq yes
     done
   done
+  "${kubectl_bin}" --context "${context}" auth can-i get configmaps \
+    --all-namespaces --as "${agent_sa}" | grep -Fxq yes
+  "${kubectl_bin}" --context "${context}" auth can-i get nodes \
+    --all-namespaces --as "${agent_sa}" | grep -Fxq no
   "${kubectl_bin}" --context "${context}" auth can-i get /metrics \
     --as "${agent_sa}" | grep -Fxq yes
 
@@ -380,6 +384,13 @@ capture_evidence() {
   "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
     get prometheusagent,servicemonitor,podmonitor,probe,scrapeconfig --output yaml \
     >"${evidence_dir}/monitoring-resources.yaml" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
+    get secret prom-agent-fixture --output yaml \
+    >"${evidence_dir}/prom-agent-fixture-secret.yaml" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
+    get secret prom-agent-fixture --output 'jsonpath={.data.prometheus\.yaml\.gz}' 2>/dev/null \
+    | base64 --decode | gzip --decompress --stdout \
+    >"${evidence_dir}/prometheus-generated.yaml" 2>&1 || true
   "${kubectl_bin}" --context "${context}" get kubestatemetrics --output yaml \
     >"${evidence_dir}/kubestatemetrics.yaml" 2>&1 || true
   "${kubectl_bin}" --context "${context}" --namespace monitor-in-hand-system get all,lease --output yaml \
@@ -411,6 +422,14 @@ capture_evidence() {
         ;;
     esac
   done
+  "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
+    exec pod/prom-agent-fixture-0 --container prometheus -- \
+    wget -qO- http://127.0.0.1:9090/api/v1/status/config \
+    >"${evidence_dir}/agent-status-config.json" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" \
+    exec pod/prom-agent-fixture-0 --container prometheus -- \
+    wget -qO- http://127.0.0.1:9090/api/v1/targets \
+    >"${evidence_dir}/agent-targets.json" 2>&1 || true
   echo "诊断证据已保存：${evidence_dir}"
 }
 
