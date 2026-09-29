@@ -1,6 +1,6 @@
 # 一期验收矩阵
 
-本文件记录已经自动化并作为 blocking gate 执行的稳定场景。后续 ticket 追加自身场景，不改写已有 ID。
+本文件记录已经自动化并作为 blocking gate 执行的稳定场景。已有 ID 保持不变；后续 ticket 追加自身场景时使用 `docs/agents/development-standards.md` 规定的 Issue-scoped ID，不再分配全局递增编号。
 
 ## UT
 

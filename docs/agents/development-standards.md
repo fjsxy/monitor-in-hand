@@ -2,6 +2,13 @@
 
 本文档适用于整个仓库的业务代码、UT、integration test 和 E2E，也是代码评审的必查项。
 
+## 稳定场景 ID
+
+- 已有稳定场景 ID 是历史追踪身份，不重命名；其兼容清单冻结在 `test/testenv/testdata/legacy-acceptance-ids.txt`，后续不得追加旧格式 ID。
+- 新增稳定场景 ID 必须由其 GitHub Issue 独占分配，不再读取仓库中的最大编号。格式分别为 `UT-<DOMAIN>-GH<ISSUE>-<SEQ>`、`IT-<DOMAIN>-GH<ISSUE>-<SEQ>`、`HELM-GH<ISSUE>-<SEQ>` 和 `E2E-<KUBERNETES_MINOR>-<DOMAIN>-GH<ISSUE>-<SEQ>`。
+- `<ISSUE>` 是实现该场景的 GitHub Issue 编号，不补零；`<SEQ>` 在同一测试层级、目标版本、领域和 Issue 内从 `001` 独立递增。例如 Issue #53 使用 `UT-KSM-GH53-001` 和 `E2E-119-KSM-GH53-001`。
+- 验收矩阵的来源必须包含 ID 中对应的 `#<ISSUE>`。不得使用 UUID、时间戳、全局自增序号或合并时重编号代替该规则。
+
 ## E2E
 
 - 所有 E2E 场景和业务断言必须使用 Go 的 Ginkgo/Gomega 编写。

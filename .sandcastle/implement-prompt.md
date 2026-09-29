@@ -18,6 +18,7 @@
 
 - 先理解 acceptance criteria、相关 ADR/`CONTEXT.md` 和当前实现。
 - 一次完成一个可验证的 red-green slice。
+- 新增稳定测试场景时使用包含 `GH{{TASK_ID}}` 的 Issue-scoped ID；不得扫描现有最大编号后分配全局递增 ID，也不得重命名已有 ID。完整格式遵循 `docs/agents/development-standards.md`。
 - 经常运行聚焦测试；提交前至少运行 `make typecheck` 和 `make test HELM=helm`。
 - sandbox 不挂载宿主 Docker socket。需要 kind/Docker 的验收必须落实为 PR 中的 blocking CI job；本地明确记录未运行，不能伪报通过。
 - 不得通过删除、skip、放宽断言或吞掉错误让测试变绿。

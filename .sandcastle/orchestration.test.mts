@@ -94,6 +94,7 @@ test("prompt 模板中的变量都有调度参数", () => {
   for (const path of [
     ".sandcastle/implement-prompt.md",
     ".sandcastle/review-prompt.md",
+    ".sandcastle/merge-conflict-prompt.md",
   ]) {
     const template = readFileSync(path, "utf8");
     const variables = [

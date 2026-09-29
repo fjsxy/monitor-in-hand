@@ -6,17 +6,45 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var (
-	stableAcceptanceID = regexp.MustCompile(`(?:UT|IT)-[A-Z0-9]+-[0-9]{3}|HELM-[0-9]{3}|E2E-(?:119|128)-[A-Z0-9-]+-[0-9]{3}`)
-	goTestFile         = regexp.MustCompile(`_test\.go$`)
+	stableAcceptanceID    = regexp.MustCompile(`(?:UT|IT)-[A-Z0-9]+-(?:GH[1-9][0-9]*-)?[0-9]{3}|HELM-(?:GH[1-9][0-9]*-)?[0-9]{3}|E2E-(?:119|128)-[A-Z0-9]+-(?:GH[1-9][0-9]*-)?[0-9]{3}`)
+	issueScopedAcceptance = regexp.MustCompile(`^(?:(?:UT|IT)-[A-Z0-9]+|HELM|E2E-(?:119|128)-[A-Z0-9-]+)-GH([1-9][0-9]*)-[0-9]{3}$`)
+	issueReference        = regexp.MustCompile(`#([1-9][0-9]*)`)
+	goTestFile            = regexp.MustCompile(`_test\.go$`)
 )
 
 var _ = Describe("一期验收矩阵可追溯性", func() {
+	DescribeTable("识别由 GitHub Issue 独占分配的稳定场景 ID",
+		func(id string, wantIssue int) {
+			issue, ok := acceptanceIssue(id)
+			Expect(ok).To(BeTrue())
+			Expect(issue).To(Equal(wantIssue))
+			Expect(stableAcceptanceID.FindString(id)).To(Equal(id))
+		},
+		Entry("unit", "UT-KSM-GH"+"53-001", 53),
+		Entry("integration", "IT-KSM-GH"+"56-002", 56),
+		Entry("helm", "HELM-GH"+"59-001", 59),
+		Entry("e2e", "E2E-119-KSM-GH"+"53-003", 53),
+	)
+
+	It("拒绝 Issue-scoped ID 与验收矩阵来源不一致", func() {
+		matrix := "| `UT-KSM-GH" + "53-001` | #56 | 纯规划 |"
+		Expect(issueOwnershipMismatches(matrix)).To(Equal([]string{"UT-KSM-GH" + "53-001"}))
+	})
+
+	It("拒绝历史清单之外的全局递增 ID", func() {
+		found := occurrences([]string{"UT-KSM-" + "999", "UT-KSM-GH" + "53-001"}, "fixture")
+		allowedLegacy := map[string]struct{}{"UT-KSM-" + "001": {}}
+		Expect(unscopedAcceptanceIDs(found, allowedLegacy)).To(Equal([]string{"UT-KSM-" + "999"}))
+	})
+
 	It("测试源码与矩阵中的稳定场景 ID 双向一致且各自唯一", func() {
 		By("从所有 Go 测试源码收集会进入测试报告的稳定场景 ID")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -28,8 +56,13 @@ var _ = Describe("一期验收矩阵可追溯性", func() {
 		matrix, err := os.ReadFile(matrixPath)
 		Expect(err).NotTo(HaveOccurred())
 		matrixIDs := occurrences(stableAcceptanceID.FindAllString(string(matrix), -1), matrixPath)
+		legacyIDs, err := loadAcceptanceIDs(filepath.Join(root, "test", "testenv", "testdata", "legacy-acceptance-ids.txt"))
+		Expect(err).NotTo(HaveOccurred())
 
 		By("验证任一侧都没有重复 ID，且测试与矩阵不存在漏登或悬空条目")
+		Expect(issueOwnershipMismatches(string(matrix))).To(BeEmpty(), "Issue-scoped ID 必须归属验收矩阵来源中的同一 Issue")
+		Expect(unscopedAcceptanceIDs(sourceIDs, legacyIDs)).To(BeEmpty(), "新增测试场景必须使用 Issue-scoped ID")
+		Expect(unscopedAcceptanceIDs(matrixIDs, legacyIDs)).To(BeEmpty(), "新增矩阵场景必须使用 Issue-scoped ID")
 		Expect(duplicates(sourceIDs)).To(BeEmpty(), "测试源码中的稳定场景 ID 必须唯一")
 		Expect(duplicates(matrixIDs)).To(BeEmpty(), "验收矩阵中的稳定场景 ID 必须唯一")
 		Expect(missingIDs(sourceIDs, matrixIDs)).To(BeEmpty(), "以下测试场景尚未登记到一期验收矩阵")
@@ -67,6 +100,70 @@ func occurrences(ids []string, source string) map[string][]string {
 	for _, id := range ids {
 		result[id] = append(result[id], source)
 	}
+	return result
+}
+
+func acceptanceIssue(id string) (int, bool) {
+	matches := issueScopedAcceptance.FindStringSubmatch(id)
+	if len(matches) != 2 {
+		return 0, false
+	}
+	issue, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0, false
+	}
+	return issue, true
+}
+
+func loadAcceptanceIDs(path string) (map[string]struct{}, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]struct{}{}
+	for _, id := range strings.Fields(string(contents)) {
+		result[id] = struct{}{}
+	}
+	return result, nil
+}
+
+func unscopedAcceptanceIDs(ids map[string][]string, allowedLegacy map[string]struct{}) []string {
+	var result []string
+	for id := range ids {
+		if _, scoped := acceptanceIssue(id); scoped {
+			continue
+		}
+		if _, allowed := allowedLegacy[id]; !allowed {
+			result = append(result, id)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func issueOwnershipMismatches(matrix string) []string {
+	var result []string
+	for _, line := range strings.Split(matrix, "\n") {
+		cells := strings.Split(line, "|")
+		if len(cells) < 3 {
+			continue
+		}
+
+		sourceIssues := map[int]struct{}{}
+		for _, match := range issueReference.FindAllStringSubmatch(cells[2], -1) {
+			issue, err := strconv.Atoi(match[1])
+			if err == nil {
+				sourceIssues[issue] = struct{}{}
+			}
+		}
+		for _, id := range stableAcceptanceID.FindAllString(cells[1], -1) {
+			issue, scoped := acceptanceIssue(id)
+			if _, found := sourceIssues[issue]; scoped && !found {
+				result = append(result, id)
+			}
+		}
+	}
+	sort.Strings(result)
 	return result
 }
 

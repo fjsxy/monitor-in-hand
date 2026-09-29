@@ -26,7 +26,11 @@ const fakeAgent: AgentProvider = {
   captureSessions: false,
   buildPrintCommand: ({ prompt }) => {
     const expectedDiff = `git diff ${targetBranch}...${branch}`;
-    if (!prompt.includes(expectedDiff) || prompt.includes("{{TARGET_BRANCH}}")) {
+    const expectedRebase = `rebase 到 \`${targetBranch}\` 时的冲突`;
+    if (
+      (!prompt.includes(expectedDiff) && !prompt.includes(expectedRebase)) ||
+      prompt.includes("{{TARGET_BRANCH}}")
+    ) {
       throw new Error("Sandcastle built-in prompt arguments were not substituted");
     }
     return { command: "printf '%s\\n' '<promise>COMPLETE</promise>'" };
@@ -79,6 +83,20 @@ try {
   });
   if (!run.completionSignal) {
     throw new Error("Sandcastle prompt argument smoke did not complete");
+  }
+
+  const conflictRun = await sandbox.run({
+    name: "merge-conflict-prompt-smoke",
+    agent: fakeAgent,
+    maxIterations: 1,
+    promptFile: "./.sandcastle/merge-conflict-prompt.md",
+    promptArgs: promptArgsForIssue(
+      { number: 0, title: "Sandcastle smoke" },
+      branch,
+    ),
+  });
+  if (!conflictRun.completionSignal) {
+    throw new Error("Sandcastle merge conflict prompt smoke did not complete");
   }
 
   process.stdout.write(result.stdout);

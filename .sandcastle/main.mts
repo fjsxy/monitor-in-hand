@@ -5,10 +5,18 @@ import * as sandcastle from "@ai-hero/sandcastle";
 import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
 import {
   branchForIssue,
+  isAgentTicket,
   promptArgsForIssue,
   selectFrontier,
   type IssueRecord,
 } from "./orchestration.mts";
+import {
+  mergeReviewedPullRequests,
+  selectResumablePullRequests,
+  type PullRequestCandidate,
+  type ReviewedPullRequest,
+} from "./merge.mts";
+import { createGitHubMergeOperations } from "./github-merge.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
 
 const EXPECTED_REMOTE = "https://github.com/fjsxy/monitor-in-hand";
@@ -68,6 +76,17 @@ function assertPreconditions(): {
 
   const baseBranch = command("git", ["branch", "--show-current"]);
   if (!baseBranch) throw new Error("当前处于 detached HEAD，无法创建 ticket 分支。");
+  if (baseBranch !== "main") {
+    throw new Error(`必须从 main 运行 Sandcastle，当前分支是 ${baseBranch}。`);
+  }
+  command("git", ["fetch", "origin", "main"]);
+  command("git", ["merge", "--ff-only", "origin/main"]);
+  if (
+    command("git", ["rev-parse", "HEAD"]) !==
+    command("git", ["rev-parse", "origin/main"])
+  ) {
+    throw new Error("本地 main 含有未推送提交，拒绝启动自动 merge 流程。");
+  }
 
   const localEnv = readLocalEnv();
   const codexAuthFile = resolveCodexAuthFile(
@@ -112,6 +131,38 @@ function existingPullRequest(branch: string): string | undefined {
   return url || undefined;
 }
 
+function fetchResumablePullRequests(
+  issues: IssueRecord[],
+  currentUser: string,
+  baseBranch: string,
+): ReviewedPullRequest[] {
+  const eligibleIssues = new Set(
+    issues
+      .filter(isAgentTicket)
+      .filter(
+        (issue) =>
+          issue.assignees.length > 0 &&
+          issue.assignees.every((assignee) => assignee.login === currentUser),
+      )
+      .map((issue) => issue.number),
+  );
+  const candidates = JSON.parse(
+    command("gh", [
+      "pr",
+      "list",
+      "--state",
+      "open",
+      "--base",
+      baseBranch,
+      "--limit",
+      "1000",
+      "--json",
+      "number,url,headRefName,baseRefName,body,isDraft,closingIssuesReferences",
+    ]),
+  ) as PullRequestCandidate[];
+  return selectResumablePullRequests(candidates, eligibleIssues, baseBranch);
+}
+
 function claimIssue(issue: IssueRecord, currentUser: string): void {
   const assignees = JSON.parse(
     command("gh", ["issue", "view", String(issue.number), "--json", "assignees"]),
@@ -143,29 +194,60 @@ function publishPullRequest(
   issue: IssueRecord,
   branch: string,
   baseBranch: string,
-): string {
+): ReviewedPullRequest {
   command("git", ["push", "--set-upstream", "origin", branch]);
 
   const existing = existingPullRequest(branch);
-  if (existing) return existing;
+  if (!existing) {
+    command("gh", [
+      "pr",
+      "create",
+      "--base",
+      baseBranch,
+      "--head",
+      branch,
+      "--title",
+      issue.title,
+      "--body",
+      [
+        `Closes #${issue.number}`,
+        "",
+        "由 Sandcastle 在隔离 worktree/sandbox 中实现并复核。",
+        "Issue 仅在 PR 通过 CI 并由串行 merge 流程以 rebase 方式合并后关闭。",
+      ].join("\n"),
+    ]);
+  }
 
-  return command("gh", [
-    "pr",
-    "create",
-    "--base",
-    baseBranch,
-    "--head",
+  const published = JSON.parse(
+    command("gh", [
+      "pr",
+      "view",
+      branch,
+      "--json",
+      "number,url,headRefName,baseRefName,state,isDraft",
+    ]),
+  ) as {
+    number: number;
+    url: string;
+    headRefName: string;
+    baseRefName: string;
+    state: string;
+    isDraft: boolean;
+  };
+  if (
+    published.state !== "OPEN" ||
+    published.isDraft ||
+    published.headRefName !== branch ||
+    published.baseRefName !== baseBranch
+  ) {
+    throw new Error(`PR #${published.number} 状态或分支与 merge 前置条件不符。`);
+  }
+  return {
+    issue: issue.number,
+    number: published.number,
     branch,
-    "--title",
-    issue.title,
-    "--body",
-    [
-      `Closes #${issue.number}`,
-      "",
-      "由 Sandcastle 在隔离 worktree/sandbox 中实现并复核。",
-      "Issue 仅在 PR 合并后关闭；CI 与验收结论以 GitHub 为准。",
-    ].join("\n"),
-  ]);
+    url: published.url,
+  };
 }
 
 async function executeIssue(
@@ -175,7 +257,12 @@ async function executeIssue(
   ghToken: string,
   agent: ReturnType<typeof sandcastle.codex>,
   maxIterations: number,
-): Promise<{ issue: number; status: string; detail?: string }> {
+): Promise<{
+  issue: number;
+  status: string;
+  detail?: string;
+  pullRequest?: ReviewedPullRequest;
+}> {
   const branch = branchForIssue(issue.number);
   const promptArgs = promptArgsForIssue(issue, branch);
   const stagedAuth = stageCodexAuth(codexAuthFile);
@@ -250,8 +337,13 @@ async function executeIssue(
     stagedAuth.cleanup();
   }
 
-  const prUrl = publishPullRequest(issue, branch, baseBranch);
-  return { issue: issue.number, status: "pull-request", detail: prUrl };
+  const pullRequest = publishPullRequest(issue, branch, baseBranch);
+  return {
+    issue: issue.number,
+    status: "pull-request",
+    detail: pullRequest.url,
+    pullRequest,
+  };
 }
 
 async function main(): Promise<void> {
@@ -269,22 +361,45 @@ async function main(): Promise<void> {
     process.env.SANDCASTLE_MAX_ITERATIONS || localEnv.SANDCASTLE_MAX_ITERATIONS,
     3,
   );
+  const ciTimeoutMinutes = positiveInteger(
+    process.env.SANDCASTLE_CI_TIMEOUT_MINUTES ||
+      localEnv.SANDCASTLE_CI_TIMEOUT_MINUTES,
+    60,
+  );
+  const ciPollSeconds = positiveInteger(
+    process.env.SANDCASTLE_CI_POLL_SECONDS || localEnv.SANDCASTLE_CI_POLL_SECONDS,
+    15,
+  );
 
   const issues = fetchIssues();
+  const resumablePullRequests = fetchResumablePullRequests(
+    issues,
+    currentUser,
+    baseBranch,
+  );
   const frontier = selectFrontier(issues, currentUser, maxParallel).filter(
     (issue) => !existingPullRequest(branchForIssue(issue.number)),
   );
 
-  if (frontier.length === 0) {
+  if (frontier.length === 0 && resumablePullRequests.length === 0) {
     console.log(`没有可执行的 ${READY_LABEL} frontier ticket。`);
     return;
   }
 
-  console.log(
-    `本轮将在 ${baseBranch} 基础上并行处理：${frontier
-      .map((issue) => `#${issue.number}`)
-      .join(", ")}`,
-  );
+  if (frontier.length > 0) {
+    console.log(
+      `本轮将在 ${baseBranch} 基础上并行处理：${frontier
+        .map((issue) => `#${issue.number}`)
+        .join(", ")}`,
+    );
+  }
+  if (resumablePullRequests.length > 0) {
+    console.log(
+      `恢复已有 Sandcastle PR：${resumablePullRequests
+        .map((pr) => `#${pr.number}`)
+        .join(", ")}`,
+    );
+  }
 
   const claimed: IssueRecord[] = [];
   for (const issue of frontier) {
@@ -297,7 +412,7 @@ async function main(): Promise<void> {
     }
   }
 
-  if (claimed.length === 0) {
+  if (claimed.length === 0 && resumablePullRequests.length === 0) {
     throw new Error("本轮 frontier ticket 均未能成功认领。");
   }
 
@@ -317,6 +432,9 @@ async function main(): Promise<void> {
   );
 
   let failed = false;
+  const reviewedPullRequests: ReviewedPullRequest[] = [
+    ...resumablePullRequests,
+  ];
   for (const [index, result] of settled.entries()) {
     const issue = claimed[index]!;
     if (result.status === "rejected") {
@@ -325,11 +443,50 @@ async function main(): Promise<void> {
       continue;
     }
     if (result.value.status !== "pull-request") failed = true;
+    if (result.value.pullRequest) {
+      if (
+        !reviewedPullRequests.some(
+          (pr) => pr.number === result.value.pullRequest!.number,
+        )
+      ) {
+        reviewedPullRequests.push(result.value.pullRequest);
+      }
+    }
     console.log(
       `#${issue.number}: ${result.value.status}${
         result.value.detail ? ` — ${result.value.detail}` : ""
       }`,
     );
+  }
+
+  if (reviewedPullRequests.length > 0) {
+    console.log(
+      `进入串行 merge 阶段：${reviewedPullRequests
+        .sort((left, right) => left.issue - right.issue)
+        .map((pr) => `PR #${pr.number}`)
+        .join(", ")}`,
+    );
+    const mergeResults = await mergeReviewedPullRequests(
+      reviewedPullRequests,
+      createGitHubMergeOperations({
+        baseBranch,
+        codexAuthFile,
+        ghToken,
+        agent,
+        maxIterations,
+        ciTimeoutMs: ciTimeoutMinutes * 60_000,
+        ciPollMs: ciPollSeconds * 1_000,
+        issuesByNumber: new Map(issues.map((issue) => [issue.number, issue])),
+      }),
+    );
+    for (const result of mergeResults) {
+      if (result.status !== "merged") failed = true;
+      console.log(
+        `#${result.issue} / PR #${result.pr}: ${result.status}${
+          result.detail ? ` — ${result.detail}` : ""
+        }`,
+      );
+    }
   }
 
   if (failed) process.exitCode = 1;
