@@ -132,6 +132,7 @@ spec:
 		Expect(instance.Status.DesiredPods).To(Equal(int32(1)))
 		Expect(instance.Status.AvailablePods).To(Equal(int32(1)))
 		Expect(instance.Status.EffectiveCollectors).To(Equal(sharedCollectorCatalog()))
+		Expect(instance.Status.EffectiveNamespaceCount).To(BeNumerically(">", 0))
 		Expect(instance.Status.ManagedResources).To(HaveLen(5))
 		Expect(conditionIsTrue(instance.Status.Conditions, "Ready", instance.Generation)).To(BeTrue())
 		Expect(conditionIsTrue(instance.Status.Conditions, "Available", instance.Generation)).To(BeTrue())
@@ -147,7 +148,10 @@ spec:
 		Expect(podSpec.Containers).To(HaveLen(1))
 		container := podSpec.Containers[0]
 		Expect(container.Image).To(Equal(active.image))
-		Expect(container.Args).To(Equal([]string{"--resources=" + strings.Join(sharedCollectorCatalog(), ",")}))
+		Expect(container.Args).To(ContainElement("--resources=" + strings.Join(sharedCollectorCatalog(), ",")))
+		effectiveNamespaces, err := namespacesFromArgs(container.Args)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(effectiveNamespaces).To(ContainElement(targetNamespace))
 		Expect(container.Resources).To(Equal(corev1.ResourceRequirements{}))
 		Expect(container.Ports).To(ContainElements(
 			SatisfyAll(HaveField("Name", "http-metrics"), HaveField("ContainerPort", int32(8080))),
@@ -362,7 +366,7 @@ spec:
 		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", managed)
 		Expect(err).NotTo(HaveOccurred())
 		container := deployment.Spec.Template.Spec.Containers[0]
-		Expect(container.Args).To(Equal([]string{"--resources=pods", "--metric-allowlist=pod_info,^definitely_no_metric$"}))
+		Expect(container.Args).To(ContainElements("--resources=pods", "--metric-allowlist=pod_info,^definitely_no_metric$"))
 		Expect(container.Resources).To(Equal(corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("20m"), corev1.ResourceMemory: resource.MustParse("32Mi"),
@@ -401,9 +405,7 @@ spec:
 		By("验证 denylist 参数并从真实 scrape 确认被拒指标缺失、其他 pod 指标仍存在")
 		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", managed)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-			"--resources=pods", "--metric-denylist=kube_pod_info",
-		}))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElements("--resources=pods", "--metric-denylist=kube_pod_info"))
 		assertMetrics(ctx, managed, []string{"kube_pod_status_phase"}, []string{"kube_pod_info"})
 	}, SpecTimeout(10*time.Minute))
 
@@ -451,6 +453,161 @@ spec:
 		Expect(err).NotTo(HaveOccurred())
 		Expect(valid.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseReady))
 	}, SpecTimeout(5*time.Minute))
+
+	It(fmt.Sprintf("[%s] 动态收敛 Namespace 采集范围", dynamicNamespaceScenarioID()), func(ctx SpecContext) {
+		const (
+			dynamicInstance = "dynamic-namespace-filter"
+			dynamicManaged  = "ksm-dynamic-namespace-filter"
+			literalName     = "mih-filter-literal"
+			firstMatch      = "mih-filter-team-a"
+			secondMatch     = "mih-filter-team-b"
+			partialMatch    = "prefix-mih-filter-team-a"
+			futureMatch     = "mih-filter-future"
+		)
+
+		By("创建字面、完整 regex 命中和仅 substring 命中的 Namespace")
+		for _, namespace := range []string{literalName, firstMatch, partialMatch} {
+			run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "create", "namespace", namespace)
+			run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", namespace,
+				"create", "configmap", "mih-filter-probe", "--from-literal=source=e2e")
+		}
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  namespaceFilter:
+    mode: Include
+    names:
+      - %s
+    namePatterns:
+      - mih-filter-team-[ab]
+`, dynamicInstance, targetNamespace, literalName)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+
+		By("验证字面名称与完整 regex 的去重并集统一下发到可用 workload")
+		initialGeneration := int64(0)
+		Eventually(func() error {
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", dynamicManaged)
+			if err != nil {
+				return err
+			}
+			actual, err := namespacesFromArgs(deployment.Spec.Template.Spec.Containers[0].Args)
+			if err != nil {
+				return err
+			}
+			if strings.Join(actual, ",") != literalName+","+firstMatch {
+				return fmt.Errorf("effective namespaces=%v，期望字面与完整匹配并集", actual)
+			}
+			if deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("dynamic Deployment availableReplicas=%d", deployment.Status.AvailableReplicas)
+			}
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", dynamicInstance)
+			if err != nil {
+				return err
+			}
+			if instance.Status.EffectiveNamespaceCount != 2 {
+				return fmt.Errorf("effectiveNamespaceCount=%d，期望 2", instance.Status.EffectiveNamespaceCount)
+			}
+			initialGeneration = deployment.Generation
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+		assertMetricLabels(ctx, dynamicManaged,
+			[]metricExpectation{
+				{name: "kube_configmap_info", labels: map[string]string{"namespace": literalName, "configmap": "mih-filter-probe"}},
+				{name: "kube_configmap_info", labels: map[string]string{"namespace": firstMatch, "configmap": "mih-filter-probe"}},
+			},
+			[]metricExpectation{{name: "kube_configmap_info", labels: map[string]string{"namespace": partialMatch, "configmap": "mih-filter-probe"}}})
+
+		By("新增 regex 命中 Namespace 后更新字面列表并触发 rollout")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "create", "namespace", secondMatch)
+		Eventually(func() error {
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", dynamicManaged)
+			if err != nil {
+				return err
+			}
+			actual, err := namespacesFromArgs(deployment.Spec.Template.Spec.Containers[0].Args)
+			if err != nil {
+				return err
+			}
+			if strings.Join(actual, ",") != literalName+","+firstMatch+","+secondMatch {
+				return fmt.Errorf("Namespace 展开列表尚未包含新增匹配项")
+			}
+			if deployment.Generation <= initialGeneration || deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("rollout 尚未完成: generation=%d available=%d", deployment.Generation, deployment.Status.AvailableReplicas)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+
+		By("把过滤器改为当前零匹配，并验证只删除 workload")
+		zeroManifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  namespaceFilter:
+    mode: Include
+    namePatterns:
+      - mih-filter-future
+`, dynamicInstance, targetNamespace)
+		runWithInput(ctx, repoRoot, zeroManifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		Eventually(func() error {
+			if err := objectAbsent(ctx, targetNamespace, "deployment", dynamicManaged); err != nil {
+				return err
+			}
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", dynamicInstance)
+			if err != nil {
+				return err
+			}
+			if instance.Status.EffectiveNamespaceCount != 0 || instance.Status.DesiredPods != 0 ||
+				!conditionMatches(instance.Status.Conditions, "Ready", metav1.ConditionTrue, "NoNamespaceMatched") ||
+				!conditionMatches(instance.Status.Conditions, "Available", metav1.ConditionFalse, "NoNamespaceMatched") {
+				return fmt.Errorf("零匹配 status 尚未收敛: %+v", instance.Status)
+			}
+			return nil
+		}, 2*time.Minute, time.Second).Should(Succeed())
+		_, err := getObject[corev1.Service](ctx, targetNamespace, "service", dynamicManaged)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[corev1.ServiceAccount](ctx, targetNamespace, "serviceaccount", dynamicManaged)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[rbacv1.ClusterRole](ctx, "", "clusterrole", dynamicManaged)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("匹配 Namespace 出现、删除并再次出现时自动恢复、归零和再恢复")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "create", "namespace", futureMatch)
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", futureMatch,
+			"create", "configmap", "mih-filter-probe", "--from-literal=source=e2e")
+		Eventually(func() error {
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", dynamicManaged)
+			if err != nil {
+				return err
+			}
+			if deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("恢复后的 Deployment 尚未可用")
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+		assertMetricLabels(ctx, dynamicManaged,
+			[]metricExpectation{{name: "kube_configmap_info", labels: map[string]string{"namespace": futureMatch, "configmap": "mih-filter-probe"}}},
+			[]metricExpectation{{name: "kube_configmap_info", labels: map[string]string{"namespace": literalName, "configmap": "mih-filter-probe"}}})
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "namespace", futureMatch, "--wait=true")
+		Eventually(func() error { return objectAbsent(ctx, targetNamespace, "deployment", dynamicManaged) }, 2*time.Minute, time.Second).Should(Succeed())
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "create", "namespace", futureMatch)
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", futureMatch,
+			"create", "configmap", "mih-filter-probe", "--from-literal=source=e2e")
+		Eventually(func() error {
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", dynamicManaged)
+			if err != nil {
+				return err
+			}
+			if deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("再次恢复后的 Deployment 尚未可用")
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+	}, SpecTimeout(20*time.Minute))
 })
 
 func stableScenarioID() string {
@@ -461,13 +618,23 @@ func stableScenarioID() string {
 }
 
 func lifecycleScenarioID() string {
-	if active.kubernetes == "1.19" {
+	if os.Getenv("KUBERNETES_VERSION") == "1.19" {
 		return "E2E-119-KSM-002"
 	}
-	if active.kubernetes == "1.28" {
+	if os.Getenv("KUBERNETES_VERSION") == "1.28" {
 		return "E2E-128-KSM-002"
 	}
 	return "E2E-UNSUPPORTED-KSM-002"
+}
+
+func dynamicNamespaceScenarioID() string {
+	if os.Getenv("KUBERNETES_VERSION") == "1.19" {
+		return "E2E-119-KSM-006"
+	}
+	if os.Getenv("KUBERNETES_VERSION") == "1.28" {
+		return "E2E-128-KSM-006"
+	}
+	return "E2E-UNSUPPORTED-KSM-006"
 }
 
 func configurationScenarioID(sequence string) string {
@@ -676,6 +843,20 @@ func contains(values []string, wanted string) bool {
 	return false
 }
 
+func namespacesFromArgs(args []string) ([]string, error) {
+	for _, argument := range args {
+		if !strings.HasPrefix(argument, "--namespaces=") {
+			continue
+		}
+		namespaces := strings.Split(strings.TrimPrefix(argument, "--namespaces="), ",")
+		if !sort.StringsAreSorted(namespaces) {
+			return nil, fmt.Errorf("namespace args 未排序: %v", namespaces)
+		}
+		return namespaces, nil
+	}
+	return nil, fmt.Errorf("args=%v，缺少 --namespaces 参数", args)
+}
+
 func canonicalRules(rules []rbacv1.PolicyRule) []string {
 	canonical := make([]string, 0, len(rules))
 	for _, rule := range rules {
@@ -691,6 +872,62 @@ func canonicalRules(rules []rbacv1.PolicyRule) []string {
 }
 
 func assertMetrics(ctx SpecContext, serviceName string, present, absent []string) {
+	assertMetricsBody(ctx, serviceName, func(body []byte) error {
+		for _, metric := range present {
+			if !bytes.Contains(body, []byte("\n"+metric)) {
+				return fmt.Errorf("metrics 未包含 %s", metric)
+			}
+		}
+		for _, metric := range absent {
+			if bytes.Contains(body, []byte("\n"+metric)) {
+				return fmt.Errorf("metrics 不应包含 %s", metric)
+			}
+		}
+		return nil
+	})
+}
+
+type metricExpectation struct {
+	name   string
+	labels map[string]string
+}
+
+func assertMetricLabels(ctx SpecContext, serviceName string, present, absent []metricExpectation) {
+	assertMetricsBody(ctx, serviceName, func(body []byte) error {
+		for _, expectation := range present {
+			if !metricHasLabels(body, expectation) {
+				return fmt.Errorf("metrics 未包含 %s labels=%v", expectation.name, expectation.labels)
+			}
+		}
+		for _, expectation := range absent {
+			if metricHasLabels(body, expectation) {
+				return fmt.Errorf("metrics 不应包含 %s labels=%v", expectation.name, expectation.labels)
+			}
+		}
+		return nil
+	})
+}
+
+func metricHasLabels(body []byte, expectation metricExpectation) bool {
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.HasPrefix(line, expectation.name+"{") {
+			continue
+		}
+		matched := true
+		for name, value := range expectation.labels {
+			if !strings.Contains(line, fmt.Sprintf(`%s="%s"`, name, value)) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func assertMetricsBody(ctx SpecContext, serviceName string, verify func([]byte) error) {
 	// 先预留本地端口并启动到受管 Service 的转发进程。
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	Expect(err).NotTo(HaveOccurred())
@@ -730,17 +967,7 @@ func assertMetrics(ctx SpecContext, serviceName string, present, absent []string
 		if response.StatusCode != http.StatusOK {
 			return fmt.Errorf("metrics HTTP status=%d", response.StatusCode)
 		}
-		for _, metric := range present {
-			if !bytes.Contains(body, []byte("\n"+metric)) {
-				return fmt.Errorf("metrics 未包含 %s", metric)
-			}
-		}
-		for _, metric := range absent {
-			if bytes.Contains(body, []byte("\n"+metric)) {
-				return fmt.Errorf("metrics 不应包含 %s", metric)
-			}
-		}
-		return nil
+		return verify(body)
 	}, time.Minute, time.Second).Should(Succeed())
 }
 

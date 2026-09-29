@@ -19,6 +19,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	monitoringv1alpha1 "github.com/fjsxy/monitor-in-hand/api/v1alpha1"
 	ksm "github.com/fjsxy/monitor-in-hand/internal/kubestatemetrics"
@@ -104,6 +106,7 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("读取 Kubernetes 版本: %w", err)
 	}
+	// 先完整读取目标落点和可采集 Namespace 集合，确保规划只依赖同一时刻的只读集群事实。
 	namespace := &corev1.Namespace{}
 	namespaceExists := true
 	if err := r.Get(ctx, client.ObjectKey{Name: instance.Spec.TargetNamespace}, namespace); err != nil {
@@ -112,10 +115,19 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 		}
 		namespaceExists = false
 	}
+	namespaces := &corev1.NamespaceList{}
+	if err := r.List(ctx, namespaces); err != nil {
+		return ctrl.Result{}, fmt.Errorf("列出 Namespace: %w", err)
+	}
+	namespaceNames := make([]string, 0, len(namespaces.Items))
+	for index := range namespaces.Items {
+		namespaceNames = append(namespaceNames, namespaces.Items[index].Name)
+	}
 
 	plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
 		KubernetesVersion:     serverVersion.GitVersion,
 		TargetNamespaceExists: namespaceExists,
+		NamespaceNames:        namespaceNames,
 	})
 	if problem != nil {
 		if err := r.updateProblemStatus(ctx, instance, problem); err != nil {
@@ -131,7 +143,12 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 	if suspended {
 		resources = nonWorkloadResources(plan.Resources)
 	}
-	if conflict, err := r.findOwnershipConflict(ctx, resources); err != nil {
+	// 在任何写入前检查本轮所有目标身份；零匹配时也必须保护待删除 workload 的所有权。
+	conflictCandidates := resources
+	if len(plan.EffectiveNamespaces) == 0 {
+		conflictCandidates = append(append([]client.Object(nil), resources...), plan.Workloads...)
+	}
+	if conflict, err := r.findOwnershipConflict(ctx, conflictCandidates); err != nil {
 		return ctrl.Result{}, err
 	} else if conflict != nil {
 		if err := r.updateProblemStatus(ctx, instance, conflict); err != nil {
@@ -160,20 +177,29 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 	// 所有写入都通过 owner 预检后才执行，保证同名非受管资源不会被部分接管。
 	for _, desired := range resources {
 		if err := r.apply(ctx, desired); err != nil {
-			reason := ksm.ReasonApplyFailed
-			var conflict *ownershipConflictError
-			if errors.As(err, &conflict) {
-				reason = ksm.ReasonResourceConflict
-			}
-			applyProblem := &ksm.Problem{Reason: reason, Message: fmt.Sprintf("写入 %T %q: %v", desired, desired.GetName(), err)}
-			if statusErr := r.updateProblemStatus(ctx, instance, applyProblem); statusErr != nil {
-				return ctrl.Result{}, fmt.Errorf("写入 %T %q 失败: %v；并且更新失败 status: %w", desired, desired.GetName(), err, statusErr)
-			}
-			return ctrl.Result{}, fmt.Errorf("写入 %T %q: %w", desired, desired.GetName(), err)
+			return ctrl.Result{}, r.updateWriteProblem(ctx, instance, "写入", desired, err)
 		}
 	}
 	if suspended {
 		return r.reconcileSuspended(ctx, instance, plan)
+	}
+	// 零匹配是稳定业务状态：先保持非 workload 资源，再安全删除全部已拥有 workload。
+	if len(plan.EffectiveNamespaces) == 0 {
+		workloadsGone := true
+		for _, workload := range plan.Workloads {
+			gone, err := r.deleteOwned(ctx, workload)
+			if err != nil {
+				return ctrl.Result{}, r.updateWriteProblem(ctx, instance, "删除", workload, err)
+			}
+			workloadsGone = workloadsGone && gone
+		}
+		if !workloadsGone {
+			return ctrl.Result{RequeueAfter: dependencyRetryInterval}, nil
+		}
+		if err := r.updateNoNamespaceMatchedStatus(ctx, instance, plan); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 
 	deployment := &appsv1.Deployment{}
@@ -211,7 +237,7 @@ func (r *KubeStateMetricsReconciler) reconcileDisabled(ctx context.Context, inst
 
 func (r *KubeStateMetricsReconciler) reconcileSuspended(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan) (ctrl.Result, error) {
 	// 挂起只收敛 workload controller 的删除，前序调谐已经确保非 workload 资源继续存在。
-	workload := workloadResources(plan.Resources)
+	workload := plan.Workloads
 	resources, err := r.deleteOwnedResources(ctx, instance, workload)
 	if err != nil {
 		statusErr := r.updateSuspendedStatus(ctx, instance, plan, resources, true, err)
@@ -379,6 +405,44 @@ func cleanupWasInterrupted(instance *monitoringv1alpha1.KubeStateMetrics) bool {
 	}
 	condition := apiMeta.FindStatusCondition(instance.Status.Conditions, "Progressing")
 	return condition != nil && condition.Status == metav1.ConditionTrue && (condition.Reason == ksm.ReasonDisabling || condition.Reason == ksm.ReasonWaitingForDeletion)
+}
+
+func (r *KubeStateMetricsReconciler) updateWriteProblem(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, action string, object client.Object, writeErr error) error {
+	reason := ksm.ReasonApplyFailed
+	var conflict *ownershipConflictError
+	if errors.As(writeErr, &conflict) {
+		reason = ksm.ReasonResourceConflict
+	}
+	problem := &ksm.Problem{Reason: reason, Message: fmt.Sprintf("%s %T %q: %v", action, object, object.GetName(), writeErr)}
+	if statusErr := r.updateProblemStatus(ctx, instance, problem); statusErr != nil {
+		return fmt.Errorf("%s %T %q 失败: %v；并且更新失败 status: %w", action, object, object.GetName(), writeErr, statusErr)
+	}
+	return fmt.Errorf("%s %T %q: %w", action, object, object.GetName(), writeErr)
+}
+
+func (r *KubeStateMetricsReconciler) deleteOwned(ctx context.Context, desired client.Object) (bool, error) {
+	current, err := emptyObjectFor(desired)
+	if err != nil {
+		return false, err
+	}
+	key := client.ObjectKeyFromObject(desired)
+	if err := r.Get(ctx, key, current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if !hasManagingOwner(current, desired.GetOwnerReferences()[0]) {
+		return false, &ownershipConflictError{message: "待删除的同名 workload 不由当前 KubeStateMetrics UID 管理"}
+	}
+	uid := current.GetUID()
+	if err := r.Delete(ctx, current, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
 }
 
 type ownershipConflictError struct{ message string }
@@ -588,6 +652,7 @@ func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, in
 	instance.Status.KubeStateMetricsVersion = plan.Profile.Version
 	instance.Status.DeploymentMode = monitoringv1alpha1.DeploymentModeDeployment
 	instance.Status.EffectiveCollectors = append([]string(nil), plan.EffectiveCollectors...)
+	instance.Status.EffectiveNamespaceCount = int32(len(plan.EffectiveNamespaces))
 	instance.Status.DesiredPods = 1
 	instance.Status.AvailablePods = availablePods
 	instance.Status.ManagedResources = managedResourceReferences(plan.Resources)
@@ -601,6 +666,26 @@ func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, in
 		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, "MinimumReplicasUnavailable", "单副本 Deployment 尚不可用")
 	}
 	setCondition(&instance.Status, instance.Generation, "Degraded", metav1.ConditionFalse, "ReconcileSucceeded", "未发现调谐故障")
+	return r.writeStatusIfChanged(ctx, instance, *before)
+}
+
+func (r *KubeStateMetricsReconciler) updateNoNamespaceMatchedStatus(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan) error {
+	before := instance.Status.DeepCopy()
+	message := "当前没有 Namespace 匹配 spec.namespaceFilter，已停止全部 workload"
+	instance.Status.ObservedGeneration = instance.Generation
+	instance.Status.Phase = monitoringv1alpha1.KubeStateMetricsPhaseReady
+	instance.Status.AppliedTargetNamespace = instance.Spec.TargetNamespace
+	instance.Status.KubeStateMetricsVersion = plan.Profile.Version
+	instance.Status.DeploymentMode = monitoringv1alpha1.DeploymentModeDeployment
+	instance.Status.EffectiveCollectors = append([]string(nil), plan.EffectiveCollectors...)
+	instance.Status.EffectiveNamespaceCount = 0
+	instance.Status.DesiredPods = 0
+	instance.Status.AvailablePods = 0
+	instance.Status.ManagedResources = managedResourceReferences(plan.Resources)
+	setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionTrue, ksm.ReasonNoNamespaceMatched, message)
+	setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionFalse, ksm.ReasonNoNamespaceMatched, message)
+	setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, ksm.ReasonNoNamespaceMatched, message)
+	setCondition(&instance.Status, instance.Generation, "Degraded", metav1.ConditionFalse, ksm.ReasonNoNamespaceMatched, message)
 	return r.writeStatusIfChanged(ctx, instance, *before)
 }
 
@@ -709,10 +794,25 @@ func copyStringMap(source map[string]string) map[string]string {
 func (r *KubeStateMetricsReconciler) SetupWithManager(manager ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(manager).
 		For(&monitoringv1alpha1.KubeStateMetrics{}).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.requestsForNamespace)).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.ClusterRole{}).
 		Owns(&rbacv1.ClusterRoleBinding{}).
 		Complete(r)
+}
+
+func (r *KubeStateMetricsReconciler) requestsForNamespace(ctx context.Context, _ client.Object) []reconcile.Request {
+	instances := &monitoringv1alpha1.KubeStateMetricsList{}
+	if err := r.List(ctx, instances); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "Namespace 变化后列出 KubeStateMetrics 失败")
+		return nil
+	}
+	// Namespace 集合会影响 All 和 regex Include，因此每次变化都重新规划所有受管实例。
+	requests := make([]reconcile.Request, 0, len(instances.Items))
+	for index := range instances.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKey{Name: instances.Items[index].Name}})
+	}
+	return requests
 }

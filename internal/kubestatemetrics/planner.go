@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	monitoringv1alpha1 "github.com/fjsxy/monitor-in-hand/api/v1alpha1"
@@ -24,6 +26,7 @@ const (
 	ReasonResourceConflict             = "ResourceConflict"
 	ReasonApplyFailed                  = "ApplyFailed"
 	ReasonUnsupportedKubernetesVersion = "UnsupportedKubernetesVersion"
+	ReasonNoNamespaceMatched           = "NoNamespaceMatched"
 
 	labelName          = "app.kubernetes.io/name"
 	labelInstance      = "app.kubernetes.io/instance"
@@ -37,6 +40,7 @@ const (
 type ClusterFacts struct {
 	KubernetesVersion     string
 	TargetNamespaceExists bool
+	NamespaceNames        []string
 }
 
 // Problem is a stable, administrator-visible planning failure.
@@ -61,7 +65,9 @@ type ResourcePlan struct {
 	InstanceID          string
 	Name                string
 	EffectiveCollectors []string
+	EffectiveNamespaces []string
 	Resources           []client.Object
+	Workloads           []client.Object
 }
 
 var collectorCatalog = []string{
@@ -106,6 +112,10 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 	if problem != nil {
 		return nil, problem
 	}
+	effectiveNamespaces, problem := resolveNamespaces(instance.Spec.NamespaceFilter, facts.NamespaceNames)
+	if problem != nil {
+		return nil, problem
+	}
 
 	// spec 有效后再选择版本 profile 并验证外部 Namespace 依赖。
 	profile, problem := profileFor(facts.KubernetesVersion)
@@ -124,14 +134,77 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 	name := ManagedResourceName(instance.Name)
 	containerArgs := []string{"--resources=" + strings.Join(effectiveCollectors, ",")}
 	containerArgs = append(containerArgs, metricFilterArgs...)
-	resources := deploymentResources(instance, profile, instanceID, name, containerArgs)
+	containerArgs = append(containerArgs, "--namespaces="+strings.Join(effectiveNamespaces, ","))
+	nonWorkloads, deployment := deploymentResources(instance, profile, instanceID, name, containerArgs)
+	// Deployment 是当前模式唯一 workload；零匹配时从期望资源中分离，但保留其身份供 controller 安全删除。
+	resources := append([]client.Object(nil), nonWorkloads...)
+	if len(effectiveNamespaces) > 0 {
+		resources = append(resources, deployment)
+	}
 	return &ResourcePlan{
 		Profile:             profile,
 		InstanceID:          instanceID,
 		Name:                name,
 		EffectiveCollectors: effectiveCollectors,
+		EffectiveNamespaces: effectiveNamespaces,
 		Resources:           resources,
+		Workloads:           []client.Object{deployment},
 	}, nil
+}
+
+func resolveNamespaces(filter monitoringv1alpha1.NamespaceFilter, namespaceNames []string) ([]string, *Problem) {
+	mode := filter.Mode
+	if mode == "" {
+		mode = monitoringv1alpha1.NamespaceFilterModeAll
+	}
+	switch mode {
+	case monitoringv1alpha1.NamespaceFilterModeAll:
+		if len(filter.Names) > 0 || len(filter.NamePatterns) > 0 {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.namespaceFilter.mode 为 All 时 names 与 namePatterns 必须为空"}
+		}
+		selected := make(map[string]struct{}, len(namespaceNames))
+		for _, name := range namespaceNames {
+			selected[name] = struct{}{}
+		}
+		return sortedNames(selected), nil
+	case monitoringv1alpha1.NamespaceFilterModeInclude:
+		if len(filter.Names) == 0 && len(filter.NamePatterns) == 0 {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.namespaceFilter.mode 为 Include 时 names 与 namePatterns 至少一项非空"}
+		}
+	default:
+		return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.namespaceFilter.mode %q 不受支持", mode)}
+	}
+
+	selected := make(map[string]struct{}, len(filter.Names))
+	for _, name := range filter.Names {
+		if problems := validation.IsDNS1123Label(name); len(problems) > 0 {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.namespaceFilter.names 包含非法 Namespace 名 %q: %s", name, strings.Join(problems, "; "))}
+		}
+		selected[name] = struct{}{}
+	}
+	// 先编译每个表达式，再以显式锚点执行完整 Namespace 名匹配并合并字面项。
+	for _, expression := range filter.NamePatterns {
+		pattern, err := regexp.Compile("^(?:" + expression + ")$")
+		if err != nil {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.namespaceFilter.namePatterns 包含非法 RE2 表达式 %q: %v", expression, err)}
+		}
+		for _, namespace := range namespaceNames {
+			if pattern.MatchString(namespace) {
+				selected[namespace] = struct{}{}
+			}
+		}
+	}
+
+	return sortedNames(selected), nil
+}
+
+func sortedNames(selected map[string]struct{}) []string {
+	result := make([]string, 0, len(selected))
+	for name := range selected {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func resolveMetricFilter(config monitoringv1alpha1.KubeStateMetricsMetricFilter) ([]string, *Problem) {
@@ -284,7 +357,7 @@ func stableInstanceID(name string) string {
 	return prefix + "-" + digest
 }
 
-func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string) []client.Object {
+func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string) ([]client.Object, *appsv1.Deployment) {
 	labels := managedLabels(instanceID, profile.Version)
 	podResources := corev1.ResourceRequirements{}
 	if instance.Spec.PodResources != nil {
@@ -367,7 +440,7 @@ func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile 
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: name},
 		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: namespace}},
 	}
-	return []client.Object{serviceAccount, clusterRole, clusterRoleBinding, service, deployment}
+	return []client.Object{serviceAccount, clusterRole, clusterRoleBinding, service}, deployment
 }
 
 func managedLabels(instanceID, version string) map[string]string {

@@ -11,6 +11,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
@@ -22,6 +23,7 @@ var (
 	environmentStarted bool
 	testClient         client.Client
 	testScheme         *runtime.Scheme
+	testConfig         *rest.Config
 )
 
 func TestController(t *testing.T) {
@@ -40,10 +42,10 @@ var _ = BeforeSuite(func() {
 	crdPath, err := filepath.Abs(filepath.Join("..", "..", "..", "config", "crd", "bases"))
 	Expect(err).NotTo(HaveOccurred())
 	testEnvironment = &envtest.Environment{CRDDirectoryPaths: []string{crdPath}}
-	config, err := testEnvironment.Start()
+	testConfig, err = testEnvironment.Start()
 	Expect(err).NotTo(HaveOccurred())
 	environmentStarted = true
-	testClient, err = client.New(config, client.Options{Scheme: testScheme})
+	testClient, err = client.New(testConfig, client.Options{Scheme: testScheme})
 	Expect(err).NotTo(HaveOccurred())
 })
 

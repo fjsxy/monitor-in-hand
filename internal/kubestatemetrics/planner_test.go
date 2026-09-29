@@ -34,6 +34,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
 				KubernetesVersion:     kubernetesVersion,
 				TargetNamespaceExists: true,
+				NamespaceNames:        []string{"monitoring"},
 			})
 
 			Expect(problem).To(BeNil())
@@ -69,7 +70,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
 			container := deployment.Spec.Template.Spec.Containers[0]
 			Expect(container.Image).To(Equal(wantImage))
-			Expect(container.Args).To(Equal([]string{"--resources=" + strings.Join(plan.EffectiveCollectors, ",")}))
+			Expect(container.Args).To(Equal([]string{"--resources=" + strings.Join(plan.EffectiveCollectors, ","), "--namespaces=monitoring"}))
 			Expect(container.Ports).To(ConsistOf(
 				corev1.ContainerPort{Name: "http-metrics", ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
 				corev1.ContainerPort{Name: "telemetry", ContainerPort: 8081, Protocol: corev1.ProtocolTCP},
@@ -145,6 +146,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
 			KubernetesVersion:     kubernetesVersion,
 			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
 		})
 
 		By("验证固定 catalog、实际参数与省略资源的行为")
@@ -159,6 +161,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		deployment := deploymentFrom(plan)
 		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
 			"--resources=" + strings.Join(plan.EffectiveCollectors, ","),
+			"--namespaces=monitoring",
 		}))
 		Expect(deployment.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{}))
 	},
@@ -178,12 +181,13 @@ var _ = Describe("默认 Deployment 规划", func() {
 		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
 			KubernetesVersion:     kubernetesVersion,
 			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
 		})
 
 		By("验证实际参数和 effective collectors 来自同一解析结果")
 		Expect(problem).To(BeNil())
 		Expect(plan.EffectiveCollectors).To(Equal([]string{"pods", "deployments"}))
-		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods,deployments"}))
+		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods,deployments", "--namespaces=monitoring"}))
 	},
 		Entry("Kubernetes 1.19", "v1.19.16"),
 		Entry("Kubernetes 1.28", "v1.28.15"),
@@ -223,6 +227,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
 				KubernetesVersion:     kubernetesVersion,
 				TargetNamespaceExists: true,
+				NamespaceNames:        []string{"monitoring"},
 			})
 
 			By("验证 filter 被原样映射到对应参数")
@@ -230,6 +235,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
 				"--resources=pods",
 				wantFilterArg,
+				"--namespaces=monitoring",
 			}))
 		},
 		Entry("Kubernetes 1.19 Allow 保留未锚定和合法零命中 pattern", "v1.19.16", monitoringv1alpha1.MetricFilterModeAllow,
@@ -292,6 +298,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
 			KubernetesVersion:     kubernetesVersion,
 			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
 		})
 
 		By("验证 ResourceRequirements 未经改写地下发")
@@ -316,6 +323,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
 			KubernetesVersion:     "v1.27.9",
 			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
 		})
 
 		Expect(plan).To(BeNil())
@@ -341,6 +349,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
 			KubernetesVersion:     "v1.28.15",
 			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
 		})
 
 		Expect(plan).To(BeNil())
@@ -360,6 +369,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
 				KubernetesVersion:     version,
 				TargetNamespaceExists: true,
+				NamespaceNames:        []string{"monitoring"},
 			})
 			Expect(problem).To(BeNil())
 			for _, delegated := range plan.Profile.Rules {
@@ -431,6 +441,122 @@ var _ = Describe("受管实例 phase 推导", func() {
 	)
 })
 
+var _ = Describe("Namespace 采集范围规划", func() {
+	It("UT-KSM-019 随 Namespace 集合增删在零匹配与恢复之间重新规划", func() {
+		By("准备只匹配 team Namespace 的受管实例")
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "dynamic", UID: types.UID("uid-55-dynamic")},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				NamespaceFilter: monitoringv1alpha1.NamespaceFilter{
+					Mode: monitoringv1alpha1.NamespaceFilterModeInclude, NamePatterns: []string{"team-[ab]"},
+				},
+			},
+		}
+		facts := ksm.ClusterFacts{KubernetesVersion: "v1.28.15", TargetNamespaceExists: true, NamespaceNames: []string{"monitoring"}}
+
+		By("验证零匹配、扩展、归零和恢复都来自同一份 Namespace 集合")
+		plan, problem := ksm.BuildPlan(instance, facts)
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveNamespaces).To(BeEmpty())
+		Expect(plan.Resources).To(HaveLen(4))
+
+		facts.NamespaceNames = append(facts.NamespaceNames, "team-a", "team-b")
+		plan, problem = ksm.BuildPlan(instance, facts)
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveNamespaces).To(Equal([]string{"team-a", "team-b"}))
+		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(ContainElement("--namespaces=team-a,team-b"))
+
+		facts.NamespaceNames = []string{"monitoring"}
+		plan, problem = ksm.BuildPlan(instance, facts)
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveNamespaces).To(BeEmpty())
+		Expect(plan.Resources).To(HaveLen(4))
+
+		facts.NamespaceNames = append(facts.NamespaceNames, "team-b")
+		plan, problem = ksm.BuildPlan(instance, facts)
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveNamespaces).To(Equal([]string{"team-b"}))
+	})
+
+	It("UT-KSM-018 即使目标 Namespace 缺失也优先把非法 regex 报告为 InvalidSpec", func() {
+		By("准备同时包含静态错误和缺失依赖的声明")
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-before-dependency", UID: types.UID("uid-55-order")},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "missing",
+				NamespaceFilter: monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, NamePatterns: []string{"["}},
+			},
+		}
+
+		By("验证静态 InvalidSpec 优先且零资源")
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{KubernetesVersion: "v1.28.15"})
+		Expect(plan).To(BeNil())
+		Expect(problem).To(SatisfyAll(HaveField("Reason", ksm.ReasonInvalidSpec), HaveField("Message", ContainSubstring("["))))
+	})
+
+	It("UT-KSM-017 零匹配只规划非 workload 资源并保留 workload 删除身份", func() {
+		By("准备当前没有 Namespace 匹配的 Include 声明")
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "empty", UID: types.UID("uid-55-empty")},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				NamespaceFilter: monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, NamePatterns: []string{"future-.*"}},
+			},
+		}
+
+		By("验证只保留非 workload 期望资源和可删除 workload 身份")
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{KubernetesVersion: "v1.28.15", TargetNamespaceExists: true, NamespaceNames: []string{"monitoring"}})
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveNamespaces).To(BeEmpty())
+		Expect(plan.Resources).To(HaveLen(4))
+		Expect(plan.Workloads).To(ConsistOf(BeAssignableToTypeOf(&appsv1.Deployment{})))
+	})
+
+	DescribeTable("UT-KSM-016 对非法 namespaceFilter 返回 InvalidSpec 且零资源",
+		func(filter monitoringv1alpha1.NamespaceFilter, message string) {
+			By("执行包含非法 namespaceFilter 的纯规划")
+			instance := &monitoringv1alpha1.KubeStateMetrics{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-filter", UID: types.UID("uid-55-invalid")},
+				Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: "monitoring", NamespaceFilter: filter},
+			}
+			plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{KubernetesVersion: "v1.28.15", TargetNamespaceExists: true, NamespaceNames: []string{"monitoring"}})
+			Expect(plan).To(BeNil())
+			Expect(problem).To(SatisfyAll(HaveField("Reason", ksm.ReasonInvalidSpec), HaveField("Message", ContainSubstring(message))))
+		},
+		Entry("All 带字面名称", monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeAll, Names: []string{"team-a"}}, "All"),
+		Entry("All 带表达式", monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeAll, NamePatterns: []string{"team-.*"}}, "All"),
+		Entry("Include 为空", monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude}, "Include"),
+		Entry("未知 mode", monitoringv1alpha1.NamespaceFilter{Mode: "Unknown", Names: []string{"team-a"}}, "Unknown"),
+		Entry("非法字面 Namespace 名", monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, Names: []string{"team-a,team-b"}}, "team-a,team-b"),
+		Entry("非法 RE2", monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, NamePatterns: []string{"["}}, "["),
+	)
+
+	It("UT-KSM-015 将省略的 All 模式展开为全部当前 Namespace", func() {
+		By("执行省略 namespaceFilter 的兼容声明")
+		instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: "all", UID: types.UID("uid-55-all")}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: "monitoring"}}
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{KubernetesVersion: "v1.28.15", TargetNamespaceExists: true, NamespaceNames: []string{"team-b", "monitoring", "team-a"}})
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveNamespaces).To(Equal([]string{"monitoring", "team-a", "team-b"}))
+		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(ContainElement("--namespaces=monitoring,team-a,team-b"))
+	})
+
+	It("UT-KSM-014 将字面名称与完整 RE2 匹配结果作为排序去重并集下发", func() {
+		By("执行包含字面名称、重叠 regex 和 substring 干扰项的纯规划")
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "filtered", UID: types.UID("uid-55")},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				NamespaceFilter: monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, Names: []string{"literal", "team-a"}, NamePatterns: []string{"team-[ab]"}},
+			},
+		}
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{KubernetesVersion: "v1.28.15", TargetNamespaceExists: true, NamespaceNames: []string{"monitoring", "team-b", "prefix-team-a", "team-a"}})
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveNamespaces).To(Equal([]string{"literal", "team-a", "team-b"}))
+		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(ContainElement("--namespaces=literal,team-a,team-b"))
+	})
+})
+
 func policyRulesAllow(rules []rbacv1.PolicyRule, apiGroup, resource, verb string) bool {
 	for _, rule := range rules {
 		if (slices.Contains(rule.APIGroups, apiGroup) || slices.Contains(rule.APIGroups, "*")) &&
@@ -458,6 +584,7 @@ func expectInvalidSpecAcrossProfiles(instance *monitoringv1alpha1.KubeStateMetri
 		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
 			KubernetesVersion:     kubernetesVersion,
 			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
 		})
 
 		By("验证 InvalidSpec 且零资源计划")

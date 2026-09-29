@@ -163,6 +163,8 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "required")).To(ContainElement("spec"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "enabled", "default")).To(BeTrue())
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "suspended", "default")).To(BeFalse())
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "namespaceFilter", "default", "mode")).To(Equal("All"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "namespaceFilter", "properties", "mode", "enum")).To(ConsistOf("All", "Include"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "default", "mode")).To(Equal("Deployment"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "collectors", "default", "mode")).To(Equal("Default"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "collectors", "properties", "mode", "enum")).To(ConsistOf("Default", "Include"))
@@ -178,7 +180,7 @@ var _ = Describe("Operator Helm chart", func() {
 		}
 		sort.Strings(specKeys)
 		Expect(specKeys).To(Equal([]string{
-			"collectors", "deployment", "enabled", "metricFilter", "podResources", "suspended", "targetNamespace",
+			"collectors", "deployment", "enabled", "metricFilter", "namespaceFilter", "podResources", "suspended", "targetNamespace",
 		}), "CRD 不得暴露 image、version、extraArgs、opt-in metrics 或原始 allow/deny 参数")
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "status", "properties", "phase", "enum")).To(ConsistOf(
 			"Pending", "Deleting", "Disabling", "Disabled", "Reconciling", "Ready", "Degraded",

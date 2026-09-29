@@ -3,6 +3,7 @@ package controller_test
 import (
 	"context"
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -10,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -17,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/version"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	monitoringv1alpha1 "github.com/fjsxy/monitor-in-hand/api/v1alpha1"
 	ksmcontroller "github.com/fjsxy/monitor-in-hand/internal/controller"
@@ -37,13 +40,14 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		suffix = fmt.Sprintf("%d", GinkgoRandomSeed()+int64(CurrentSpecReport().LeafNodeLocation.LineNumber))
 	})
 
-	reconcile := func(name, gitVersion string) {
+	reconcile := func(name, gitVersion string) ctrl.Result {
 		reconciler := &ksmcontroller.KubeStateMetricsReconciler{
 			Client:        testClient,
 			ServerVersion: fixedServerVersion{gitVersion: gitVersion},
 		}
-		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: name}})
+		result, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: name}})
 		Expect(err).NotTo(HaveOccurred())
+		return result
 	}
 
 	DescribeTable("IT-KSM-005 在 admission 阶段拒绝缺少必填声明的 CR",
@@ -86,8 +90,10 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		deployment := &appsv1.Deployment{}
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
 		Expect(*deployment.Spec.Replicas).To(Equal(int32(1)))
-		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(HaveLen(1))
-		Expect(deployment.Spec.Template.Spec.Containers[0].Args[0]).To(HavePrefix("--resources="))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElements(
+			HavePrefix("--resources="),
+			SatisfyAll(HavePrefix("--namespaces="), ContainSubstring(namespace)),
+		))
 		Expect(deployment.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{}))
 		Expect(deployment.OwnerReferences).To(ContainElement(HaveField("UID", instance.UID)))
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.Service{})).To(Succeed())
@@ -255,7 +261,7 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		deployment := &appsv1.Deployment{}
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "ksm-" + name}, deployment)).To(Succeed())
 		container := deployment.Spec.Template.Spec.Containers[0]
-		Expect(container.Args).To(Equal([]string{"--resources=pods,deployments", "--metric-allowlist=pod_info"}))
+		Expect(container.Args).To(ContainElements("--resources=pods,deployments", "--metric-allowlist=pod_info"))
 		Expect(container.Resources).To(Equal(*resources))
 
 		By("验证 status 使用同一份解析后的 effective collectors")
@@ -265,12 +271,13 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 
 		By("将已应用实例改为非法配置，并确认既有 workload 与 effective status 保持一致")
 		deploymentResourceVersion := deployment.ResourceVersion
+		deploymentArgs := append([]string(nil), deployment.Spec.Template.Spec.Containers[0].Args...)
 		actual.Spec.MetricFilter.Patterns = []string{"["}
 		Expect(testClient.Update(ctx, actual)).To(Succeed())
 		reconcile(name, gitVersion)
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "ksm-" + name}, deployment)).To(Succeed())
 		Expect(deployment.ResourceVersion).To(Equal(deploymentResourceVersion))
-		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods,deployments", "--metric-allowlist=pod_info"}))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal(deploymentArgs))
 		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 		Expect(condition(actual, "Degraded").Reason).To(Equal(ksm.ReasonInvalidSpec))
 		Expect(actual.Status.EffectiveCollectors).To(Equal([]string{"pods", "deployments"}))
@@ -360,9 +367,7 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		By("验证 denylist 参数和 effective collectors")
 		deployment := &appsv1.Deployment{}
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "ksm-" + name}, deployment)).To(Succeed())
-		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-			"--resources=pods", "--metric-denylist=kube_pod_info",
-		}))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElements("--resources=pods", "--metric-denylist=kube_pod_info"))
 		actual := &monitoringv1alpha1.KubeStateMetrics{}
 		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 		Expect(actual.Status.EffectiveCollectors).To(Equal([]string{"pods"}))
@@ -558,6 +563,213 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(actual.Status.ObservedGeneration).To(Equal(actual.Generation))
 		Expect(actual.Status.ManagedResources).To(HaveLen(5))
 	})
+
+	It("IT-KSM-013 从集群 Namespace 解析统一采集范围并报告实际数量", func() {
+		By("准备字面项、完整 regex 命中和 substring 干扰 Namespace")
+		targetNamespace := "it-ksm-filter-target-" + suffix
+		literalNamespace := "it-ksm-filter-literal-" + suffix
+		matchedNamespace := "it-ksm-filter-team-a-" + suffix
+		partialNamespace := "prefix-it-ksm-filter-team-a-" + suffix
+		for _, namespace := range []string{targetNamespace, matchedNamespace, partialNamespace} {
+			Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		}
+		name := "filter-" + suffix
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: targetNamespace,
+				NamespaceFilter: monitoringv1alpha1.NamespaceFilter{
+					Mode: monitoringv1alpha1.NamespaceFilterModeInclude, Names: []string{literalNamespace, matchedNamespace},
+					NamePatterns: []string{"it-ksm-filter-team-[ab]-" + suffix},
+				},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("执行调谐并验证展开参数与 status count 来自同一解析结果")
+		reconcile(name, "v1.28.15")
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: "ksm-" + name}, deployment)).To(Succeed())
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--namespaces=" + literalNamespace + "," + matchedNamespace))
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.EffectiveNamespaceCount).To(Equal(int32(2)))
+	})
+
+	It("IT-KSM-014 在零匹配与恢复之间只收敛 workload", func() {
+		By("准备初始有匹配项的受管实例")
+		targetNamespace := "it-ksm-empty-target-" + suffix
+		matchedNamespace := "it-ksm-empty-match-" + suffix
+		for _, namespace := range []string{targetNamespace, matchedNamespace} {
+			Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		}
+		name := "empty-" + suffix
+		resourceName := "ksm-" + name
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: targetNamespace,
+				NamespaceFilter: monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, NamePatterns: []string{"it-ksm-empty-match-.*"}},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+
+		By("删除唯一匹配 Namespace 后进入稳定空集合")
+		deleteNamespaceInEnvtest(ctx, matchedNamespace)
+		reconcile(name, "v1.28.15")
+		reconcile(name, "v1.28.15")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status).To(SatisfyAll(
+			HaveField("Phase", monitoringv1alpha1.KubeStateMetricsPhaseReady),
+			HaveField("DesiredPods", int32(0)),
+			HaveField("AvailablePods", int32(0)),
+			HaveField("EffectiveNamespaceCount", int32(0)),
+			HaveField("ManagedResources", HaveLen(4)),
+		))
+		Expect(condition(actual, "Ready")).To(SatisfyAll(HaveField("Status", metav1.ConditionTrue), HaveField("Reason", "NoNamespaceMatched")))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, &corev1.Service{})).To(Succeed())
+
+		By("匹配 Namespace 出现后恢复 workload，再次归零后重新进入稳定空集合")
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: matchedNamespace}})).To(Succeed())
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+		deleteNamespaceInEnvtest(ctx, matchedNamespace)
+		reconcile(name, "v1.28.15")
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("IT-KSM-015 非法 regex 只更新 InvalidSpec status 而不部分修改受管资源", func() {
+		By("准备已成功下发资源的 All 模式实例")
+		targetNamespace := "it-ksm-invalid-regex-target-" + suffix
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: targetNamespace}})).To(Succeed())
+		name := "invalid-regex-" + suffix
+		resourceName := "ksm-" + name
+		instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: targetNamespace}}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		before := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, before)).To(Succeed())
+
+		By("更新为非法 regex，并验证既有 workload 未被部分修改")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.NamespaceFilter = monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, NamePatterns: []string{"["}}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		after := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, after)).To(Succeed())
+		Expect(after.ResourceVersion).To(Equal(before.ResourceVersion))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Degraded")).To(SatisfyAll(HaveField("Status", metav1.ConditionTrue), HaveField("Reason", "InvalidSpec")))
+	})
+
+	It("IT-KSM-016 watch Namespace 并自动收敛 rollout、零匹配与恢复", func() {
+		By("启动真实 manager 和 Namespace watch")
+		manager, err := ctrl.NewManager(testConfig, ctrl.Options{Scheme: testScheme, Metrics: server.Options{BindAddress: "0"}, HealthProbeBindAddress: "0"})
+		Expect(err).NotTo(HaveOccurred())
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{Client: manager.GetClient(), ServerVersion: fixedServerVersion{gitVersion: "v1.28.15"}}
+		Expect(reconciler.SetupWithManager(manager)).To(Succeed())
+		managerContext, cancelManager := context.WithCancel(ctx)
+		managerDone := make(chan error, 1)
+		go func() { managerDone <- manager.Start(managerContext) }()
+		Expect(manager.GetCache().WaitForCacheSync(ctx)).To(BeTrue())
+		DeferCleanup(func() {
+			By("停止测试 manager 并等待退出")
+			cancelManager()
+			Eventually(managerDone, 5*time.Second).Should(Receive(BeNil()))
+		})
+
+		By("准备初始零匹配的受管实例")
+		targetNamespace := "it-ksm-watch-target-" + suffix
+		firstNamespace := "it-ksm-watch-team-a-" + suffix
+		secondNamespace := "it-ksm-watch-team-b-" + suffix
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: targetNamespace}})).To(Succeed())
+		name := "watch-" + suffix
+		resourceName := "ksm-" + name
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: targetNamespace, NamespaceFilter: monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, NamePatterns: []string{"it-ksm-watch-team-[ab]-" + suffix}}},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		Eventually(func(g Gomega) {
+			actual := &monitoringv1alpha1.KubeStateMetrics{}
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			g.Expect(apiMeta.FindStatusCondition(actual.Status.Conditions, "Ready")).To(HaveField("Reason", "NoNamespaceMatched"))
+		}, 5*time.Second).Should(Succeed())
+
+		By("新增匹配 Namespace 后由 watch 创建 workload，集合扩展触发 rollout")
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: firstNamespace}})).To(Succeed())
+		firstGeneration := int64(0)
+		Eventually(func(g Gomega) {
+			deployment := &appsv1.Deployment{}
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, deployment)).To(Succeed())
+			g.Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--namespaces=" + firstNamespace))
+			firstGeneration = deployment.Generation
+		}, 5*time.Second).Should(Succeed())
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: secondNamespace}})).To(Succeed())
+		Eventually(func(g Gomega) {
+			deployment := &appsv1.Deployment{}
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, deployment)).To(Succeed())
+			g.Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--namespaces=" + firstNamespace + "," + secondNamespace))
+			g.Expect(deployment.Generation).To(BeNumerically(">", firstGeneration))
+		}, 5*time.Second).Should(Succeed())
+
+		By("删除全部匹配 Namespace 后自动归零，再次出现后自动恢复")
+		deleteNamespaceInEnvtest(ctx, secondNamespace)
+		deleteNamespaceInEnvtest(ctx, firstNamespace)
+		Eventually(func(g Gomega) {
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+		}, 5*time.Second).Should(Succeed())
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: firstNamespace}})).To(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+		}, 5*time.Second).Should(Succeed())
+	})
+
+	It("IT-KSM-017 workload 尚未真正删除时不提前报告稳定零匹配", func() {
+		By("准备有匹配项且 workload 带删除 finalizer 的实例")
+		targetNamespace := "it-ksm-delete-pending-target-" + suffix
+		matchedNamespace := "it-ksm-delete-pending-match-" + suffix
+		for _, namespace := range []string{targetNamespace, matchedNamespace} {
+			Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		}
+		name := "delete-pending-" + suffix
+		resourceName := "ksm-" + name
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: targetNamespace, NamespaceFilter: monitoringv1alpha1.NamespaceFilter{Mode: monitoringv1alpha1.NamespaceFilterModeInclude, NamePatterns: []string{"it-ksm-delete-pending-match-.*"}}},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, deployment)).To(Succeed())
+		deployment.Finalizers = []string{"test.monitor-in-hand/finalizer"}
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+
+		By("让匹配归零，并验证 workload 仍终止中时不会提前报告 NoNamespaceMatched")
+		deleteNamespaceInEnvtest(ctx, matchedNamespace)
+		result := reconcile(name, "v1.28.15")
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, deployment)).To(Succeed())
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Ready").Reason).NotTo(Equal("NoNamespaceMatched"))
+
+		By("解除 finalizer，并在 workload 消失后报告稳定零匹配")
+		deployment.Finalizers = nil
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+		Eventually(func() error {
+			return testClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: resourceName}, &appsv1.Deployment{})
+		}).Should(Satisfy(apierrors.IsNotFound))
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Ready").Reason).To(Equal("NoNamespaceMatched"))
+	})
 })
 
 func condition(instance *monitoringv1alpha1.KubeStateMetrics, conditionType string) metav1.Condition {
@@ -571,3 +783,20 @@ func condition(instance *monitoringv1alpha1.KubeStateMetrics, conditionType stri
 }
 
 func boolPointer(value bool) *bool { return &value }
+
+func deleteNamespaceInEnvtest(ctx context.Context, name string) {
+	namespace := &corev1.Namespace{}
+	Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, namespace)).To(Succeed())
+	Expect(testClient.Delete(ctx, namespace)).To(Succeed())
+	Eventually(func() error {
+		current := &corev1.Namespace{}
+		if err := testClient.Get(ctx, client.ObjectKey{Name: name}, current); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		current.Spec.Finalizers = nil
+		return testClient.SubResource("finalize").Update(ctx, current)
+	}).Should(Succeed())
+}
