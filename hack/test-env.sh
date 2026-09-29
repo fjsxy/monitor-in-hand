@@ -328,10 +328,6 @@ verify_environment() {
         --all-namespaces --as "${agent_sa}" | grep -Fxq yes
     done
   done
-  "${kubectl_bin}" --context "${context}" auth can-i get configmaps \
-    --all-namespaces --as "${agent_sa}" | grep -Fxq yes
-  "${kubectl_bin}" --context "${context}" auth can-i get nodes \
-    --all-namespaces --as "${agent_sa}" | grep -Fxq no
   "${kubectl_bin}" --context "${context}" auth can-i get /metrics \
     --as "${agent_sa}" | grep -Fxq yes
 

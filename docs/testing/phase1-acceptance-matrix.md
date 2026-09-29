@@ -41,9 +41,11 @@
 | `UT-KSM-GH56-009` | #56 | controller 边界 | 通用 | 资源问题已识别但回写 status 前的实际 topology 观测又失败时，以 `ObservationFailed` 落盘切换阶段 | Go test failure、status | `go test ./internal/controller` |
 | `UT-EXAMPLE-GH59-001` | #59 | 示例/RBAC | 通用 | 原生 Agent 示例为四类配置使用非空 object/namespace selector，ScrapeConfig 覆盖 static 与五种一期 Kubernetes discovery；统一 runtime ClusterRole 包含所需资源与 `/metrics` 且不含 nodes | Ginkgo failure、示例 manifest | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-001` | #59 | 预检 CLI | 通用 | 空 object selector 保持上游合法能力，但严格预检以非零退出拒绝将其报告为一期支持 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
-| `UT-PREFLIGHT-GH59-002` | #59 | 预检 CLI | 通用 | Node、FileSD、DNS 代表的一期外 ScrapeConfig discovery 均被非零拒绝 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
+| `UT-PREFLIGHT-GH59-002` | #59 | 预检 CLI | 通用 | Node、node metadata、FileSD、DNS、LightSail 代表的一期外 ScrapeConfig discovery 均被非零拒绝 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-003` | #59 | 预检 CLI | 通用 | 空 namespace selector 解析为 Operator watch scope 内全部 namespace，声明的配置范围覆盖不足时非零退出 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-004` | #59 | 预检 CLI | 通用 | 采集配置的 Secret key selector 只在配置自身 namespace 检查，引用缺失时非零退出 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
+| `UT-PREFLIGHT-GH59-005` | #59 | 预检 CLI | 通用 | Namespace LabelSelector 的 NotIn 保持 Kubernetes 原生语义，label 不存在时仍匹配 | NDJSON diagnostics | `go test ./test/testenv` |
+| `UT-PREFLIGHT-GH59-006` | #59 | 预检 CLI | 通用 | 空 namespace selector 的覆盖集合与 Prometheus Operator 实际 common watch scope 求交，不误要求 scope 外 namespace | NDJSON diagnostics | `go test ./test/testenv` |
 
 ## HELM
 
@@ -110,6 +112,6 @@
 | `E2E-128-PREFLIGHT-002` | #58 | kind E2E/预检 | Kubernetes 1.28.15 | runtime ServiceAccount 缺失时预检非零退出，并报告 `RuntimeServiceAccountNotFound` 与 `PreflightFailed` | NDJSON diagnostics、退出码 | `make e2e-preflight KUBERNETES_VERSION=1.28 ...` |
 | `E2E-119-PREFLIGHT-GH59-001` / `E2E-128-PREFLIGHT-GH59-001` | #59 | kind E2E/计划预检 | Kubernetes 1.19.16、1.28.15 | 四类显式非空 selector 与 static、Pod、Service、Endpoints、EndpointSlice、Ingress discovery 计划通过严格预检 | NDJSON diagnostics、退出码 | `make e2e-preflight KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-PREFLIGHT-GH59-002` / `E2E-128-PREFLIGHT-GH59-002` | #59 | kind E2E/计划预检 | Kubernetes 1.19.16、1.28.15 | 上游合法空 object selector 被非零拒绝且报告 `EmptyObjectSelectorUnsupported` | NDJSON diagnostics、退出码 | `make e2e-preflight KUBERNETES_VERSION=<minor> ...` |
-| `E2E-119-COLLECTION-GH59-001` / `E2E-128-COLLECTION-GH59-001` | #59 | kind E2E/配置选择 | Kubernetes 1.19.16、1.28.15 | 四类 object selector 相互独立；全 nil Agent 保持 Reconciled/Available 且生成零 scrape job；namespace selector 的 nil、空对象和非空 label 分别选择当前、全部和标签 namespace | generated config、Agent status | `make e2e-collection KUBERNETES_VERSION=<minor> ...` |
+| `E2E-119-COLLECTION-GH59-001` / `E2E-128-COLLECTION-GH59-001` | #59 | kind E2E/配置选择 | Kubernetes 1.19.16、1.28.15 | 四类 object selector 相互独立；全 nil Agent 保持 Reconciled/Available 且生成零 scrape job；四类各自用 namespace selector 的 nil、空对象和非空 label 分别选择当前、全部和标签 namespace | generated config、Agent status | `make e2e-collection KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-COLLECTION-GH59-002` / `E2E-128-COLLECTION-GH59-002` | #59 | kind E2E/真实 targets | Kubernetes 1.19.16、1.28.15 | ServiceMonitor、PodMonitor、Probe 与 ScrapeConfig 均产生真实 up target；ScrapeConfig 覆盖 static、Pod、Service、Endpoints、EndpointSlice、Ingress，并验证 ServiceMonitor 的 Endpoints/EndpointSlice 版本差异 | generated config、Agent status API、targets API | `make e2e-collection KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-COLLECTION-GH59-003` / `E2E-128-COLLECTION-GH59-003` | #59 | kind E2E/拒绝诊断 | Kubernetes 1.19.16、1.28.15 | 上游接受但 selector role 不兼容的 ScrapeConfig 不进入 generated config，并通过 InvalidConfiguration Event 与 Prometheus Operator logs 定位 | generated config、Events、Operator logs | `make e2e-collection KUBERNETES_VERSION=<minor> ...` |
