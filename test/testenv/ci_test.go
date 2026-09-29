@@ -11,6 +11,7 @@ import (
 
 var _ = Describe("双版本一期验收门禁", func() {
 	It("并行运行两个固定版本并在失败时先保存证据再清理", func() {
+		By("读取 CI workflow 并定位双版本验收 job")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		contents, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
@@ -22,6 +23,7 @@ var _ = Describe("双版本一期验收门禁", func() {
 		job, found := jobs["test-environment"].(map[string]any)
 		Expect(found).To(BeTrue(), "缺少 test-environment blocking job")
 
+		By("验证 Kubernetes 1.19 和 1.28 使用独立矩阵入口")
 		strategy := job["strategy"].(map[string]any)
 		Expect(strategy["fail-fast"]).To(BeFalse())
 		matrix := strategy["matrix"].(map[string]any)
@@ -40,6 +42,7 @@ var _ = Describe("双版本一期验收门禁", func() {
 			),
 		))
 
+		By("验证环境准备、Ginkgo E2E、报告上传和最终清理都是 blocking 步骤")
 		steps := job["steps"].([]any)
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("uses", "azure/setup-kubectl@v4"),
@@ -49,12 +52,18 @@ var _ = Describe("双版本一期验收门禁", func() {
 			HaveKeyWithValue("name", "创建并验收外部测试环境"),
 			HaveKeyWithValue("run", And(
 				ContainSubstring("make test-env-up"),
-				ContainSubstring("make preflight"),
-				ContainSubstring("AGENT_SERVICE_ACCOUNT=prometheus-agent"),
-				ContainSubstring("AGENT_SERVICE_ACCOUNT=missing-preflight-sa"),
-				ContainSubstring(`"reason":"RuntimeServiceAccountNotFound"`),
 				ContainSubstring("make test-env-verify"),
 			)),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("name", "E2E 严格部署预检"),
+			HaveKeyWithValue("run", ContainSubstring("make e2e-preflight")),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("name", "上传 E2E 测试报告"),
+			HaveKeyWithValue("if", "${{ always() }}"),
+			HaveKeyWithValue("uses", "actions/upload-artifact@v4"),
+			HaveKeyWithValue("with", HaveKeyWithValue("path", "artifacts/e2e/")),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "失败时保存测试环境证据"),
@@ -69,5 +78,16 @@ var _ = Describe("双版本一期验收门禁", func() {
 			HaveKeyWithValue("if", "${{ always() }}"),
 			Not(HaveKey("continue-on-error")),
 		)))
+	})
+
+	It("使用 Ginkgo 验证部署预检的成功和失败行为", func() {
+		By("检查 Make 公共入口调用 Ginkgo 并生成 JUnit")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		makefile, err := os.ReadFile(filepath.Join(root, "Makefile"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(makefile)).To(ContainSubstring("e2e-preflight:"))
+		Expect(string(makefile)).To(ContainSubstring("go run github.com/onsi/ginkgo/v2/ginkgo"))
+		Expect(string(makefile)).To(ContainSubstring("--junit-report"))
 	})
 })

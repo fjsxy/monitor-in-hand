@@ -2,8 +2,10 @@
 # Image URL to use all building/pushing image targets
 IMG ?= docker.io/fjsxy/monitor-in-hand:0.1.0
 HELM ?= $(shell command -v helm 2>/dev/null || printf '%s/.tools/bin/helm' '$(CURDIR)')
+GINKGO ?= go run github.com/onsi/ginkgo/v2/ginkgo
 RELEASE ?= monitor-in-hand
 NAMESPACE ?= monitor-in-hand-system
+E2E_REPORT_DIR ?= artifacts/e2e/$(TEST_RUN_ID)-$(KUBERNETES_VERSION)
 # Kubebuilder v3.13.0 generated this project and matches the controller-runtime v0.16 line.
 KUBEBUILDER_VERSION ?= v3.13.0
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
@@ -66,7 +68,7 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test test-unit test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight test-env-up test-env-verify test-env-evidence test-env-down
+.PHONY: test test-unit test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight test-env-up test-env-verify test-env-evidence test-env-down
 test: manifests verify-generated generate fmt typecheck test-unit test-helm test-testenv ## Run all tests.
 
 test-unit: ## Run control-plane unit tests.
@@ -101,6 +103,13 @@ preflight: ## Strictly qualify a cluster before creating a native PrometheusAgen
 		$(if $(OPERATOR_DEPLOYMENT),--operator-deployment "$(OPERATOR_DEPLOYMENT)") \
 		$(if $(KUBE_CONTEXT),--context "$(KUBE_CONTEXT)") \
 		$(if $(PREFLIGHT_TIMEOUT_SECONDS),--timeout-seconds "$(PREFLIGHT_TIMEOUT_SECONDS)")
+
+e2e-preflight: ## Verify strict deployment preflight against the current pinned test environment.
+	mkdir -p "$(E2E_REPORT_DIR)"
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" \
+		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=20m \
+		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)" \
+		./test/e2e/preflight
 
 test-env-up: ## Create the pinned external test environment for one supported Kubernetes minor.
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh up

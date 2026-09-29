@@ -145,11 +145,16 @@ finish_failed() {
   exit 1
 }
 
-if ! version_json=$(kubectl_call version --output json 2>&1); then
+# kubectl 可能把 client/server 版本偏差警告写到 stderr；只允许 stdout 进入 JSON 解析。
+version_stderr_file=$(mktemp "${TMPDIR:-/tmp}/monitor-in-hand-preflight-version.XXXXXX")
+if ! version_json=$(kubectl_call version --output json 2>"${version_stderr_file}"); then
+  version_stderr=$(cat "${version_stderr_file}")
+  rm -f "${version_stderr_file}"
   record_failure kubernetes-version fail KubernetesAPIUnavailable "无法读取 Kubernetes server version" \
-    "$(jq --null-input --arg error "${version_json}" '{error: $error}')"
+    "$(jq --null-input --arg stdout "${version_json}" --arg stderr "${version_stderr}" '{stdout: $stdout, stderr: $stderr}')"
   finish_failed
 fi
+rm -f "${version_stderr_file}"
 if ! version_fields=$(jq --raw-output --exit-status '
     [.serverVersion.major, (.serverVersion.minor | sub("[^0-9].*$"; "")), .serverVersion.gitVersion] |
     select(length == 3 and all(.[]; type == "string" and length > 0)) |

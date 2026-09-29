@@ -178,6 +178,7 @@ case "$*" in
     if [[ "${PREFLIGHT_VERSION_MALFORMED:-}" == 1 ]]; then
       printf '%s\n' '{invalid'
     else
+      printf '%s\n' 'WARNING: client and server version differ' >&2
       printf '%s\n' '{"serverVersion":{"major":"1","minor":"19","gitVersion":"v1.19.16"}}'
     fi
     ;;
