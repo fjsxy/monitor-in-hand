@@ -46,6 +46,7 @@
 | `UT-PREFLIGHT-GH59-004` | #59 | 预检 CLI | 通用 | 采集配置的 Secret key selector 只在配置自身 namespace 检查，引用缺失时非零退出 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-005` | #59 | 预检 CLI | 通用 | Namespace LabelSelector 的 NotIn 保持 Kubernetes 原生语义，label 不存在时仍匹配 | NDJSON diagnostics | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-006` | #59 | 预检 CLI | 通用 | 空 namespace selector 的覆盖集合与 Prometheus Operator 实际 common watch scope 求交，不误要求 scope 外 namespace | NDJSON diagnostics | `go test ./test/testenv` |
+| `UT-PREFLIGHT-GH59-007` | #59 | 预检 CLI | 通用 | ConfigMap key selector 只查询采集配置自身 namespace，跨 namespace 同名对象不能满足引用 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 
 ## HELM
 

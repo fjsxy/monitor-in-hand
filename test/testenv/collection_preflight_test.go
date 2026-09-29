@@ -271,6 +271,42 @@ esac
 		))
 	})
 
+	It("[UT-PREFLIGHT-GH59-007] 跨 namespace 同名 ConfigMap 不满足采集配置引用", func() {
+		By("准备在 monitoring namespace 引用缺失 ConfigMap 的 ServiceMonitor")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fakeBin := GinkgoT().TempDir()
+		agentManifest := filepath.Join(fakeBin, "agent.yaml")
+		configManifest := filepath.Join(fakeBin, "config.yaml")
+		Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		writeCollectionValidationKubectl(fakeBin,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","serviceMonitorSelector":{"matchLabels":{"mih":"selected"}}}}`,
+			`{"apiVersion":"monitoring.coreos.com/v1","kind":"ServiceMonitor","metadata":{"name":"selected","namespace":"monitoring","labels":{"mih":"selected"}},"spec":{"endpoints":[{"tlsConfig":{"ca":{"configMap":{"name":"missing-ca","key":"ca.crt"}}}}]}}`,
+			false,
+		)
+
+		By("通过公开预检入口执行 ConfigMap 引用检查")
+		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+			"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
+			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+		)
+		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+		output, err := command.CombinedOutput()
+
+		By("验证只查询声明对象 namespace，并以 ConfigMap 缺失原因非零退出")
+		Expect(err).To(HaveOccurred(), string(output))
+		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
+		expectJSONDiagnostics(output)
+		Expect(string(output)).To(SatisfyAll(
+			ContainSubstring(`"reason":"ReferencedAssetUnavailable"`),
+			ContainSubstring(`"namespace":"monitoring"`),
+			ContainSubstring(`"kind":"configmap"`),
+			ContainSubstring(`"name":"missing-ca"`),
+		))
+	})
+
 	It("[UT-PREFLIGHT-GH59-005] Namespace LabelSelector 的 NotIn 匹配缺少该 label 的 namespace", func() {
 		By("准备位于无 excluded label namespace 的 PodMonitor")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -360,6 +396,10 @@ case "$*" in
       exit 1
     fi
     printf '%s\n' 'secret/missing-credentials'
+    ;;
+  "--namespace monitoring get configmap missing-ca --output name")
+    printf '%s\n' 'configmap exists only in another namespace' >&2
+    exit 1
     ;;
   *) printf 'unexpected kubectl call: %s\n' "$*" >&2; exit 1 ;;
 esac
