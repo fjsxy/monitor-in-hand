@@ -87,6 +87,33 @@ export interface CIRepairDependencies {
 
 const REPAIR_PUSH_VISIBILITY_ATTEMPTS = 30;
 
+async function waitForPublishedPullRequestHead(
+  prNumber: number,
+  previousHeadOid: string,
+  expectedHeadOid: string,
+  fetchSnapshot: () => PullRequestSnapshot,
+  delayBeforeRefetch: () => Promise<void>,
+  operation: "repair" | "rebase",
+): Promise<PullRequestSnapshot> {
+  for (
+    let visibilityAttempt = 1;
+    visibilityAttempt <= REPAIR_PUSH_VISIBILITY_ATTEMPTS;
+    visibilityAttempt += 1
+  ) {
+    const snapshot = fetchSnapshot();
+    if (snapshot.state === "OPEN" && snapshot.headRefOid === expectedHeadOid) {
+      return snapshot;
+    }
+    if (snapshot.state !== "OPEN" || snapshot.headRefOid !== previousHeadOid) {
+      throw new Error(`PR #${prNumber} ${operation} 推送后 head 回读不一致。`);
+    }
+    if (visibilityAttempt < REPAIR_PUSH_VISIBILITY_ATTEMPTS) {
+      await delayBeforeRefetch();
+    }
+  }
+  throw new Error(`PR #${prNumber} ${operation} 推送后等待 head 可见超时。`);
+}
+
 function fetchPullRequest(number: number): PullRequestSnapshot {
   return JSON.parse(
     command("gh", [
@@ -298,14 +325,23 @@ async function resolveRebaseWithAgent(
       const unmerged = await sandbox.exec(
         "git diff --name-only --diff-filter=U",
       );
-      if (unmerged.exitCode !== 0 || !unmerged.stdout.trim()) {
+      const rebaseState = await sandbox.exec(
+        [
+          'test -d "$(git rev-parse --git-path rebase-merge)"',
+          '|| test -d "$(git rev-parse --git-path rebase-apply)"',
+        ].join(" "),
+      );
+      if (unmerged.exitCode !== 0 || rebaseState.exitCode !== 0) {
         throw new Error(
-          rebase.stderr || `PR #${pr.number} rebase 失败且没有可解析的冲突。`,
+          rebase.stderr || `PR #${pr.number} rebase 失败且没有可恢复状态。`,
         );
       }
 
+      const conflictSummary =
+        unmerged.stdout.trim().replaceAll("\n", ", ") ||
+        "rebase 已停止但尚无 unmerged path";
       console.log(
-        `PR #${pr.number} 存在冲突，启动 resolver：${unmerged.stdout.trim().replaceAll("\n", ", ")}`,
+        `PR #${pr.number} 存在冲突，启动 resolver：${conflictSummary}`,
       );
       const resolution = await sandbox.run(
         withAgentIdleTimeout(idleTimeoutSeconds, {
@@ -377,10 +413,14 @@ async function resolveRebaseWithAgent(
     "origin",
     `${pr.branch}:refs/heads/${pr.branch}`,
   ]);
-  const pushed = fetchPullRequest(pr.number);
-  if (pushed.headRefOid !== rebasedHeadOid) {
-    throw new Error(`PR #${pr.number} rebase 推送后 head 回读不一致。`);
-  }
+  await waitForPublishedPullRequestHead(
+    pr.number,
+    checkedHeadOid,
+    rebasedHeadOid,
+    () => fetchPullRequest(pr.number),
+    () => delay(1_000),
+    "rebase",
+  );
   return rebasedHeadOid;
 }
 
@@ -458,33 +498,14 @@ export function createGitHubMergeOperations(
       assertFailedHeadUnchanged();
       repairDependencies.pushRepairedBranch(pr, failure.headOid);
 
-      let published: PullRequestSnapshot | undefined;
-      for (
-        let visibilityAttempt = 1;
-        visibilityAttempt <= REPAIR_PUSH_VISIBILITY_ATTEMPTS;
-        visibilityAttempt += 1
-      ) {
-        const snapshot = repairDependencies.fetchPullRequest(pr.number);
-        if (
-          snapshot.state === "OPEN" &&
-          snapshot.headRefOid === result.repairedHeadOid
-        ) {
-          published = snapshot;
-          break;
-        }
-        if (
-          snapshot.state !== "OPEN" ||
-          snapshot.headRefOid !== failure.headOid
-        ) {
-          throw new Error(`PR #${pr.number} repair 推送后 head 回读不一致。`);
-        }
-        if (visibilityAttempt < REPAIR_PUSH_VISIBILITY_ATTEMPTS) {
-          await repairDependencies.delayBeforeRefetch();
-        }
-      }
-      if (!published) {
-        throw new Error(`PR #${pr.number} repair 推送后等待 head 可见超时。`);
-      }
+      const published = await waitForPublishedPullRequestHead(
+        pr.number,
+        failure.headOid,
+        result.repairedHeadOid,
+        () => repairDependencies.fetchPullRequest(pr.number),
+        repairDependencies.delayBeforeRefetch,
+        "repair",
+      );
       console.log(
         `PR #${pr.number} repair 已推送 head ${published.headRefOid.slice(0, 12)}，等待新一轮 CI。`,
       );
