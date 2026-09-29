@@ -49,6 +49,10 @@ var _ = Describe("双版本一期验收门禁", func() {
 			HaveKeyWithValue("with", HaveKeyWithValue("version", "${{ matrix.kubectl }}")),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("uses", "azure/setup-helm@v4"),
+			HaveKeyWithValue("with", HaveKeyWithValue("version", "v3.22.0")),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "创建并验收外部测试环境"),
 			HaveKeyWithValue("run", And(
 				ContainSubstring("make test-env-up"),
@@ -58,6 +62,10 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "E2E 严格部署预检"),
 			HaveKeyWithValue("run", ContainSubstring("make e2e-preflight")),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("name", "E2E 默认 KubeStateMetrics Deployment"),
+			HaveKeyWithValue("run", ContainSubstring("make e2e-default-deployment")),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "上传 E2E 测试报告"),
@@ -80,14 +88,21 @@ var _ = Describe("双版本一期验收门禁", func() {
 		)))
 	})
 
-	It("使用 Ginkgo 验证部署预检的成功和失败行为", func() {
+	It("使用 Ginkgo 执行 E2E 业务断言而不由 shell 代替", func() {
 		By("检查 Make 公共入口调用 Ginkgo 并生成 JUnit")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		makefile, err := os.ReadFile(filepath.Join(root, "Makefile"))
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(makefile)).To(ContainSubstring("e2e-preflight:"))
 		Expect(string(makefile)).To(ContainSubstring("go run github.com/onsi/ginkgo/v2/ginkgo"))
 		Expect(string(makefile)).To(ContainSubstring("--junit-report"))
+		Expect(string(makefile)).To(ContainSubstring("e2e-preflight:"))
+		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/preflight"`))
+		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/kubestatemetrics"`))
+		Expect(string(makefile)).NotTo(ContainSubstring("./hack/e2e-default-deployment.sh"))
+
+		By("确认旧 shell 业务断言入口已被删除")
+		_, err = os.Stat(filepath.Join(root, "hack", "e2e-default-deployment.sh"))
+		Expect(os.IsNotExist(err)).To(BeTrue())
 	})
 })

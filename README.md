@@ -1,6 +1,6 @@
 # monitor-in-hand
 
-面向单个 Kubernetes 集群的可观测组件管控 Operator。本阶段只提供可安装、可探活的控制面，不包含 `KubeStateMetrics` 业务调谐。
+面向单个 Kubernetes 集群的可观测组件管控 Operator。当前提供可安装、可探活的控制面，以及 cluster-scoped `KubeStateMetrics` API 的默认单副本 Deployment 调谐。
 
 发布镜像位于 Docker Hub：`docker.io/fjsxy/monitor-in-hand:<version>`。Chart 使用 `appVersion` 选择固定镜像 tag。
 
@@ -30,6 +30,14 @@ make lint-chart
 make verify-generated
 make smoke-install
 ```
+
+`make test` 会下载固定的 Kubernetes 1.28 envtest 资产并执行 controller integration tests。默认 Deployment 的真实集群验收复用双版本测试环境：
+
+```bash
+make e2e-default-deployment KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119 HELM=helm
+```
+
+该命令需要对应 `test-env-up` 创建的集群以及可用的 Docker socket；CI 在 Kubernetes 1.19 与 1.28 两个 blocking matrix legs 中运行它。
 
 `make smoke-install` 创建独立的临时 kind v1.28.15 集群，构建并加载本地镜像，验证 Deployment、leader-election Lease、`/healthz`、`/readyz`、JSON 日志和单实例安装约束，完成后删除该临时集群。传入 `KIND_NODE_IMAGE` 可验证其他目标版本。
 
@@ -62,6 +70,21 @@ make test-env-evidence KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119
 ```
 
 证据写入 `artifacts/test-env/`。CI 的两个 matrix legs 独立并行，单个集群内的有状态步骤保持串行；失败时先上传证据，再按身份清理集群。
+
+## KubeStateMetrics 最小声明
+
+`targetNamespace` 必须预先存在；Operator 不创建或删除该 Namespace。省略其他字段时，API 默认启用实例、不挂起，并使用固定单副本 Deployment：
+
+```yaml
+apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: default
+spec:
+  targetNamespace: monitoring
+```
+
+Kubernetes 1.19.x 固定选择 kube-state-metrics 2.3.0，Kubernetes 1.28.x 固定选择 2.11.0。其他 minor 或缺失目标 Namespace 只更新 CR status，不创建受管资源。
 
 ## 部署预检
 
