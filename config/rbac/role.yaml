@@ -13,7 +13,6 @@ rules:
   - nodes
   - persistentvolumeclaims
   - persistentvolumes
-  - pods
   - replicationcontrollers
   - resourcequotas
   - secrets
@@ -31,6 +30,7 @@ rules:
   - ""
   resources:
   - namespaces
+  - pods
   verbs:
   - get
   - list
