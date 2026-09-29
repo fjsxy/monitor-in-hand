@@ -8,6 +8,8 @@ NAMESPACE ?= monitor-in-hand-system
 KUBEBUILDER_VERSION ?= v3.13.0
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.28.0
+GINKGO ?= go run github.com/onsi/ginkgo/v2/ginkgo
+E2E_REPORT_DIR ?= artifacts/e2e/$(TEST_RUN_ID)-$(KUBERNETES_VERSION)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -100,7 +102,10 @@ smoke-install: ## Run the isolated kind installation smoke test.
 	./hack/smoke-install.sh
 
 e2e-default-deployment: ## Verify the default managed KubeStateMetrics Deployment in an existing test environment.
-	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" ./hack/e2e-default-deployment.sh
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
+		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=20m \
+		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)" \
+		./test/e2e/kubestatemetrics
 
 test-env-up: ## Create the pinned external test environment for one supported Kubernetes minor.
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh up
