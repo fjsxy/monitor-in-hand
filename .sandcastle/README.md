@@ -59,6 +59,7 @@ npm run sandcastle
 - `SANDCASTLE_MODEL`：默认 `gpt-5.6-sol`；reasoning effort 固定为 `high`。
 - `SANDCASTLE_MAX_PARALLEL`：默认 `3`。
 - `SANDCASTLE_MAX_ITERATIONS`：默认 `3`。
+- `SANDCASTLE_IDLE_TIMEOUT_SECONDS`：agent 连续没有 stdout 时的终止门限，默认 `1800` 秒。Codex 在处理较大 tool output 或执行 high reasoning 时可能长时间不输出；该门限不代表单条 shell 命令的 timeout。
 - `SANDCASTLE_CI_TIMEOUT_MINUTES`：单次等待某个 PR CI 的最长时间，默认 `60`。
 - `SANDCASTLE_CI_POLL_SECONDS`：CI 状态轮询间隔，默认 `15`。
 

@@ -9,6 +9,7 @@ import {
 } from "./merge.mts";
 import { promptArgsForIssue, type IssueRecord } from "./orchestration.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
+import { withAgentIdleTimeout } from "./runtime-config.mts";
 
 const repoRoot = process.cwd();
 
@@ -127,6 +128,7 @@ async function resolveRebaseWithAgent(
   ghToken: string,
   agent: ReturnType<typeof sandcastle.codex>,
   maxIterations: number,
+  idleTimeoutSeconds: number,
 ): Promise<string> {
   const stagedAuth = stageCodexAuth(codexAuthFile);
   let sandbox: Awaited<ReturnType<typeof sandcastle.createSandbox>> | undefined;
@@ -180,24 +182,28 @@ async function resolveRebaseWithAgent(
       console.log(
         `PR #${pr.number} 存在冲突，启动 resolver：${unmerged.stdout.trim().replaceAll("\n", ", ")}`,
       );
-      const resolution = await sandbox.run({
-        name: `issue-${pr.issue}-merge-conflict`,
-        agent,
-        maxIterations,
-        promptFile: "./.sandcastle/merge-conflict-prompt.md",
-        promptArgs: promptArgsForIssue(issue, pr.branch),
-      });
+      const resolution = await sandbox.run(
+        withAgentIdleTimeout(idleTimeoutSeconds, {
+          name: `issue-${pr.issue}-merge-conflict`,
+          agent,
+          maxIterations,
+          promptFile: "./.sandcastle/merge-conflict-prompt.md",
+          promptArgs: promptArgsForIssue(issue, pr.branch),
+        }),
+      );
       if (!resolution.completionSignal) {
         throw new Error(`PR #${pr.number} resolver 未完成冲突解决。`);
       }
 
-      const review = await sandbox.run({
-        name: `issue-${pr.issue}-post-rebase-review`,
-        agent,
-        maxIterations: 1,
-        promptFile: "./.sandcastle/review-prompt.md",
-        promptArgs: promptArgsForIssue(issue, pr.branch),
-      });
+      const review = await sandbox.run(
+        withAgentIdleTimeout(idleTimeoutSeconds, {
+          name: `issue-${pr.issue}-post-rebase-review`,
+          agent,
+          maxIterations: 1,
+          promptFile: "./.sandcastle/review-prompt.md",
+          promptArgs: promptArgsForIssue(issue, pr.branch),
+        }),
+      );
       if (!review.completionSignal) {
         throw new Error(`PR #${pr.number} 冲突解决后的 code-review 未通过。`);
       }
@@ -259,6 +265,7 @@ export function createGitHubMergeOperations(options: {
   ghToken: string;
   agent: ReturnType<typeof sandcastle.codex>;
   maxIterations: number;
+  idleTimeoutSeconds: number;
   ciTimeoutMs: number;
   ciPollMs: number;
   issuesByNumber: Map<number, IssueRecord>;
@@ -311,6 +318,7 @@ export function createGitHubMergeOperations(options: {
         options.ghToken,
         options.agent,
         options.maxIterations,
+        options.idleTimeoutSeconds,
       );
     },
 

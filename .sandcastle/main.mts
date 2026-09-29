@@ -18,6 +18,10 @@ import {
 } from "./merge.mts";
 import { createGitHubMergeOperations } from "./github-merge.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
+import {
+  resolveAgentIdleTimeoutSeconds,
+  withAgentIdleTimeout,
+} from "./runtime-config.mts";
 
 const EXPECTED_REMOTE = "https://github.com/fjsxy/monitor-in-hand";
 const READY_LABEL = "ready-for-agent";
@@ -257,6 +261,7 @@ async function executeIssue(
   ghToken: string,
   agent: ReturnType<typeof sandcastle.codex>,
   maxIterations: number,
+  idleTimeoutSeconds: number,
 ): Promise<{
   issue: number;
   status: string;
@@ -286,13 +291,15 @@ async function executeIssue(
     });
 
     try {
-      const implementation = await sandbox.run({
-        name: `issue-${issue.number}-implement`,
-        agent,
-        maxIterations,
-        promptFile: "./.sandcastle/implement-prompt.md",
-        promptArgs,
-      });
+      const implementation = await sandbox.run(
+        withAgentIdleTimeout(idleTimeoutSeconds, {
+          name: `issue-${issue.number}-implement`,
+          agent,
+          maxIterations,
+          promptFile: "./.sandcastle/implement-prompt.md",
+          promptArgs,
+        }),
+      );
 
       if (!implementation.completionSignal) {
         return {
@@ -310,13 +317,15 @@ async function executeIssue(
         };
       }
 
-      const review = await sandbox.run({
-        name: `issue-${issue.number}-review`,
-        agent,
-        maxIterations: 1,
-        promptFile: "./.sandcastle/review-prompt.md",
-        promptArgs,
-      });
+      const review = await sandbox.run(
+        withAgentIdleTimeout(idleTimeoutSeconds, {
+          name: `issue-${issue.number}-review`,
+          agent,
+          maxIterations: 1,
+          promptFile: "./.sandcastle/review-prompt.md",
+          promptArgs,
+        }),
+      );
 
       if (!review.completionSignal) {
         return {
@@ -360,6 +369,10 @@ async function main(): Promise<void> {
   const maxIterations = positiveInteger(
     process.env.SANDCASTLE_MAX_ITERATIONS || localEnv.SANDCASTLE_MAX_ITERATIONS,
     3,
+  );
+  const idleTimeoutSeconds = resolveAgentIdleTimeoutSeconds(
+    process.env,
+    localEnv,
   );
   const ciTimeoutMinutes = positiveInteger(
     process.env.SANDCASTLE_CI_TIMEOUT_MINUTES ||
@@ -427,6 +440,7 @@ async function main(): Promise<void> {
         ghToken,
         agent,
         maxIterations,
+        idleTimeoutSeconds,
       ),
     ),
   );
@@ -474,6 +488,7 @@ async function main(): Promise<void> {
         ghToken,
         agent,
         maxIterations,
+        idleTimeoutSeconds,
         ciTimeoutMs: ciTimeoutMinutes * 60_000,
         ciPollMs: ciPollSeconds * 1_000,
         issuesByNumber: new Map(issues.map((issue) => [issue.number, issue])),

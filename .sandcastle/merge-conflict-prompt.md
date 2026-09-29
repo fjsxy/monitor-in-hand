@@ -11,6 +11,7 @@
 
 # 约束
 
+- 阅读长文件时逐个、分段读取；搜索先限定目录和模式，再按需展开。不要在一次命令中串联多个长文件或回传大范围无界输出。
 - 追溯双方意图并保留仍然成立的行为，不机械选择 ours/theirs，不通过删除测试、放宽断言或恢复旧实现消除冲突。
 - 不执行 `git rebase --abort`，不重新开始 rebase，不 merge `{{TARGET_BRANCH}}`。
 - 逐个解决冲突并 `git add`；使用 `GIT_EDITOR=true git rebase --continue` 推进，直到 rebase 完成。
