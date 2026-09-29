@@ -162,7 +162,9 @@ var _ = Describe("原生 PrometheusAgent 采集配置", Serial, func() {
 			}
 		}
 		Expect(strings.TrimSpace(kubectl(ctx, "auth", "can-i", "get", "configmaps", "--all-namespaces", "--as", agentSubject))).To(Equal("yes"))
-		Expect(strings.TrimSpace(kubectl(ctx, "auth", "can-i", "get", "nodes", "--all-namespaces", "--as", agentSubject))).To(Equal("no"))
+		nodesOutput, nodesErr := kubectlResult(ctx, "auth", "can-i", "get", "nodes", "--as", agentSubject)
+		Expect(nodesErr).To(HaveOccurred(), "nodes 权限必须被拒绝")
+		Expect(strings.TrimSpace(nodesOutput)).To(Equal("no"))
 
 		By(scenarioID + " 从 Agent targets API 等待每类 job 至少一个真实 up target")
 		apiResults := waitForAgentAPIs(ctx, fixtureJobs)

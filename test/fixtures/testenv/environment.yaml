@@ -475,6 +475,7 @@ spec:
   serviceAccountName: prometheus-agent
   replicas: 1
   shards: 1
+  serviceDiscoveryRole: __SERVICE_DISCOVERY_ROLE__
   serviceMonitorSelector:
     matchLabels:
       monitoring.fjsxy.github.io/test-fixture: "true"

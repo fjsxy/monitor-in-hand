@@ -149,7 +149,11 @@ wait_for_test_workloads() {
 }
 
 install_test_workloads() {
-  local rendered
+  local rendered service_discovery_role
+  case "${kubernetes_version}" in
+    1.19) service_discovery_role=Endpoints ;;
+    1.28) service_discovery_role=EndpointSlice ;;
+  esac
   rendered=$(sed \
     -e "s|__NODE_EXPORTER_IMAGE__|${NODE_EXPORTER_IMAGE}|g" \
     -e "s|__BLACKBOX_EXPORTER_IMAGE__|${BLACKBOX_EXPORTER_IMAGE}|g" \
@@ -157,9 +161,10 @@ install_test_workloads() {
     -e "s|__VMINSERT_IMAGE__|${VMINSERT_IMAGE}|g" \
     -e "s|__VMSELECT_IMAGE__|${VMSELECT_IMAGE}|g" \
     -e "s|__PROMETHEUS_IMAGE__|${PROMETHEUS_IMAGE}|g" \
+    -e "s|__SERVICE_DISCOVERY_ROLE__|${service_discovery_role}|g" \
     "${fixture_root}/environment.yaml")
   if grep -Eq '__[A-Z0-9_]+__' <<<"${rendered}"; then
-    echo "测试依赖基线 manifest 存在未替换的 image token" >&2
+    echo "测试依赖基线 manifest 存在未替换的模板 token" >&2
     exit 1
   fi
   printf '%s\n' "${rendered}" \
@@ -290,7 +295,7 @@ verify_environment() {
   verify_crd_served probes.monitoring.coreos.com v1
 
   verify_crd_schema_fields prometheusagents.monitoring.coreos.com v1alpha1 \
-    '["image","version","serviceAccountName","replicas","shards","storage","walCompression","externalLabels","replicaExternalLabelName","serviceMonitorSelector","serviceMonitorNamespaceSelector","podMonitorSelector","podMonitorNamespaceSelector","probeSelector","probeNamespaceSelector","scrapeConfigSelector","scrapeConfigNamespaceSelector","remoteWrite"]'
+    '["image","version","serviceAccountName","replicas","shards","storage","walCompression","externalLabels","replicaExternalLabelName","serviceDiscoveryRole","serviceMonitorSelector","serviceMonitorNamespaceSelector","podMonitorSelector","podMonitorNamespaceSelector","probeSelector","probeNamespaceSelector","scrapeConfigSelector","scrapeConfigNamespaceSelector","remoteWrite"]'
   verify_crd_schema_fields scrapeconfigs.monitoring.coreos.com v1alpha1 \
     '["staticConfigs","kubernetesSDConfigs"]'
   verify_crd_schema_fields servicemonitors.monitoring.coreos.com v1 \
