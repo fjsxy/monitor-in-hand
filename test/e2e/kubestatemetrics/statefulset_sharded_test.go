@@ -69,8 +69,11 @@ spec:
 			"--pod-namespace=$(POD_NAMESPACE)",
 		}
 		Expect(container.Args).To(Equal(expectedArgs))
-		Expect(container.Resources.Requests).To(HaveKeyWithValue(corev1.ResourceCPU, resource.MustParse("15m")))
-		Expect(container.Resources.Limits).To(HaveKeyWithValue(corev1.ResourceMemory, resource.MustParse("96Mi")))
+		expectedTemplateResources := corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("15m")},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("96Mi")},
+		}
+		Expect(container.Resources).To(Equal(expectedTemplateResources))
 		Expect(container.Env).To(ConsistOf(
 			HaveField("Name", "POD_NAME"),
 			HaveField("Name", "POD_NAMESPACE"),
@@ -85,13 +88,16 @@ spec:
 		))
 
 		By("验证每个 shard Pod 都继承同一份过滤与资源配置")
+		// Pod API 会把显式 limit 复制为同名的缺省 request；完整断言默认化后的有效资源，避免误认为 Operator 改写了声明。
+		expectedPodResources := expectedTemplateResources.DeepCopy()
+		expectedPodResources.Requests[corev1.ResourceMemory] = resource.MustParse("96Mi")
 		for ordinal := 0; ordinal < 2; ordinal++ {
 			podName := fmt.Sprintf("%s-%d", shardedManagedName, ordinal)
 			pod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(pod.Spec.Containers).To(HaveLen(1))
 			Expect(pod.Spec.Containers[0].Args).To(Equal(expectedArgs))
-			Expect(pod.Spec.Containers[0].Resources).To(Equal(container.Resources))
+			Expect(pod.Spec.Containers[0].Resources).To(Equal(*expectedPodResources))
 
 			By(fmt.Sprintf("从 shard Pod %d 的 telemetry 验证唯一 ordinal 和 total shards", ordinal))
 			assertTargetMetricsBody(ctx, "pod/"+podName, 8081, func(body []byte) error {
