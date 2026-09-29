@@ -531,7 +531,23 @@ export function createGitHubMergeOperations(
         "--rebase",
       ]);
       if (update.ok) {
-        const updated = fetchPullRequest(pr.number);
+        const remoteBranch = command("git", [
+          "ls-remote",
+          "origin",
+          `refs/heads/${pr.branch}`,
+        ]);
+        const remoteHeadOid = remoteBranch.split(/\s+/)[0];
+        if (!remoteHeadOid) {
+          throw new Error(`PR #${pr.number} 更新后无法读取远端 head。`);
+        }
+        const updated = await waitForPublishedPullRequestHead(
+          pr.number,
+          checkedHeadOid,
+          remoteHeadOid,
+          () => fetchPullRequest(pr.number),
+          repairDependencies.delayBeforeRefetch,
+          "rebase",
+        );
         console.log(
           `PR #${pr.number} 已基于最新 ${options.baseBranch} 更新。`,
         );
