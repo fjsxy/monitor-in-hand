@@ -3,6 +3,7 @@ package kubestatemetrics
 import (
 	"crypto/sha256"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -56,14 +57,24 @@ type Profile struct {
 
 // ResourcePlan contains the complete desired state for one reconcile.
 type ResourcePlan struct {
-	Profile    Profile
-	InstanceID string
-	Name       string
-	Resources  []client.Object
+	Profile             Profile
+	InstanceID          string
+	Name                string
+	EffectiveCollectors []string
+	Resources           []client.Object
+}
+
+var collectorCatalog = []string{
+	"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
+	"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
+	"namespaces", "networkpolicies", "nodes", "persistentvolumeclaims", "persistentvolumes", "poddisruptionbudgets",
+	"pods", "replicasets", "replicationcontrollers", "resourcequotas", "secrets", "services", "statefulsets",
+	"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
 }
 
 // BuildPlan validates all known inputs before returning any writable resources.
 func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts) (*ResourcePlan, *Problem) {
+	// 先完成全部纯 spec 校验，使配置错误稳定返回 InvalidSpec，而不被集群依赖状态掩盖。
 	if instance.Spec.TargetNamespace == "" {
 		return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.targetNamespace 必填"}
 	}
@@ -73,6 +84,30 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 			Message: fmt.Sprintf("spec.targetNamespace 首次应用后不可修改：已应用 %q，当前 %q", instance.Status.AppliedTargetNamespace, instance.Spec.TargetNamespace),
 		}
 	}
+	mode := instance.Spec.Deployment.Mode
+	if mode == "" {
+		mode = monitoringv1alpha1.DeploymentModeDeployment
+	}
+	if mode != monitoringv1alpha1.DeploymentModeDeployment {
+		return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.deployment.mode %q 不受支持", mode)}
+	}
+	if instance.Spec.PodResources != nil && len(instance.Spec.PodResources.Claims) != 0 {
+		return nil, &Problem{
+			Reason:  ReasonInvalidSpec,
+			Message: "spec.podResources.claims 不受支持；受管 Pod 不开放 resourceClaims 声明",
+		}
+	}
+
+	effectiveCollectors, problem := resolveCollectors(instance.Spec.Collectors)
+	if problem != nil {
+		return nil, problem
+	}
+	metricFilterArgs, problem := resolveMetricFilter(instance.Spec.MetricFilter)
+	if problem != nil {
+		return nil, problem
+	}
+
+	// spec 有效后再选择版本 profile 并验证外部 Namespace 依赖。
 	profile, problem := profileFor(facts.KubernetesVersion)
 	if problem != nil {
 		return nil, problem
@@ -84,18 +119,103 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 		}
 	}
 
-	mode := instance.Spec.Deployment.Mode
-	if mode == "" {
-		mode = monitoringv1alpha1.DeploymentModeDeployment
-	}
-	if mode != monitoringv1alpha1.DeploymentModeDeployment {
-		return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.deployment.mode %q 不受支持", mode)}
-	}
-
+	// 最后把同一份解析结果同时用于 workload 参数和 status 所需的资源计划。
 	instanceID := stableInstanceID(instance.Name)
 	name := ManagedResourceName(instance.Name)
-	resources := deploymentResources(instance, profile, instanceID, name)
-	return &ResourcePlan{Profile: profile, InstanceID: instanceID, Name: name, Resources: resources}, nil
+	containerArgs := []string{"--resources=" + strings.Join(effectiveCollectors, ",")}
+	containerArgs = append(containerArgs, metricFilterArgs...)
+	resources := deploymentResources(instance, profile, instanceID, name, containerArgs)
+	return &ResourcePlan{
+		Profile:             profile,
+		InstanceID:          instanceID,
+		Name:                name,
+		EffectiveCollectors: effectiveCollectors,
+		Resources:           resources,
+	}, nil
+}
+
+func resolveMetricFilter(config monitoringv1alpha1.KubeStateMetricsMetricFilter) ([]string, *Problem) {
+	switch config.Mode {
+	case "", monitoringv1alpha1.MetricFilterModeAll:
+		if len(config.Patterns) != 0 {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.metricFilter.mode 为 All 时 patterns 必须为空"}
+		}
+		return nil, nil
+	case monitoringv1alpha1.MetricFilterModeAllow:
+		patterns, problem := metricPatternsForArgument(config.Patterns, monitoringv1alpha1.MetricFilterModeAllow)
+		if problem != nil {
+			return nil, problem
+		}
+		return []string{"--metric-allowlist=" + strings.Join(patterns, ",")}, nil
+	case monitoringv1alpha1.MetricFilterModeDeny:
+		patterns, problem := metricPatternsForArgument(config.Patterns, monitoringv1alpha1.MetricFilterModeDeny)
+		if problem != nil {
+			return nil, problem
+		}
+		return []string{"--metric-denylist=" + strings.Join(patterns, ",")}, nil
+	default:
+		return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.metricFilter.mode %q 不受支持", config.Mode)}
+	}
+}
+
+func metricPatternsForArgument(patterns []string, mode monitoringv1alpha1.MetricFilterMode) ([]string, *Problem) {
+	if len(patterns) == 0 {
+		return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.metricFilter.mode 为 %s 时 patterns 必须非空", mode)}
+	}
+	result := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		if pattern == "" {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.metricFilter.patterns 不得包含空项"}
+		}
+		if strings.Contains(pattern, ",") {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.metricFilter.patterns 中 %q 包含逗号", pattern)}
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.metricFilter.patterns 中 %q 是非法 Go 正则表达式: %v", pattern, err)}
+		}
+		// 上游会 trim 每个 flag 项；用捕获组保护首尾空白，同时保持 Go MatchString 语义不变。
+		if strings.TrimSpace(pattern) != pattern {
+			pattern = "(" + pattern + ")"
+		}
+		result = append(result, pattern)
+	}
+	return result, nil
+}
+
+func resolveCollectors(config monitoringv1alpha1.KubeStateMetricsCollectors) ([]string, *Problem) {
+	switch config.Mode {
+	case "", monitoringv1alpha1.CollectorModeDefault:
+		if len(config.Names) != 0 {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.collectors.mode 为 Default 时 names 必须为空"}
+		}
+		return append([]string(nil), collectorCatalog...), nil
+	case monitoringv1alpha1.CollectorModeInclude:
+		if len(config.Names) == 0 {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.collectors.mode 为 Include 时 names 必须非空"}
+		}
+		seen := make(map[string]struct{}, len(config.Names))
+		for _, name := range config.Names {
+			if !isKnownCollector(name) {
+				return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.collectors.names 包含共同 catalog 外的 collector %q", name)}
+			}
+			if _, exists := seen[name]; exists {
+				return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.collectors.names 包含重复项 %q", name)}
+			}
+			seen[name] = struct{}{}
+		}
+		return append([]string(nil), config.Names...), nil
+	default:
+		return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.collectors.mode %q 不受支持", config.Mode)}
+	}
+}
+
+func isKnownCollector(name string) bool {
+	for _, candidate := range collectorCatalog {
+		if name == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 // ManagedResourceName returns the stable shared name of an instance's directly managed resources.
@@ -164,8 +284,12 @@ func stableInstanceID(name string) string {
 	return prefix + "-" + digest
 }
 
-func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string) []client.Object {
+func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string) []client.Object {
 	labels := managedLabels(instanceID, profile.Version)
+	podResources := corev1.ResourceRequirements{}
+	if instance.Spec.PodResources != nil {
+		podResources = *instance.Spec.PodResources.DeepCopy()
+	}
 	selector := map[string]string{
 		labelName:          "kube-state-metrics",
 		labelInstance:      instanceID,
@@ -192,6 +316,7 @@ func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile 
 						Name:                     "kube-state-metrics",
 						Image:                    profile.Image,
 						ImagePullPolicy:          corev1.PullIfNotPresent,
+						Args:                     append([]string(nil), containerArgs...),
 						Ports:                    ports,
 						TerminationMessagePath:   corev1.TerminationMessagePathDefault,
 						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
@@ -212,6 +337,7 @@ func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile 
 							FailureThreshold:    3,
 						},
 						SecurityContext: profile.ContainerSecurityContext.DeepCopy(),
+						Resources:       podResources,
 					}},
 				},
 			},
@@ -315,3 +441,4 @@ var _ runtime.Object = &appsv1.Deployment{}
 func boolPointer(value bool) *bool    { return &value }
 func int32Pointer(value int32) *int32 { return &value }
 func int64Pointer(value int64) *int64 { return &value }
+

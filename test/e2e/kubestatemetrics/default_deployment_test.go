@@ -21,6 +21,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -120,11 +121,17 @@ spec:
 		Expect(instance.Spec.Suspended).NotTo(BeNil())
 		Expect(*instance.Spec.Suspended).To(BeFalse())
 		Expect(instance.Spec.Deployment.Mode).To(Equal(monitoringv1alpha1.DeploymentModeDeployment))
+		Expect(instance.Spec.Collectors.Mode).To(Equal(monitoringv1alpha1.CollectorModeDefault))
+		Expect(instance.Spec.Collectors.Names).To(BeEmpty())
+		Expect(instance.Spec.MetricFilter.Mode).To(Equal(monitoringv1alpha1.MetricFilterModeAll))
+		Expect(instance.Spec.MetricFilter.Patterns).To(BeEmpty())
+		Expect(instance.Spec.PodResources).To(BeNil())
 		Expect(instance.Status.AppliedTargetNamespace).To(Equal(targetNamespace))
 		Expect(instance.Status.KubeStateMetricsVersion).To(Equal(active.version))
 		Expect(instance.Status.DeploymentMode).To(Equal(monitoringv1alpha1.DeploymentModeDeployment))
 		Expect(instance.Status.DesiredPods).To(Equal(int32(1)))
 		Expect(instance.Status.AvailablePods).To(Equal(int32(1)))
+		Expect(instance.Status.EffectiveCollectors).To(Equal(sharedCollectorCatalog()))
 		Expect(instance.Status.ManagedResources).To(HaveLen(5))
 		Expect(conditionIsTrue(instance.Status.Conditions, "Ready", instance.Generation)).To(BeTrue())
 		Expect(conditionIsTrue(instance.Status.Conditions, "Available", instance.Generation)).To(BeTrue())
@@ -140,7 +147,8 @@ spec:
 		Expect(podSpec.Containers).To(HaveLen(1))
 		container := podSpec.Containers[0]
 		Expect(container.Image).To(Equal(active.image))
-		Expect(container.Args).To(BeEmpty())
+		Expect(container.Args).To(Equal([]string{"--resources=" + strings.Join(sharedCollectorCatalog(), ",")}))
+		Expect(container.Resources).To(Equal(corev1.ResourceRequirements{}))
 		Expect(container.Ports).To(ContainElements(
 			SatisfyAll(HaveField("Name", "http-metrics"), HaveField("ContainerPort", int32(8080))),
 			SatisfyAll(HaveField("Name", "telemetry"), HaveField("ContainerPort", int32(8081))),
@@ -191,7 +199,7 @@ spec:
 		Expect(binding.Subjects).To(Equal([]rbacv1.Subject{{Kind: "ServiceAccount", Name: managedName, Namespace: targetNamespace}}))
 
 		By("通过真实 Service 端口读取指标，确认 kube-state-metrics 可用")
-		assertMetricsAvailable(ctx)
+		assertMetrics(ctx, managedName, []string{"kube_pod_info"}, nil)
 	}, SpecTimeout(15*time.Minute))
 
 	It(fmt.Sprintf("[%s] 覆盖停用、挂起、恢复与 finalizer 删除阻塞", lifecycleScenarioID()), func(ctx SpecContext) {
@@ -317,6 +325,132 @@ spec:
 			return objectAbsent(ctx, "", "kubestatemetrics", lifecycleName)
 		}, 2*time.Minute, time.Second).Should(Succeed())
 	}, SpecTimeout(20*time.Minute))
+
+	It(fmt.Sprintf("[%s] 显式 collectors、Allow filter 与 podResources 作用于真实 workload", configurationScenarioID("003")), func(ctx SpecContext) {
+		const name = "configured-allow"
+		managed := "ksm-" + name
+		By("提交只采集 pods、使用未锚定 allow pattern 且显式声明 resources 的实例")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  collectors:
+    mode: Include
+    names: [pods]
+  metricFilter:
+    mode: Allow
+    patterns: [pod_info, '^definitely_no_metric$']
+  podResources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+`, name, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+
+		By("等待真实 workload 和 status 收敛")
+		waitForInstanceReady(ctx, name, managed)
+
+		By("验证解析结果、参数与完整 ResourceRequirements 一致")
+		instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(instance.Status.EffectiveCollectors).To(Equal([]string{"pods"}))
+		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", managed)
+		Expect(err).NotTo(HaveOccurred())
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Args).To(Equal([]string{"--resources=pods", "--metric-allowlist=pod_info,^definitely_no_metric$"}))
+		Expect(container.Resources).To(Equal(corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("20m"), corev1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("200m"), corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		}))
+
+		By("读取真实 metrics，证明 Go MatchString 未锚定语义允许 kube_pod_info 且过滤其他 pod metrics")
+		assertMetrics(ctx, managed, []string{"kube_pod_info"}, []string{"kube_pod_status_phase"})
+	}, SpecTimeout(10*time.Minute))
+
+	It(fmt.Sprintf("[%s] Deny filter 从真实 workload 排除匹配指标", configurationScenarioID("004")), func(ctx SpecContext) {
+		const name = "configured-deny"
+		managed := "ksm-" + name
+		By("提交 pods collector 和 kube_pod_info deny pattern")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  collectors:
+    mode: Include
+    names: [pods]
+  metricFilter:
+    mode: Deny
+    patterns: [kube_pod_info]
+`, name, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+
+		By("等待真实 workload 和 status 收敛")
+		waitForInstanceReady(ctx, name, managed)
+
+		By("验证 denylist 参数并从真实 scrape 确认被拒指标缺失、其他 pod 指标仍存在")
+		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", managed)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+			"--resources=pods", "--metric-denylist=kube_pod_info",
+		}))
+		assertMetrics(ctx, managed, []string{"kube_pod_status_phase"}, []string{"kube_pod_info"})
+	}, SpecTimeout(10*time.Minute))
+
+	It(fmt.Sprintf("[%s] 非法配置只降级当前实例且不反复写资源", configurationScenarioID("005")), func(ctx SpecContext) {
+		const name = "invalid-filter"
+		By("提交包含非法 Go regexp 的实例")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  metricFilter:
+    mode: Allow
+    patterns: ['[']
+`, name, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+
+		By("等待 InvalidSpec status，并验证当前实例没有 workload")
+		var invalidResourceVersion string
+		Eventually(func() error {
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", name)
+			if err != nil {
+				return err
+			}
+			if instance.Status.ObservedGeneration != instance.Generation || !conditionHasReason(instance.Status.Conditions, "Degraded", "InvalidSpec") {
+				return fmt.Errorf("InvalidSpec status 尚未收敛: generation=%d observed=%d", instance.Generation, instance.Status.ObservedGeneration)
+			}
+			invalidResourceVersion = instance.ResourceVersion
+			return nil
+		}, time.Minute, time.Second).Should(Succeed())
+		_, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", "ksm-"+name)
+		Expect(err).To(MatchError(ContainSubstring("NotFound")))
+
+		By("确认相同 generation 不反复写 status，且 Operator 与既有合法实例保持可用")
+		Consistently(func() string {
+			instance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", name)
+			Expect(getErr).NotTo(HaveOccurred())
+			return instance.ResourceVersion
+		}, 5*time.Second, time.Second).Should(Equal(invalidResourceVersion))
+		operator, err := getObject[appsv1.Deployment](ctx, operatorNamespace, "deployment", "monitor-in-hand-monitor-in-hand")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(operator.Status.AvailableReplicas).To(Equal(int32(1)))
+		valid, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", instanceName)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(valid.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseReady))
+	}, SpecTimeout(5*time.Minute))
 })
 
 func stableScenarioID() string {
@@ -334,6 +468,37 @@ func lifecycleScenarioID() string {
 		return "E2E-128-KSM-002"
 	}
 	return "E2E-UNSUPPORTED-KSM-002"
+}
+
+func configurationScenarioID(sequence string) string {
+	ids := map[string]map[string]string{
+		"1.19": {
+			"003": "E2E-119-KSM-003",
+			"004": "E2E-119-KSM-004",
+			"005": "E2E-119-KSM-005",
+		},
+		"1.28": {
+			"003": "E2E-128-KSM-003",
+			"004": "E2E-128-KSM-004",
+			"005": "E2E-128-KSM-005",
+		},
+	}
+	if versionIDs, supported := ids[os.Getenv("KUBERNETES_VERSION")]; supported {
+		if id, found := versionIDs[sequence]; found {
+			return id
+		}
+	}
+	return "E2E-UNSUPPORTED-KSM-" + sequence
+}
+
+func sharedCollectorCatalog() []string {
+	return []string{
+		"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
+		"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
+		"namespaces", "networkpolicies", "nodes", "persistentvolumeclaims", "persistentvolumes", "poddisruptionbudgets",
+		"pods", "replicasets", "replicationcontrollers", "resourcequotas", "secrets", "services", "statefulsets",
+		"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
+	}
 }
 
 func scenarioFor(version string) scenario {
@@ -428,6 +593,37 @@ func conditionIsTrue(conditions []metav1.Condition, conditionType string, genera
 	return false
 }
 
+func conditionHasReason(conditions []metav1.Condition, conditionType, reason string) bool {
+	for _, condition := range conditions {
+		if condition.Type == conditionType && condition.Status == metav1.ConditionTrue && condition.Reason == reason {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForInstanceReady(ctx SpecContext, instance, deployment string) {
+	Eventually(func() error {
+		workload, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", deployment)
+		if err != nil {
+			return err
+		}
+		if workload.Status.AvailableReplicas != 1 {
+			return fmt.Errorf("Deployment %s availableReplicas=%d，期望 1", deployment, workload.Status.AvailableReplicas)
+		}
+		managed, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", instance)
+		if err != nil {
+			return err
+		}
+		if managed.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady ||
+			managed.Status.ObservedGeneration != managed.Generation || managed.Status.AvailablePods != 1 {
+			return fmt.Errorf("实例 %s status 尚未 Ready: phase=%s observed=%d generation=%d available=%d",
+				instance, managed.Status.Phase, managed.Status.ObservedGeneration, managed.Generation, managed.Status.AvailablePods)
+		}
+		return nil
+	}, 5*time.Minute, 2*time.Second).Should(Succeed())
+}
+
 func conditionMatches(conditions []metav1.Condition, conditionType string, status metav1.ConditionStatus, reason string) bool {
 	for _, condition := range conditions {
 		if condition.Type == conditionType && condition.Status == status && condition.Reason == reason {
@@ -494,7 +690,8 @@ func canonicalRules(rules []rbacv1.PolicyRule) []string {
 	return canonical
 }
 
-func assertMetricsAvailable(ctx SpecContext) {
+func assertMetrics(ctx SpecContext, serviceName string, present, absent []string) {
+	// 先预留本地端口并启动到受管 Service 的转发进程。
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	Expect(err).NotTo(HaveOccurred())
 	port := listener.Addr().(*net.TCPAddr).Port
@@ -502,10 +699,11 @@ func assertMetricsAvailable(ctx SpecContext) {
 
 	logBuffer := &bytes.Buffer{}
 	command := exec.CommandContext(ctx, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
-		"port-forward", "service/"+managedName, fmt.Sprintf("%d:8080", port))
+		"port-forward", "service/"+serviceName, fmt.Sprintf("%d:8080", port))
 	command.Stdout = logBuffer
 	command.Stderr = logBuffer
 	Expect(command.Start()).To(Succeed())
+	// 场景结束时清理转发进程，避免多个真实 workload 验收相互干扰。
 	DeferCleanup(func() {
 		if command.Process != nil {
 			_ = command.Process.Kill()
@@ -514,6 +712,7 @@ func assertMetricsAvailable(ctx SpecContext) {
 	})
 
 	client := &http.Client{Timeout: 2 * time.Second}
+	// 在有界时间内等待 metrics endpoint 可用，并验证允许与拒绝集合。
 	Eventually(func() error {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/metrics", port), nil)
 		if err != nil {
@@ -528,8 +727,18 @@ func assertMetricsAvailable(ctx SpecContext) {
 		if err != nil {
 			return err
 		}
-		if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("\nkube_pod_info")) {
-			return fmt.Errorf("metrics 未包含 kube_pod_info: status=%d", response.StatusCode)
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("metrics HTTP status=%d", response.StatusCode)
+		}
+		for _, metric := range present {
+			if !bytes.Contains(body, []byte("\n"+metric)) {
+				return fmt.Errorf("metrics 未包含 %s", metric)
+			}
+		}
+		for _, metric := range absent {
+			if bytes.Contains(body, []byte("\n"+metric)) {
+				return fmt.Errorf("metrics 不应包含 %s", metric)
+			}
 		}
 		return nil
 	}, time.Minute, time.Second).Should(Succeed())
@@ -577,3 +786,4 @@ func envOrDefault(name, fallback string) string {
 	}
 	return fallback
 }
+

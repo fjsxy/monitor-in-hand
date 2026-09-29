@@ -1,15 +1,18 @@
 package kubestatemetrics_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
@@ -66,7 +69,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
 			container := deployment.Spec.Template.Spec.Containers[0]
 			Expect(container.Image).To(Equal(wantImage))
-			Expect(container.Args).To(BeEmpty())
+			Expect(container.Args).To(Equal([]string{"--resources=" + strings.Join(plan.EffectiveCollectors, ",")}))
 			Expect(container.Ports).To(ConsistOf(
 				corev1.ContainerPort{Name: "http-metrics", ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
 				corev1.ContainerPort{Name: "telemetry", ContainerPort: 8081, Protocol: corev1.ProtocolTCP},
@@ -135,6 +138,168 @@ var _ = Describe("默认 Deployment 规划", func() {
 		},
 		Entry("Kubernetes 1.19", "v1.19.16", "2.3.0", "k8s.gcr.io/kube-state-metrics/kube-state-metrics:v2.3.0", "endpoints", false),
 		Entry("Kubernetes 1.28", "v1.28.15", "2.11.0", "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.11.0", "endpointslices", true),
+	)
+
+	DescribeTable("UT-KSM-006 默认 collectors 固定为两个版本共同的 28 项 catalog", func(kubernetesVersion string) {
+		By("执行最小声明的纯规划")
+		plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
+			KubernetesVersion:     kubernetesVersion,
+			TargetNamespaceExists: true,
+		})
+
+		By("验证固定 catalog、实际参数与省略资源的行为")
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveCollectors).To(Equal([]string{
+			"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
+			"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
+			"namespaces", "networkpolicies", "nodes", "persistentvolumeclaims", "persistentvolumes", "poddisruptionbudgets",
+			"pods", "replicasets", "replicationcontrollers", "resourcequotas", "secrets", "services", "statefulsets",
+			"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
+		}))
+		deployment := deploymentFrom(plan)
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+			"--resources=" + strings.Join(plan.EffectiveCollectors, ","),
+		}))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{}))
+	},
+		Entry("Kubernetes 1.19", "v1.19.16"),
+		Entry("Kubernetes 1.28", "v1.28.15"),
+	)
+
+	DescribeTable("UT-KSM-007 Include collectors 成为实际参数和 effective collectors", func(kubernetesVersion string) {
+		By("准备显式 Include collector 声明")
+		instance := newInstance()
+		instance.Spec.Collectors = monitoringv1alpha1.KubeStateMetricsCollectors{
+			Mode:  monitoringv1alpha1.CollectorModeInclude,
+			Names: []string{"pods", "deployments"},
+		}
+
+		By("执行纯规划")
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
+			KubernetesVersion:     kubernetesVersion,
+			TargetNamespaceExists: true,
+		})
+
+		By("验证实际参数和 effective collectors 来自同一解析结果")
+		Expect(problem).To(BeNil())
+		Expect(plan.EffectiveCollectors).To(Equal([]string{"pods", "deployments"}))
+		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods,deployments"}))
+	},
+		Entry("Kubernetes 1.19", "v1.19.16"),
+		Entry("Kubernetes 1.28", "v1.28.15"),
+	)
+
+	DescribeTable("UT-KSM-008 非法 collector 配置在规划资源前返回 InvalidSpec",
+		func(collectors monitoringv1alpha1.KubeStateMetricsCollectors, wantMessage string) {
+			By("准备非法 collector 声明")
+			instance := newInstance()
+			instance.Spec.Collectors = collectors
+			expectInvalidSpecAcrossProfiles(instance, wantMessage)
+		},
+		Entry("Default 不接受 names", monitoringv1alpha1.KubeStateMetricsCollectors{
+			Mode: monitoringv1alpha1.CollectorModeDefault, Names: []string{"pods"},
+		}, "Default"),
+		Entry("Include 要求 names 非空", monitoringv1alpha1.KubeStateMetricsCollectors{
+			Mode: monitoringv1alpha1.CollectorModeInclude,
+		}, "非空"),
+		Entry("Include 不接受重复项", monitoringv1alpha1.KubeStateMetricsCollectors{
+			Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods", "pods"},
+		}, "重复"),
+		Entry("Include 不接受共同 catalog 外的名称", monitoringv1alpha1.KubeStateMetricsCollectors{
+			Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"serviceaccounts"},
+		}, "serviceaccounts"),
+	)
+
+	DescribeTable("UT-KSM-009 metric filter 映射为对应的 kube-state-metrics 参数",
+		func(kubernetesVersion string, mode monitoringv1alpha1.MetricFilterMode, patterns []string, wantFilterArg string) {
+			By("准备显式 collector 和 metric filter")
+			instance := newInstance()
+			instance.Spec.Collectors = monitoringv1alpha1.KubeStateMetricsCollectors{
+				Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods"},
+			}
+			instance.Spec.MetricFilter = monitoringv1alpha1.KubeStateMetricsMetricFilter{Mode: mode, Patterns: patterns}
+
+			By("执行纯规划")
+			plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
+				KubernetesVersion:     kubernetesVersion,
+				TargetNamespaceExists: true,
+			})
+
+			By("验证 filter 被原样映射到对应参数")
+			Expect(problem).To(BeNil())
+			Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+				"--resources=pods",
+				wantFilterArg,
+			}))
+		},
+		Entry("Kubernetes 1.19 Allow 保留未锚定和合法零命中 pattern", "v1.19.16", monitoringv1alpha1.MetricFilterModeAllow,
+			[]string{"pod_info", "^definitely_no_metric$"}, "--metric-allowlist=pod_info,^definitely_no_metric$"),
+		Entry("Kubernetes 1.28 Allow 保留未锚定和合法零命中 pattern", "v1.28.15", monitoringv1alpha1.MetricFilterModeAllow,
+			[]string{"pod_info", "^definitely_no_metric$"}, "--metric-allowlist=pod_info,^definitely_no_metric$"),
+		Entry("Kubernetes 1.19 Allow 保留首尾空白 regexp 的零命中语义", "v1.19.16", monitoringv1alpha1.MetricFilterModeAllow,
+			[]string{" pod_info ", "   "}, "--metric-allowlist=( pod_info ),(   )"),
+		Entry("Kubernetes 1.28 Allow 保留首尾空白 regexp 的零命中语义", "v1.28.15", monitoringv1alpha1.MetricFilterModeAllow,
+			[]string{" pod_info ", "   "}, "--metric-allowlist=( pod_info ),(   )"),
+		Entry("Kubernetes 1.19 Deny", "v1.19.16", monitoringv1alpha1.MetricFilterModeDeny,
+			[]string{"kube_pod_info", "_labels$"}, "--metric-denylist=kube_pod_info,_labels$"),
+		Entry("Kubernetes 1.28 Deny", "v1.28.15", monitoringv1alpha1.MetricFilterModeDeny,
+			[]string{"kube_pod_info", "_labels$"}, "--metric-denylist=kube_pod_info,_labels$"),
+	)
+
+	DescribeTable("UT-KSM-010 非法 metric filter 在规划资源前返回 InvalidSpec",
+		func(filter monitoringv1alpha1.KubeStateMetricsMetricFilter, wantMessage string) {
+			By("准备非法 metric filter 声明")
+			instance := newInstance()
+			instance.Spec.MetricFilter = filter
+			expectInvalidSpecAcrossProfiles(instance, wantMessage)
+		},
+		Entry("All 不接受 patterns", monitoringv1alpha1.KubeStateMetricsMetricFilter{
+			Mode: monitoringv1alpha1.MetricFilterModeAll, Patterns: []string{"kube_pod_info"},
+		}, "All"),
+		Entry("Allow 要求 patterns 非空", monitoringv1alpha1.KubeStateMetricsMetricFilter{
+			Mode: monitoringv1alpha1.MetricFilterModeAllow,
+		}, "非空"),
+		Entry("Deny 要求 patterns 非空", monitoringv1alpha1.KubeStateMetricsMetricFilter{
+			Mode: monitoringv1alpha1.MetricFilterModeDeny,
+		}, "非空"),
+		Entry("拒绝空 pattern", monitoringv1alpha1.KubeStateMetricsMetricFilter{
+			Mode: monitoringv1alpha1.MetricFilterModeAllow, Patterns: []string{"kube_pod_info", ""},
+		}, "空项"),
+		Entry("拒绝非法正则表达式", monitoringv1alpha1.KubeStateMetricsMetricFilter{
+			Mode: monitoringv1alpha1.MetricFilterModeAllow, Patterns: []string{"["},
+		}, "非法"),
+		Entry("拒绝包含逗号的 pattern", monitoringv1alpha1.KubeStateMetricsMetricFilter{
+			Mode: monitoringv1alpha1.MetricFilterModeDeny, Patterns: []string{"kube_(pod|node){1,2}"},
+		}, "逗号"),
+	)
+
+	DescribeTable("UT-KSM-011 显式 podResources 完整下发且不伪造默认值", func(kubernetesVersion string) {
+		By("准备显式 requests 和 limits")
+		instance := newInstance()
+		instance.Spec.PodResources = &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("25m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("250m"),
+				corev1.ResourceMemory:           resource.MustParse("256Mi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+			},
+		}
+
+		By("执行纯规划")
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
+			KubernetesVersion:     kubernetesVersion,
+			TargetNamespaceExists: true,
+		})
+
+		By("验证 ResourceRequirements 未经改写地下发")
+		Expect(problem).To(BeNil())
+		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Resources).To(Equal(*instance.Spec.PodResources))
+	},
+		Entry("Kubernetes 1.19", "v1.19.16"),
+		Entry("Kubernetes 1.28", "v1.28.15"),
 	)
 
 	It("UT-KSM-002 对未知 minor 返回 UnsupportedKubernetesVersion 且零资源", func() {
@@ -265,4 +430,31 @@ func policyRulesAllow(rules []rbacv1.PolicyRule, apiGroup, resource, verb string
 		}
 	}
 	return false
+}
+
+func deploymentFrom(plan *ksm.ResourcePlan) *appsv1.Deployment {
+	for _, resource := range plan.Resources {
+		if deployment, ok := resource.(*appsv1.Deployment); ok {
+			return deployment
+		}
+	}
+	Fail("deployment not found in resource plan")
+	return nil
+}
+
+func expectInvalidSpecAcrossProfiles(instance *monitoringv1alpha1.KubeStateMetrics, wantMessage string) {
+	for _, kubernetesVersion := range []string{"v1.19.16", "v1.28.15"} {
+		By(fmt.Sprintf("在 %s profile 下执行纯规划", kubernetesVersion))
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
+			KubernetesVersion:     kubernetesVersion,
+			TargetNamespaceExists: true,
+		})
+
+		By("验证 InvalidSpec 且零资源计划")
+		Expect(plan).To(BeNil())
+		Expect(problem).To(SatisfyAll(
+			HaveField("Reason", ksm.ReasonInvalidSpec),
+			HaveField("Message", ContainSubstring(wantMessage)),
+		))
+	}
 }

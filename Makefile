@@ -119,7 +119,7 @@ e2e-preflight: ## Verify strict deployment preflight against the current pinned 
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/preflight" \
 		./test/e2e/preflight
 
-e2e-default-deployment: ## Verify the default managed KubeStateMetrics Deployment in an existing test environment.
+e2e-default-deployment: ## Verify KubeStateMetrics configuration against real managed workloads.
 	mkdir -p "$(E2E_REPORT_DIR)/kubestatemetrics"
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
 		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=20m \

@@ -1,6 +1,52 @@
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// CollectorMode selects how a managed instance chooses Kubernetes collectors.
+type CollectorMode string
+
+const (
+	CollectorModeDefault CollectorMode = "Default"
+	CollectorModeInclude CollectorMode = "Include"
+)
+
+// KubeStateMetricsCollectors declares the stable collector set exposed by the Operator.
+type KubeStateMetricsCollectors struct {
+	// Mode selects the shared default catalog or an explicit subset.
+	// +kubebuilder:default=Default
+	// +kubebuilder:validation:Enum=Default;Include
+	// +optional
+	Mode CollectorMode `json:"mode,omitempty"`
+
+	// Names contains collector names when mode is Include.
+	// +optional
+	Names []string `json:"names,omitempty"`
+}
+
+// MetricFilterMode selects which metric names kube-state-metrics exposes.
+type MetricFilterMode string
+
+const (
+	MetricFilterModeAll   MetricFilterMode = "All"
+	MetricFilterModeAllow MetricFilterMode = "Allow"
+	MetricFilterModeDeny  MetricFilterMode = "Deny"
+)
+
+// KubeStateMetricsMetricFilter declares a typed metric-name filter.
+type KubeStateMetricsMetricFilter struct {
+	// Mode exposes all metrics or applies an allow/deny filter.
+	// +kubebuilder:default=All
+	// +kubebuilder:validation:Enum=All;Allow;Deny
+	// +optional
+	Mode MetricFilterMode `json:"mode,omitempty"`
+
+	// Patterns contains Go regular expressions for Allow and Deny modes.
+	// +optional
+	Patterns []string `json:"patterns,omitempty"`
+}
 
 // DeploymentMode identifies the topology used by a KubeStateMetrics instance.
 type DeploymentMode string
@@ -51,6 +97,21 @@ type KubeStateMetricsSpec struct {
 	// +kubebuilder:default={mode:Deployment}
 	// +optional
 	Deployment KubeStateMetricsDeploymentSpec `json:"deployment,omitempty"`
+
+	// Collectors controls the Kubernetes resources observed by kube-state-metrics.
+	// +kubebuilder:default={mode:Default}
+	// +optional
+	Collectors KubeStateMetricsCollectors `json:"collectors,omitempty"`
+
+	// MetricFilter controls which generated metrics are exposed.
+	// +kubebuilder:default={mode:All}
+	// +optional
+	MetricFilter KubeStateMetricsMetricFilter `json:"metricFilter,omitempty"`
+
+	// PodResources is passed unchanged to the kube-state-metrics container.
+	// When omitted, the Operator does not inject requests or limits.
+	// +optional
+	PodResources *corev1.ResourceRequirements `json:"podResources,omitempty"`
 }
 
 // ManagedResourceReference identifies a directly managed resource for discovery.
@@ -81,6 +142,9 @@ type KubeStateMetricsStatus struct {
 	KubeStateMetricsVersion string `json:"kubeStateMetricsVersion,omitempty"`
 	// +optional
 	DeploymentMode DeploymentMode `json:"deploymentMode,omitempty"`
+	// EffectiveCollectors reports the collector set used by the applied workload.
+	// +optional
+	EffectiveCollectors []string `json:"effectiveCollectors,omitempty"`
 	// +optional
 	DesiredPods int32 `json:"desiredPods,omitempty"`
 	// +optional

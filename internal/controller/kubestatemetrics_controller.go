@@ -569,6 +569,7 @@ func (r *KubeStateMetricsReconciler) updateProblemStatus(ctx context.Context, in
 		instance.Status.ManagedResources = nil
 		instance.Status.KubeStateMetricsVersion = ""
 		instance.Status.DeploymentMode = ""
+		instance.Status.EffectiveCollectors = nil
 		instance.Status.DesiredPods = 0
 		instance.Status.AvailablePods = 0
 		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, problem.Reason, problem.Message)
@@ -586,6 +587,7 @@ func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, in
 	instance.Status.AppliedTargetNamespace = instance.Spec.TargetNamespace
 	instance.Status.KubeStateMetricsVersion = plan.Profile.Version
 	instance.Status.DeploymentMode = monitoringv1alpha1.DeploymentModeDeployment
+	instance.Status.EffectiveCollectors = append([]string(nil), plan.EffectiveCollectors...)
 	instance.Status.DesiredPods = 1
 	instance.Status.AvailablePods = availablePods
 	instance.Status.ManagedResources = managedResourceReferences(plan.Resources)
