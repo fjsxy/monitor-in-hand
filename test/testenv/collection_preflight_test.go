@@ -99,6 +99,7 @@ var _ = Describe("采集配置部署预检", func() {
 	})
 
 	It("[UT-PREFLIGHT-GH59-001] 拒绝一期范围外的空 object selector", func() {
+		By("准备带空 ServiceMonitor object selector 的 Agent manifest")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		fakeBin := GinkgoT().TempDir()
@@ -115,6 +116,7 @@ printf 'unexpected kubectl call: %s\n' "$*" >&2
 exit 1
 `)
 
+		By("通过公开预检入口执行计划检查")
 		command := exec.Command(
 			filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring",
@@ -126,6 +128,7 @@ exit 1
 		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
 		output, err := command.CombinedOutput()
 
+		By("验证预检以支持资格失败而不是输入错误拒绝空 selector")
 		Expect(err).To(HaveOccurred(), string(output))
 		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
 		expectJSONDiagnostics(output)
@@ -147,8 +150,9 @@ exit 1
 			{name: "Node metadata", spec: `{"kubernetesSDConfigs":[{"role":"Pod","attachMetadata":{"node":true}}]}`},
 			{name: "FileSD", spec: `{"fileSDConfigs":[{"files":["/etc/prometheus/targets.json"]}]}`},
 			{name: "DNS", spec: `{"dnsSDConfigs":[{"names":["metrics.example"]}]}`},
+			{name: "LightSail", spec: `{"lightSailSDConfigs":[{}]}`},
 		} {
-			By(unsupported.name)
+			By("准备一期外 " + unsupported.name + " discovery 计划")
 			fakeBin := GinkgoT().TempDir()
 			agentManifest := filepath.Join(fakeBin, "agent.yaml")
 			configManifest := filepath.Join(fakeBin, "scrape-config.yaml")
@@ -171,6 +175,7 @@ case "$*" in
 esac
 `)
 
+			By("通过公开预检入口执行 discovery 支持子集检查")
 			command := exec.Command(
 				filepath.Join(root, "hack", "preflight.sh"),
 				"--agent-namespace", "monitoring",
@@ -186,6 +191,7 @@ esac
 			)
 			output, err := command.CombinedOutput()
 
+			By("验证一期外 discovery 以可定位原因非零退出")
 			Expect(err).To(HaveOccurred(), string(output))
 			Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
 			expectJSONDiagnostics(output)
@@ -194,6 +200,7 @@ esac
 	})
 
 	It("[UT-PREFLIGHT-GH59-003] 空 namespace selector 要求覆盖 Operator watch scope 内全部 namespace", func() {
+		By("准备跨 namespace 的 PodMonitor 与空 namespace selector")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		fakeBin := GinkgoT().TempDir()
@@ -208,6 +215,7 @@ esac
 			false,
 		)
 
+		By("以不足的 config namespace 范围执行预检")
 		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
 			"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
@@ -216,6 +224,7 @@ esac
 		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
 		output, err := command.CombinedOutput()
 
+		By("验证空 selector 的全部 watch scope 语义导致覆盖不足失败")
 		Expect(err).To(HaveOccurred(), string(output))
 		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
 		expectJSONDiagnostics(output)
@@ -226,6 +235,7 @@ esac
 	})
 
 	It("[UT-PREFLIGHT-GH59-004] 在采集配置自身 namespace 检查 Secret 引用", func() {
+		By("准备引用缺失 Secret 的同 namespace ServiceMonitor")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		fakeBin := GinkgoT().TempDir()
@@ -240,6 +250,7 @@ esac
 			true,
 		)
 
+		By("通过公开预检入口执行引用检查")
 		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
 			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
 			"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
@@ -248,6 +259,7 @@ esac
 		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
 		output, err := command.CombinedOutput()
 
+		By("验证诊断保留声明对象 namespace 与缺失 Secret 名称")
 		Expect(err).To(HaveOccurred(), string(output))
 		Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
 		expectJSONDiagnostics(output)
@@ -256,6 +268,68 @@ esac
 			ContainSubstring(`"reason":"ReferencedAssetUnavailable"`),
 			ContainSubstring(`"namespace":"monitoring"`),
 			ContainSubstring(`"name":"missing-credentials"`),
+		))
+	})
+
+	It("[UT-PREFLIGHT-GH59-005] Namespace LabelSelector 的 NotIn 匹配缺少该 label 的 namespace", func() {
+		By("准备位于无 excluded label namespace 的 PodMonitor")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fakeBin := GinkgoT().TempDir()
+		agentManifest := filepath.Join(fakeBin, "agent.yaml")
+		configManifest := filepath.Join(fakeBin, "config.yaml")
+		Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		writeCollectionValidationKubectl(fakeBin,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","podMonitorSelector":{"matchLabels":{"mih":"selected"}},"podMonitorNamespaceSelector":{"matchExpressions":[{"key":"excluded","operator":"NotIn","values":["true"]}]}}}`,
+			`{"apiVersion":"monitoring.coreos.com/v1","kind":"PodMonitor","metadata":{"name":"selected","namespace":"shared","labels":{"mih":"selected"}},"spec":{}}`,
+			false,
+		)
+
+		By("执行包含 NotIn namespace selector 的计划预检")
+		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+			"--config-namespaces", "*", "--discovery-namespaces", "monitoring",
+			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+		)
+		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+		output, _ := command.CombinedOutput()
+
+		By("验证缺少 excluded label 的 shared namespace 仍被原生 NotIn 语义选中")
+		expectJSONDiagnostics(output)
+		Expect(string(output)).To(ContainSubstring(`"reason":"CollectionConfigsSelected"`))
+	})
+
+	It("[UT-PREFLIGHT-GH59-006] 空 namespace selector 只要求覆盖 Operator 实际 watch scope", func() {
+		By("准备受限 Operator watch scope 与 scope 外 namespace")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fakeBin := GinkgoT().TempDir()
+		agentManifest := filepath.Join(fakeBin, "agent.yaml")
+		configManifest := filepath.Join(fakeBin, "config.yaml")
+		Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		writeCollectionValidationKubectl(fakeBin,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","podMonitorSelector":{"matchLabels":{"mih":"selected"}},"podMonitorNamespaceSelector":{}}}`,
+			`{"apiVersion":"monitoring.coreos.com/v1","kind":"PodMonitor","metadata":{"name":"selected","namespace":"shared","labels":{"mih":"selected"}},"spec":{}}`,
+			false,
+		)
+		GinkgoT().Setenv("PREFLIGHT_OPERATOR_ARGS", `--namespaces=monitoring,shared`)
+
+		By("执行 Operator common watch scope 受限的计划预检")
+		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+			"--config-namespaces", "monitoring,shared", "--discovery-namespaces", "monitoring",
+			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+		)
+		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+		output, _ := command.CombinedOutput()
+
+		By("验证空 selector 的 requiredNamespaces 与 Operator watch scope 求交")
+		expectJSONDiagnostics(output)
+		Expect(string(output)).To(SatisfyAll(
+			ContainSubstring(`"reason":"CollectionNamespaceScopeCovered"`),
+			Not(ContainSubstring(`"reason":"CollectionNamespaceScopeIncomplete"`)),
 		))
 	})
 })
@@ -276,6 +350,9 @@ case "$*" in
   "--namespace monitoring get serviceaccount agent --output name") printf '%s\n' 'serviceaccount/agent' ;;
   "get namespaces --output json")
     printf '%s\n' '{"items":[{"metadata":{"name":"monitoring","labels":{"scope":"agent"}}},{"metadata":{"name":"shared","labels":{"scope":"shared"}}},{"metadata":{"name":"prometheus-operator","labels":{}}}]}'
+    ;;
+  "--namespace prometheus-operator get deployment prometheus-operator --output json")
+    jq --null-input --arg args "${PREFLIGHT_OPERATOR_ARGS:-}" '{spec:{template:{spec:{serviceAccountName:"prometheus-operator",containers:[{name:"prometheus-operator",args:(if $args == "" then [] else [$args] end)}]}}}}'
     ;;
   "--namespace monitoring get secret missing-credentials --output name")
     if [[ "${PREFLIGHT_REJECT_SECRET}" == 1 ]]; then

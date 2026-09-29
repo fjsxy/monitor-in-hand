@@ -50,6 +50,23 @@ type targetsResponse struct {
 
 var config e2eConfig
 
+var fixtureJobs = []string{
+	"serviceMonitor/monitor-in-hand-test/fixture/0",
+	"podMonitor/monitor-in-hand-test/fixture/0",
+	"probe/monitor-in-hand-test/fixture",
+	"scrapeConfig/monitor-in-hand-test/fixture",
+	"scrapeConfig/monitor-in-hand-test/fixture-pod",
+	"scrapeConfig/monitor-in-hand-test/fixture-service",
+	"scrapeConfig/monitor-in-hand-test/fixture-endpoints",
+	"scrapeConfig/monitor-in-hand-test/fixture-endpointslice",
+	"scrapeConfig/monitor-in-hand-test/fixture-ingress",
+}
+
+type agentAPIResults struct {
+	Targets      string
+	StatusConfig string
+}
+
 var _ = BeforeSuite(func() {
 	By("读取双版本 CI 提供的隔离测试集群身份")
 	minor := os.Getenv("KUBERNETES_VERSION")
@@ -70,30 +87,47 @@ var _ = Describe("原生 PrometheusAgent 采集配置", Serial, func() {
 		DeferCleanup(func(cleanupCtx SpecContext) {
 			deleteResource(cleanupCtx, "prometheusagent", "gh59-zero", testNamespace)
 		})
+
+		By(scenarioID + " 等待零配置 Agent 收敛并验证生成配置没有 scrape job")
 		waitForAgentConditions(ctx, "gh59-zero")
 		zeroConfig := waitForGeneratedConfig(ctx, "gh59-zero")
 		AddReportEntry("zero-generated-config", zeroConfig, ReportEntryVisibilityFailureOrVerbose)
 		parsedZero := parsePrometheusConfig(zeroConfig)
 		Expect(parsedZero.ScrapeConfigs).To(BeEmpty())
 
-		By(scenarioID + " 分别验证 nil、空对象和非空 namespace selector，且 nil object selector 不受其他类型影响")
-		applyManifest(ctx, selectorNamespacesAndConfigs)
+		By(scenarioID + " 准备四类配置在 Agent 当前 namespace 与另一个带 label 的 namespace 中的对象")
+		applyManifest(ctx, selectorConfigFixtures)
 		DeferCleanup(func(cleanupCtx SpecContext) {
-			deleteResource(cleanupCtx, "prometheusagent", "gh59-selectors", testNamespace)
-			deleteResource(cleanupCtx, "servicemonitor", "gh59-current", testNamespace)
-			deleteResource(cleanupCtx, "scrapeconfig", "gh59-object-nil", testNamespace)
+			for _, resource := range []string{"servicemonitor", "podmonitor", "probe", "scrapeconfig"} {
+				deleteResource(cleanupCtx, resource, "gh59-"+resource+"-current", testNamespace)
+			}
 			deleteResource(cleanupCtx, "namespace", "gh59-selector-other", "")
 		})
-		waitForAgentConditions(ctx, "gh59-selectors")
-		selectedConfig := waitForGeneratedConfig(ctx, "gh59-selectors")
-		AddReportEntry("selector-generated-config", selectedConfig, ReportEntryVisibilityFailureOrVerbose)
-		jobs := jobNames(parsePrometheusConfig(selectedConfig))
-		Expect(jobs).To(ContainElements(
-			"serviceMonitor/monitor-in-hand-test/gh59-current/0",
-			"podMonitor/gh59-selector-other/gh59-all-namespaces/0",
-			"probe/gh59-selector-other/gh59-labeled-namespace",
-		))
-		Expect(jobs).NotTo(ContainElement("scrapeConfig/monitor-in-hand-test/gh59-object-nil"))
+
+		selectorTypes := []struct {
+			name, objectField, namespaceField, jobPrefix string
+		}{
+			{name: "servicemonitor", objectField: "serviceMonitorSelector", namespaceField: "serviceMonitorNamespaceSelector", jobPrefix: "serviceMonitor"},
+			{name: "podmonitor", objectField: "podMonitorSelector", namespaceField: "podMonitorNamespaceSelector", jobPrefix: "podMonitor"},
+			{name: "probe", objectField: "probeSelector", namespaceField: "probeNamespaceSelector", jobPrefix: "probe"},
+			{name: "scrapeconfig", objectField: "scrapeConfigSelector", namespaceField: "scrapeConfigNamespaceSelector", jobPrefix: "scrapeConfig"},
+		}
+		for _, selectorType := range selectorTypes {
+			for _, namespaceState := range []string{"nil", "empty", "labeled"} {
+				agentName := "gh59-" + selectorType.name + "-" + namespaceState
+				By(fmt.Sprintf("%s 验证 %s 的 %s namespace selector 且其余三类 object selector 为 nil", scenarioID, selectorType.name, namespaceState))
+				applyManifest(ctx, selectorAgentManifest(agentName, selectorType.name, selectorType.objectField, selectorType.namespaceField, namespaceState))
+				DeferCleanup(func(cleanupCtx SpecContext) { deleteResource(cleanupCtx, "prometheusagent", agentName, testNamespace) })
+
+				By(fmt.Sprintf("%s 等待 %s/%s 生成配置并验证精确 job 集合", scenarioID, selectorType.name, namespaceState))
+				generated := waitForGeneratedConfig(ctx, agentName)
+				AddReportEntry(agentName+"-generated-config", generated, ReportEntryVisibilityFailureOrVerbose)
+				actualJobs := gh59JobNames(parsePrometheusConfig(generated))
+				expectedJobs := expectedSelectorJobs(selectorType.jobPrefix, selectorType.name, namespaceState)
+				Expect(actualJobs).To(ConsistOf(expectedJobs))
+				deleteResource(ctx, "prometheusagent", agentName, testNamespace)
+			}
+		}
 	}, SpecTimeout(10*time.Minute))
 
 	It(fmt.Sprintf("[%s] 从 generated config、status 和 targets 验证四类真实 target 与六种 ScrapeConfig discovery", stableScenarioID("002")), func(ctx SpecContext) {
@@ -102,19 +136,13 @@ var _ = Describe("原生 PrometheusAgent 采集配置", Serial, func() {
 		waitForAgentConditions(ctx, "fixture")
 		generated := waitForGeneratedConfig(ctx, "fixture")
 		AddReportEntry("generated-config", generated, ReportEntryVisibilityFailureOrVerbose)
+
+		By(scenarioID + " 验证四类配置与六种 ScrapeConfig discovery 均进入 generated config")
 		parsed := parsePrometheusConfig(generated)
 		jobs := jobNames(parsed)
-		Expect(jobs).To(ContainElements(
-			"serviceMonitor/monitor-in-hand-test/fixture/0",
-			"podMonitor/monitor-in-hand-test/fixture/0",
-			"probe/monitor-in-hand-test/fixture",
-			"scrapeConfig/monitor-in-hand-test/fixture",
-			"scrapeConfig/monitor-in-hand-test/fixture-pod",
-			"scrapeConfig/monitor-in-hand-test/fixture-service",
-			"scrapeConfig/monitor-in-hand-test/fixture-endpoints",
-			"scrapeConfig/monitor-in-hand-test/fixture-endpointslice",
-			"scrapeConfig/monitor-in-hand-test/fixture-ingress",
-		))
+		for _, job := range fixtureJobs {
+			Expect(jobs).To(ContainElement(job))
+		}
 
 		By(scenarioID + " 验证 ServiceMonitor 在两个 Kubernetes minor 使用各自原生 discovery role")
 		expectedRole := "endpoints"
@@ -123,21 +151,22 @@ var _ = Describe("原生 PrometheusAgent 采集配置", Serial, func() {
 		}
 		Expect(jobRoles(parsed, "serviceMonitor/monitor-in-hand-test/fixture/0")).To(Equal([]string{expectedRole}))
 
+		By(scenarioID + " 验证统一 runtime RBAC 覆盖一期 discovery 且不授予 nodes")
+		agentSubject := "system:serviceaccount:monitor-in-hand-test:prometheus-agent"
+		for _, resource := range []string{"services", "endpoints", "pods", "ingresses.networking.k8s.io", "endpointslices.discovery.k8s.io"} {
+			for _, verb := range []string{"get", "list", "watch"} {
+				allowed := kubectl(ctx, "auth", "can-i", verb, resource, "--all-namespaces", "--as", agentSubject)
+				Expect(strings.TrimSpace(allowed)).To(Equal("yes"), verb+" "+resource)
+			}
+		}
+		Expect(strings.TrimSpace(kubectl(ctx, "auth", "can-i", "get", "configmaps", "--all-namespaces", "--as", agentSubject))).To(Equal("yes"))
+		Expect(strings.TrimSpace(kubectl(ctx, "auth", "can-i", "get", "nodes", "--all-namespaces", "--as", agentSubject))).To(Equal("no"))
+
 		By(scenarioID + " 从 Agent targets API 等待每类 job 至少一个真实 up target")
-		targets, statusConfig := waitForTargets(ctx, []string{
-			"serviceMonitor/monitor-in-hand-test/fixture/0",
-			"podMonitor/monitor-in-hand-test/fixture/0",
-			"probe/monitor-in-hand-test/fixture",
-			"scrapeConfig/monitor-in-hand-test/fixture",
-			"scrapeConfig/monitor-in-hand-test/fixture-pod",
-			"scrapeConfig/monitor-in-hand-test/fixture-service",
-			"scrapeConfig/monitor-in-hand-test/fixture-endpoints",
-			"scrapeConfig/monitor-in-hand-test/fixture-endpointslice",
-			"scrapeConfig/monitor-in-hand-test/fixture-ingress",
-		})
-		AddReportEntry("targets", targets, ReportEntryVisibilityFailureOrVerbose)
-		AddReportEntry("agent-status-config", statusConfig, ReportEntryVisibilityFailureOrVerbose)
-		Expect(statusConfig).To(ContainSubstring("serviceMonitor/monitor-in-hand-test/fixture/0"))
+		apiResults := waitForAgentAPIs(ctx, fixtureJobs)
+		AddReportEntry("targets", apiResults.Targets, ReportEntryVisibilityFailureOrVerbose)
+		AddReportEntry("agent-status-config", apiResults.StatusConfig, ReportEntryVisibilityFailureOrVerbose)
+		Expect(apiResults.StatusConfig).To(ContainSubstring("serviceMonitor/monitor-in-hand-test/fixture/0"))
 	}, SpecTimeout(10*time.Minute))
 
 	It(fmt.Sprintf("[%s] 通过 InvalidConfiguration Event 与 Operator logs 定位被拒绝配置", stableScenarioID("003")), func(ctx SpecContext) {
@@ -307,7 +336,68 @@ func jobRoles(config prometheusConfig, jobName string) []string {
 	return nil
 }
 
-func waitForTargets(ctx context.Context, requiredJobs []string) (string, string) {
+func gh59JobNames(config prometheusConfig) []string {
+	jobs := []string{}
+	for _, job := range jobNames(config) {
+		if strings.Contains(job, "/gh59-") {
+			jobs = append(jobs, job)
+		}
+	}
+	return jobs
+}
+
+func expectedSelectorJobs(jobPrefix, resourceName, namespaceState string) []string {
+	namespaces := []string{testNamespace}
+	if namespaceState == "empty" {
+		namespaces = append(namespaces, "gh59-selector-other")
+	} else if namespaceState == "labeled" {
+		namespaces = []string{"gh59-selector-other"}
+	}
+	jobs := make([]string, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		location := "other"
+		if namespace == testNamespace {
+			location = "current"
+		}
+		job := fmt.Sprintf("%s/%s/gh59-%s-%s", jobPrefix, namespace, resourceName, location)
+		if jobPrefix == "serviceMonitor" || jobPrefix == "podMonitor" {
+			job += "/0"
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs
+}
+
+func selectorAgentManifest(name, selectorValue, objectField, namespaceField, namespaceState string) string {
+	namespaceSelector := ""
+	switch namespaceState {
+	case "empty":
+		namespaceSelector = fmt.Sprintf("  %s: {}\n", namespaceField)
+	case "labeled":
+		namespaceSelector = fmt.Sprintf("  %s:\n    matchLabels:\n      monitoring.fjsxy.github.io/gh59-selected: \"true\"\n", namespaceField)
+	}
+	return fmt.Sprintf(`
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata:
+  name: %s
+  namespace: monitor-in-hand-test
+spec:
+  version: v2.55.1
+  image: quay.io/prometheus/prometheus@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3
+  serviceAccountName: prometheus-agent
+  replicas: 0
+  shards: 1
+  %s:
+    matchLabels:
+      monitoring.fjsxy.github.io/gh59-type: %s
+%s  remoteWrite:
+    - name: fixture-vm
+      url: http://vminsert.monitor-in-hand-test.svc:8480/insert/0/prometheus/api/v1/write
+`, name, objectField, selectorValue, namespaceSelector)
+}
+
+func waitForAgentAPIs(ctx context.Context, requiredJobs []string) agentAPIResults {
 	GinkgoHelper()
 	port, stop := startPortForward(ctx)
 	DeferCleanup(stop)
@@ -343,7 +433,7 @@ func waitForTargets(ctx context.Context, requiredJobs []string) (string, string)
 		statusConfig = string(contents)
 		g.Expect(statusConfig).To(ContainSubstring(`"status":"success"`))
 	}, time.Minute, 2*time.Second).Should(Succeed())
-	return body, statusConfig
+	return agentAPIResults{Targets: body, StatusConfig: statusConfig}
 }
 
 func startPortForward(ctx context.Context) (int, func()) {
@@ -402,7 +492,7 @@ spec:
       url: http://vminsert.monitor-in-hand-test.svc:8480/insert/0/prometheus/api/v1/write
 `
 
-const selectorNamespacesAndConfigs = `
+const selectorConfigFixtures = `
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -413,19 +503,40 @@ metadata:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: gh59-current
+  name: gh59-servicemonitor-current
   namespace: monitor-in-hand-test
-  labels: {monitoring.fjsxy.github.io/gh59-type: service}
+  labels: {monitoring.fjsxy.github.io/gh59-type: servicemonitor}
 spec:
+  selector: {matchLabels: {app.kubernetes.io/name: metrics-target}}
+  endpoints: [{port: metrics}]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gh59-servicemonitor-other
+  namespace: gh59-selector-other
+  labels: {monitoring.fjsxy.github.io/gh59-type: servicemonitor}
+spec:
+  namespaceSelector: {matchNames: [monitor-in-hand-test]}
   selector: {matchLabels: {app.kubernetes.io/name: metrics-target}}
   endpoints: [{port: metrics}]
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
-  name: gh59-all-namespaces
+  name: gh59-podmonitor-current
+  namespace: monitor-in-hand-test
+  labels: {monitoring.fjsxy.github.io/gh59-type: podmonitor}
+spec:
+  selector: {matchLabels: {app.kubernetes.io/name: metrics-target}}
+  podMetricsEndpoints: [{port: metrics}]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gh59-podmonitor-other
   namespace: gh59-selector-other
-  labels: {monitoring.fjsxy.github.io/gh59-type: pod}
+  labels: {monitoring.fjsxy.github.io/gh59-type: podmonitor}
 spec:
   namespaceSelector: {matchNames: [monitor-in-hand-test]}
   selector: {matchLabels: {app.kubernetes.io/name: metrics-target}}
@@ -434,7 +545,17 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: Probe
 metadata:
-  name: gh59-labeled-namespace
+  name: gh59-probe-current
+  namespace: monitor-in-hand-test
+  labels: {monitoring.fjsxy.github.io/gh59-type: probe}
+spec:
+  prober: {url: blackbox-exporter.monitor-in-hand-test.svc:9115}
+  targets: {staticConfig: {static: [http://metrics-target.monitor-in-hand-test.svc:9100/metrics]}}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: gh59-probe-other
   namespace: gh59-selector-other
   labels: {monitoring.fjsxy.github.io/gh59-type: probe}
 spec:
@@ -444,32 +565,20 @@ spec:
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: ScrapeConfig
 metadata:
-  name: gh59-object-nil
+  name: gh59-scrapeconfig-current
   namespace: monitor-in-hand-test
-  labels: {monitoring.fjsxy.github.io/gh59-type: scrape}
+  labels: {monitoring.fjsxy.github.io/gh59-type: scrapeconfig}
 spec:
   staticConfigs: [{targets: [metrics-target.monitor-in-hand-test.svc:9100]}]
 ---
 apiVersion: monitoring.coreos.com/v1alpha1
-kind: PrometheusAgent
+kind: ScrapeConfig
 metadata:
-  name: gh59-selectors
-  namespace: monitor-in-hand-test
+  name: gh59-scrapeconfig-other
+  namespace: gh59-selector-other
+  labels: {monitoring.fjsxy.github.io/gh59-type: scrapeconfig}
 spec:
-  version: v2.55.1
-  image: quay.io/prometheus/prometheus@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3
-  serviceAccountName: prometheus-agent
-  replicas: 1
-  shards: 1
-  serviceMonitorSelector: {matchLabels: {monitoring.fjsxy.github.io/gh59-type: service}}
-  podMonitorSelector: {matchLabels: {monitoring.fjsxy.github.io/gh59-type: pod}}
-  podMonitorNamespaceSelector: {}
-  probeSelector: {matchLabels: {monitoring.fjsxy.github.io/gh59-type: probe}}
-  probeNamespaceSelector: {matchLabels: {monitoring.fjsxy.github.io/gh59-selected: "true"}}
-  scrapeConfigNamespaceSelector: {}
-  remoteWrite:
-    - name: fixture-vm
-      url: http://vminsert.monitor-in-hand-test.svc:8480/insert/0/prometheus/api/v1/write
+  staticConfigs: [{targets: [metrics-target.monitor-in-hand-test.svc:9100]}]
 `
 
 const invalidScrapeConfig = `

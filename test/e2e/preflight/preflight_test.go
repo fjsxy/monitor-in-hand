@@ -117,6 +117,8 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 		)
 		AddReportEntry("planned-preflight-output", output, ReportEntryVisibilityFailureOrVerbose)
 		Expect(err).NotTo(HaveOccurred(), output)
+
+		By(scenarioID + " 验证四类配置覆盖与最终成功诊断")
 		diagnostics := parseDiagnostics(output)
 		Expect(diagnostics).To(ContainElement(SatisfyAll(
 			WithTransform(func(item diagnostic) string { return item.Check }, Equal("collection-configuration")),
@@ -130,6 +132,7 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 
 	It(fmt.Sprintf("[%s] 不把上游合法的空 object selector 报告为一期支持", stableScenarioID("GH59-002")), func(ctx SpecContext) {
 		scenarioID := stableScenarioID("GH59-002")
+		By(scenarioID + " 准备上游合法但一期不支持的空 object selector")
 		manifestPath := filepath.Join(GinkgoT().TempDir(), "agent.yaml")
 		Expect(os.WriteFile(manifestPath, []byte(emptySelectorAgentManifest), 0o600)).To(Succeed())
 
@@ -137,6 +140,8 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 		output, err := runPreflight(ctx, "prometheus-agent", "AGENT_MANIFEST="+manifestPath)
 		AddReportEntry("empty-selector-preflight-output", output, ReportEntryVisibilityFailureOrVerbose)
 		Expect(err).To(HaveOccurred(), "空 object selector 不得通过一期计划预检")
+
+		By(scenarioID + " 验证支持资格失败原因")
 		diagnostics := parseDiagnostics(output)
 		Expect(diagnostics).To(ContainElement(SatisfyAll(
 			WithTransform(func(item diagnostic) string { return item.Check }, Equal("collection-configuration")),

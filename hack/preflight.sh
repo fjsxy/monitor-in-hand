@@ -185,6 +185,7 @@ validate_collection_plan() {
   local rendered agent_count invalid_identity empty_selectors unsupported manifest
   [[ -n "${agent_manifest}" ]] || return 0
 
+  # 先把单个 Agent manifest 规范化为 JSON，并确认它与命令行声明的运行身份一致。
   if ! render_manifest_documents "${agent_manifest}"; then return; fi
   rendered=${RENDERED_MANIFESTS}
   agent_count=$(jq '[.[] | select(.apiVersion == "monitoring.coreos.com/v1alpha1" and .kind == "PrometheusAgent")] | length' <<<"${rendered}")
@@ -206,6 +207,7 @@ validate_collection_plan() {
       "$(jq --null-input --arg namespace "${agent_namespace}" --arg serviceAccount "${agent_service_account}" --argjson actual "${invalid_identity}" '{expected: {namespace: $namespace, serviceAccount: $serviceAccount}, actual: $actual}')"
   fi
 
+  # 分别检查四类 object selector；nil 是合法关闭状态，显式空对象不属于一期支持子集。
   empty_selectors=$(jq --compact-output '
       ["serviceMonitorSelector", "podMonitorSelector", "probeSelector", "scrapeConfigSelector"] as $fields |
       [$fields[] as $field |
@@ -226,6 +228,7 @@ validate_collection_plan() {
     record_pass collection-configuration pass ExplicitObjectSelectors "计划中的非 nil object selector 均为明确的非空 LabelSelector"
   fi
 
+  # 汇总管理员提供的采集配置，再拒绝需要一期基线外权限或依赖的 discovery。
   for manifest in "${collection_config_manifests[@]}"; do
     if render_manifest_documents "${manifest}"; then
       rendered=${RENDERED_MANIFESTS}
@@ -240,7 +243,7 @@ validate_collection_plan() {
          "azureSDConfigs", "gceSDConfigs", "openstackSDConfigs", "digitalOceanSDConfigs",
          "kumaSDConfigs", "eurekaSDConfigs", "dockerSDConfigs", "linodeSDConfigs",
          "hetznerSDConfigs", "nomadSDConfigs", "dockerSwarmSDConfigs", "puppetDBSDConfigs",
-         "lightsailSDConfigs", "ovhcloudSDConfigs", "scalewaySDConfigs", "ionosSDConfigs"];
+         "lightSailSDConfigs", "ovhcloudSDConfigs", "scalewaySDConfigs", "ionosSDConfigs"];
       [ .[] |
         select(.apiVersion == "monitoring.coreos.com/v1alpha1" and .kind == "ScrapeConfig") |
         . as $config |
@@ -338,6 +341,7 @@ validate_collection_selection() {
   local namespaces_json report declared_scope refs_json reference namespace kind name path output
   [[ -n "${agent_manifest}" ]] || return
 
+  # 读取实时 Namespace labels，作为解析 nil、空对象与非空 namespace selector 的事实输入。
   if ! namespaces_json=$(kubectl_call get namespaces --output json 2>&1); then
     record_failure collection-configuration fail NamespaceLabelsUnavailable "无法读取 Namespace labels 以解析 namespace selector" \
       "$(jq --null-input --arg error "${namespaces_json}" '{error: $error}')"
@@ -353,11 +357,14 @@ validate_collection_selection() {
   else
     declared_scope=$(jq --compact-output --null-input --arg scope "${config_namespaces}" '$scope | split(",")')
   fi
+  # 同时应用 object selector、namespace selector 与 Operator watch scope，生成必须覆盖的配置集合。
   report=$(jq --compact-output --null-input \
     --argjson agent "${agent_json}" \
     --argjson configs "${collection_configs_json}" \
     --argjson namespaces "${namespaces_json}" \
     --arg configScope "${config_namespaces}" \
+    --arg operatorAllow "${general_allow:-}" \
+    --arg operatorDeny "${general_deny:-}" \
     --argjson declaredScope "${declared_scope}" '
       def selector_empty($selector):
         (($selector.matchLabels // {}) | length) == 0 and (($selector.matchExpressions // []) | length) == 0;
@@ -369,7 +376,7 @@ validate_collection_selection() {
           if $expression.operator == "In" then
             (($labels[$expression.key] // null) as $value | ($expression.values // []) | index($value) != null)
           elif $expression.operator == "NotIn" then
-            (($labels | has($expression.key)) and (($expression.values // []) | index($labels[$expression.key]) == null))
+            (($labels | has($expression.key) | not) or (($expression.values // []) | index($labels[$expression.key]) == null))
           elif $expression.operator == "Exists" then
             ($labels | has($expression.key))
           elif $expression.operator == "DoesNotExist" then
@@ -383,14 +390,23 @@ validate_collection_selection() {
         else [null, null] end;
       def namespace_labels($name):
         ([ $namespaces.items[] | select(.metadata.name == $name) | (.metadata.labels // {}) ][0] // {});
+      def csv_contains($csv; $name):
+        ($csv | split(",") | index($name)) != null;
+      def operator_watches($name):
+        if $operatorAllow != "" then csv_contains($operatorAllow; $name)
+        elif $operatorDeny != "" then (csv_contains($operatorDeny; $name) | not)
+        else true end;
       def namespace_selected($selector; $namespace):
-        if $selector == null then $namespace == ($agent.metadata.namespace // "default")
-        elif selector_empty($selector) then true
-        else selector_matches($selector; namespace_labels($namespace)) end;
+        operator_watches($namespace) and
+        (if $selector == null then $namespace == ($agent.metadata.namespace // "default")
+         elif selector_empty($selector) then true
+         else selector_matches($selector; namespace_labels($namespace)) end);
       def selected_namespaces($selector):
-        if $selector == null then [($agent.metadata.namespace // "default")]
-        elif selector_empty($selector) then [$namespaces.items[].metadata.name]
-        else [$namespaces.items[] | select(selector_matches($selector; (.metadata.labels // {}))) | .metadata.name] end;
+        if $selector == null then [($agent.metadata.namespace // "default") | select(operator_watches(.))]
+        elif selector_empty($selector) then [$namespaces.items[] | select(operator_watches(.metadata.name)) | .metadata.name]
+        else [$namespaces.items[] |
+          select(operator_watches(.metadata.name) and selector_matches($selector; (.metadata.labels // {}))) |
+          .metadata.name] end;
 
       (["ServiceMonitor", "PodMonitor", "Probe", "ScrapeConfig"] |
         map(. as $kind | fields_for_kind($kind) as $fields |
@@ -414,6 +430,7 @@ validate_collection_selection() {
        requiredNamespaces: $requiredNamespaces, uncoveredNamespaces: $uncoveredNamespaces}
     ')
 
+  # 将未选中对象、缺失类型和 namespace 覆盖差距分别转成稳定诊断。
   if [[ "$(jq '.unselected | length' <<<"${report}")" != 0 || "$(jq '.missingKinds | length' <<<"${report}")" != 0 ]]; then
     record_failure collection-configuration fail CollectionConfigCoverageIncomplete "提供的采集配置没有完整对应四类独立 selector，或包含未被选中的对象" "${report}"
   else
@@ -455,9 +472,6 @@ validate_collection_selection() {
     fi
   done < <(jq --compact-output '.[]' <<<"${refs_json}")
 }
-
-validate_collection_selection
-if ((failures > 0)); then finish_failed; fi
 
 check_api_resources() {
   local version=$1 expected_json=$2 response missing
@@ -700,6 +714,10 @@ if [[ "${operator_available}" == true ]]; then
   fi
   check_watch_scope collection-config "${config_namespaces}" "${general_allow}" "${general_deny}"
 fi
+
+# 在确认 Operator 实际 watch scope 后，按四类 selector 解析计划配置并检查同 namespace 引用。
+validate_collection_selection
+if ((failures > 0)); then finish_failed; fi
 
 check_permission() {
   local check=$1 subject=$2 verb=$3 resource=$4 namespace_scope=$5 subresource=${6:-} output
