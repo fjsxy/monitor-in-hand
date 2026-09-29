@@ -43,6 +43,18 @@
 | `E2E-119-KSM-003` / `E2E-128-KSM-003` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | Include pods、未锚定 Allow pattern 和显式 podResources 作用于真实 workload 与 scrape | 完整集群对象、Events、metrics 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-KSM-004` / `E2E-128-KSM-004` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | Deny pattern 从真实 scrape 排除匹配指标，同时保留其他 collector 指标 | 完整集群对象、Events、metrics 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-KSM-005` / `E2E-128-KSM-005` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | 非法 regexp 仅降级当前实例、无 workload/status 重写，并保持 Operator 和合法实例可用 | 完整集群对象、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
+| `UT-KSM-014` | #55 | 纯规划 | 1.19、1.28 | 字面名称与完整 RE2 匹配结果组成排序去重并集，substring 不命中，并统一生成 namespace 参数 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-015` | #55 | 纯规划 | 1.19、1.28 | 省略 namespaceFilter 时按 All 展开全部当前 Namespace | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-016` | #55 | 纯规划 | 1.19、1.28 | 拒绝 All 携带过滤项、空 Include、未知 mode、非法字面名称与非法 RE2，返回 InvalidSpec 且零资源 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-017` | #55 | 纯规划 | 1.19、1.28 | 零匹配只规划非 workload 资源，同时保留待删除 workload 的稳定身份 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-018` | #55 | 纯规划 | 通用 | 非法 namespace regex 优先于缺失 targetNamespace 报告 InvalidSpec | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-019` | #55 | 纯规划 | 1.19、1.28 | Namespace 集合增删使计划在零匹配、扩展、归零与恢复之间确定性切换 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `IT-KSM-013` | #55 | envtest | API Server 1.28 | 从集群 Namespace 解析字面与完整 regex 并集，workload 参数与 effectiveNamespaceCount 一致 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-014` | #55 | envtest | API Server 1.28 | 零匹配删除 workload、保留 Service/ServiceAccount/RBAC 并报告 NoNamespaceMatched，匹配恢复后重建 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-015` | #55 | envtest | API Server 1.28 | 已应用配置变为非法 regex 时只更新 InvalidSpec status，不部分修改既有 workload | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-016` | #55 | envtest | API Server 1.28 | Namespace watch 自动触发范围扩展、rollout、归零和恢复 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-017` | #55 | envtest | API Server 1.28 | workload 仍在终止时持续 requeue，不提前报告稳定零匹配 | Ginkgo failure、API object | `make test-integration` |
+| `E2E-119-KSM-006` / `E2E-128-KSM-006` | #55 | kind E2E | Kubernetes 1.19.16、1.28.15 | 字面名称、完整 regex、substring 非命中、集合扩展、零匹配及自动恢复作用于真实可用 workload 与 KSM 指标 | 完整集群对象、conditions、Events、metrics 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-PREFLIGHT-001` | #58 | kind E2E/预检 | Kubernetes 1.19.16 | 一期支持环境使用显式 runtime ServiceAccount 时预检成功，并报告 Kubernetes 版本事实与 `PreflightPassed` | NDJSON diagnostics、集群对象 | `make e2e-preflight KUBERNETES_VERSION=1.19 ...` |
 | `E2E-128-PREFLIGHT-001` | #58 | kind E2E/预检 | Kubernetes 1.28.15 | 一期支持环境使用显式 runtime ServiceAccount 时预检成功，并报告 Kubernetes 版本事实与 `PreflightPassed` | NDJSON diagnostics、集群对象 | `make e2e-preflight KUBERNETES_VERSION=1.28 ...` |
 | `E2E-119-PREFLIGHT-002` | #58 | kind E2E/预检 | Kubernetes 1.19.16 | runtime ServiceAccount 缺失时预检非零退出，并报告 `RuntimeServiceAccountNotFound` 与 `PreflightFailed` | NDJSON diagnostics、退出码 | `make e2e-preflight KUBERNETES_VERSION=1.19 ...` |

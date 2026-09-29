@@ -111,6 +111,32 @@ spec:
                       type: string
                     type: array
                 type: object
+              namespaceFilter:
+                default:
+                  mode: All
+                description: NamespaceFilter selects the namespaces collected by this
+                  instance.
+                properties:
+                  mode:
+                    default: All
+                    description: Mode defaults to All.
+                    enum:
+                    - All
+                    - Include
+                    type: string
+                  namePatterns:
+                    description: NamePatterns are Go/RE2 expressions matched against
+                      complete namespace names.
+                    items:
+                      type: string
+                    type: array
+                  names:
+                    description: Names are literal namespace names included in Include
+                      mode.
+                    items:
+                      type: string
+                    type: array
+                type: object
               podResources:
                 description: |-
                   PodResources is passed unchanged to the kube-state-metrics container.
@@ -261,6 +287,11 @@ spec:
                 items:
                   type: string
                 type: array
+              effectiveNamespaceCount:
+                description: EffectiveNamespaceCount is the number of literal namespaces
+                  delivered to every workload role.
+                format: int32
+                type: integer
               kubeStateMetricsVersion:
                 type: string
               managedResources:

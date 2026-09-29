@@ -321,7 +321,11 @@ func TestManagedInstanceLifecycle(t *testing.T) {
 	}
 
 	// 预置已可用 workload，使恢复保持 Ready phase，单独验证 reason 变化仍产生 Event。
-	plan, problem := ksm.BuildPlan(actual, ksm.ClusterFacts{KubernetesVersion: "v1.28.15", TargetNamespaceExists: true})
+	plan, problem := ksm.BuildPlan(actual, ksm.ClusterFacts{
+		KubernetesVersion:     "v1.28.15",
+		TargetNamespaceExists: true,
+		NamespaceNames:        []string{actual.Spec.TargetNamespace},
+	})
 	if problem != nil {
 		t.Fatalf("build resume plan: %#v", problem)
 	}

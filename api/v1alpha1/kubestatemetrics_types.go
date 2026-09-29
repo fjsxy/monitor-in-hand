@@ -55,6 +55,30 @@ const (
 	DeploymentModeDeployment DeploymentMode = "Deployment"
 )
 
+// NamespaceFilterMode identifies how an instance selects namespaces to collect.
+type NamespaceFilterMode string
+
+const (
+	NamespaceFilterModeAll     NamespaceFilterMode = "All"
+	NamespaceFilterModeInclude NamespaceFilterMode = "Include"
+)
+
+// NamespaceFilter selects the namespaces collected by every workload role.
+type NamespaceFilter struct {
+	// Mode defaults to All.
+	// +kubebuilder:default=All
+	// +kubebuilder:validation:Enum=All;Include
+	Mode NamespaceFilterMode `json:"mode,omitempty"`
+
+	// Names are literal namespace names included in Include mode.
+	// +optional
+	Names []string `json:"names,omitempty"`
+
+	// NamePatterns are Go/RE2 expressions matched against complete namespace names.
+	// +optional
+	NamePatterns []string `json:"namePatterns,omitempty"`
+}
+
 // KubeStateMetricsPhase summarizes the reconciliation state of a managed instance.
 type KubeStateMetricsPhase string
 
@@ -92,6 +116,11 @@ type KubeStateMetricsSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	Suspended *bool `json:"suspended,omitempty"`
+
+	// NamespaceFilter selects the namespaces collected by this instance.
+	// +kubebuilder:default={mode:All}
+	// +optional
+	NamespaceFilter NamespaceFilter `json:"namespaceFilter,omitempty"`
 
 	// Deployment selects the workload topology.
 	// +kubebuilder:default={mode:Deployment}
@@ -150,6 +179,9 @@ type KubeStateMetricsStatus struct {
 	DesiredPods int32 `json:"desiredPods,omitempty"`
 	// +optional
 	AvailablePods int32 `json:"availablePods,omitempty"`
+	// EffectiveNamespaceCount is the number of literal namespaces delivered to every workload role.
+	// +optional
+	EffectiveNamespaceCount int32 `json:"effectiveNamespaceCount,omitempty"`
 }
 
 // KubeStateMetrics is a cluster-scoped declaration of one managed kube-state-metrics instance.
