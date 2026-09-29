@@ -140,7 +140,21 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 			HaveField("EffectiveCollectors", HaveLen(28)),
 			HaveField("ManagedResources", HaveLen(5)),
 		))
-		Expect(condition(actual, "Available").Status).To(Equal(metav1.ConditionFalse))
+		Expect(condition(actual, "Ready")).To(SatisfyAll(
+			HaveField("Status", metav1.ConditionFalse),
+			HaveField("Reason", "DeploymentProgressing"),
+			HaveField("Message", "等待单副本 Deployment 可用"),
+		))
+		Expect(condition(actual, "Progressing")).To(SatisfyAll(
+			HaveField("Status", metav1.ConditionTrue),
+			HaveField("Reason", "DeploymentProgressing"),
+			HaveField("Message", "等待单副本 Deployment 可用"),
+		))
+		Expect(condition(actual, "Available")).To(SatisfyAll(
+			HaveField("Status", metav1.ConditionFalse),
+			HaveField("Reason", "MinimumReplicasUnavailable"),
+			HaveField("Message", "单副本 Deployment 尚不可用"),
+		))
 		By("重复调谐并确认已收敛 Deployment 不被写入")
 		resourceVersion := deployment.ResourceVersion
 		reconcile(name, gitVersion)
@@ -159,7 +173,11 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(condition(actual, "Ready").Status).To(Equal(metav1.ConditionTrue))
 		Expect(condition(actual, "Progressing").Status).To(Equal(metav1.ConditionFalse))
 		Expect(condition(actual, "Degraded").Status).To(Equal(metav1.ConditionFalse))
-		Expect(condition(actual, "Available").Status).To(Equal(metav1.ConditionTrue))
+		Expect(condition(actual, "Available")).To(SatisfyAll(
+			HaveField("Status", metav1.ConditionTrue),
+			HaveField("Reason", "MinimumReplicasAvailable"),
+			HaveField("Message", "单副本 Deployment 可用"),
+		))
 	},
 		Entry("Kubernetes 1.19 profile", "v1.19.16", "2.3.0", "119"),
 		Entry("Kubernetes 1.28 profile", "v1.28.15", "2.11.0", "128"),
@@ -683,7 +701,15 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeStatefulSetSharded),
 			HaveField("DesiredPods", int32(3)),
 			HaveField("AvailablePods", int32(0)),
-			HaveField("ManagedResources", HaveLen(7)),
+			HaveField("ManagedResources", ConsistOf(
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "ServiceAccount", Namespace: namespace, Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole", Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding", Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "Service", Namespace: namespace, Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role", Namespace: namespace, Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding", Namespace: namespace, Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "apps/v1", Kind: "StatefulSet", Namespace: namespace, Name: resourceName},
+			)),
 		))
 
 		By("模拟全部 shard 可用并验证 Ready status")
