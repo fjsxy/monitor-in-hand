@@ -27,7 +27,6 @@ type e2eConfig struct {
 	kubernetesMinor string
 	testRunID       string
 	kubeContext     string
-	scenarioPrefix  string
 	versionReason   string
 }
 
@@ -52,10 +51,8 @@ var _ = BeforeSuite(func() {
 	// 将 Kubernetes minor 映射到稳定场景 ID 和预检必须报告的版本事实。
 	switch kubernetesMinor {
 	case "1.19":
-		config.scenarioPrefix = "E2E-119-PREFLIGHT"
 		config.versionReason = "SupportedKubernetes119"
 	case "1.28":
-		config.scenarioPrefix = "E2E-128-PREFLIGHT"
 		config.versionReason = "SupportedKubernetes128"
 	default:
 		Fail(fmt.Sprintf("KUBERNETES_VERSION 必须是 1.19 或 1.28，当前为 %q", kubernetesMinor))
@@ -63,8 +60,8 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = Describe("真实集群部署预检", Serial, func() {
-	It(fmt.Sprintf("[%s-001] 在一期支持环境中返回成功和版本事实", stableScenarioPrefix()), func(ctx SpecContext) {
-		scenarioID := config.scenarioPrefix + "-001"
+	It(fmt.Sprintf("[%s] 在一期支持环境中返回成功和版本事实", stableScenarioID("001")), func(ctx SpecContext) {
+		scenarioID := stableScenarioID("001")
 		By(scenarioID + " 使用显式 runtime ServiceAccount 执行预检")
 		output, err := runPreflight(ctx, "prometheus-agent")
 		AddReportEntry("preflight-output", output, ReportEntryVisibilityFailureOrVerbose)
@@ -83,8 +80,8 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 		)))
 	}, SpecTimeout(10*time.Minute))
 
-	It(fmt.Sprintf("[%s-002] 在 runtime ServiceAccount 缺失时非零退出并输出可定位原因", stableScenarioPrefix()), func(ctx SpecContext) {
-		scenarioID := config.scenarioPrefix + "-002"
+	It(fmt.Sprintf("[%s] 在 runtime ServiceAccount 缺失时非零退出并输出可定位原因", stableScenarioID("002")), func(ctx SpecContext) {
+		scenarioID := stableScenarioID("002")
 		By(scenarioID + " 对不存在的 runtime ServiceAccount 执行预检")
 		output, err := runPreflight(ctx, "missing-preflight-sa")
 		AddReportEntry("preflight-output", output, ReportEntryVisibilityFailureOrVerbose)
@@ -105,15 +102,23 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 	}, SpecTimeout(5*time.Minute))
 })
 
-func stableScenarioPrefix() string {
-	switch os.Getenv("KUBERNETES_VERSION") {
-	case "1.19":
-		return "E2E-119-PREFLIGHT"
-	case "1.28":
-		return "E2E-128-PREFLIGHT"
-	default:
-		return "E2E-UNSUPPORTED-PREFLIGHT"
+func stableScenarioID(sequence string) string {
+	ids := map[string]map[string]string{
+		"1.19": {
+			"001": "E2E-119-PREFLIGHT-001",
+			"002": "E2E-119-PREFLIGHT-002",
+		},
+		"1.28": {
+			"001": "E2E-128-PREFLIGHT-001",
+			"002": "E2E-128-PREFLIGHT-002",
+		},
 	}
+	if versionIDs, supported := ids[os.Getenv("KUBERNETES_VERSION")]; supported {
+		if id, found := versionIDs[sequence]; found {
+			return id
+		}
+	}
+	return "E2E-UNSUPPORTED-PREFLIGHT-" + sequence
 }
 
 func runPreflight(ctx context.Context, serviceAccount string) (string, error) {

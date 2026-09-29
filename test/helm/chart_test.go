@@ -333,4 +333,3 @@ func firstContainer(deployment map[string]any) map[string]any {
 	Expect(ok).To(BeTrue())
 	return container
 }
-

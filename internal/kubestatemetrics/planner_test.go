@@ -166,7 +166,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		Entry("Kubernetes 1.28", "v1.28.15"),
 	)
 
-	DescribeTable("UT-KSM-007 Include collectors 成为实际参数和 effective collectors", func(kubernetesVersion string) {
+	DescribeTable("UT-KSM-008 Include collectors 成为实际参数和 effective collectors", func(kubernetesVersion string) {
 		By("准备显式 Include collector 声明")
 		instance := newInstance()
 		instance.Spec.Collectors = monitoringv1alpha1.KubeStateMetricsCollectors{
@@ -189,7 +189,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		Entry("Kubernetes 1.28", "v1.28.15"),
 	)
 
-	DescribeTable("UT-KSM-008 非法 collector 配置在规划资源前返回 InvalidSpec",
+	DescribeTable("UT-KSM-009 非法 collector 配置在规划资源前返回 InvalidSpec",
 		func(collectors monitoringv1alpha1.KubeStateMetricsCollectors, wantMessage string) {
 			By("准备非法 collector 声明")
 			instance := newInstance()
@@ -210,7 +210,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		}, "serviceaccounts"),
 	)
 
-	DescribeTable("UT-KSM-009 metric filter 映射为对应的 kube-state-metrics 参数",
+	DescribeTable("UT-KSM-010 metric filter 映射为对应的 kube-state-metrics 参数",
 		func(kubernetesVersion string, mode monitoringv1alpha1.MetricFilterMode, patterns []string, wantFilterArg string) {
 			By("准备显式 collector 和 metric filter")
 			instance := newInstance()
@@ -246,7 +246,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			[]string{"kube_pod_info", "_labels$"}, "--metric-denylist=kube_pod_info,_labels$"),
 	)
 
-	DescribeTable("UT-KSM-010 非法 metric filter 在规划资源前返回 InvalidSpec",
+	DescribeTable("UT-KSM-011 非法 metric filter 在规划资源前返回 InvalidSpec",
 		func(filter monitoringv1alpha1.KubeStateMetricsMetricFilter, wantMessage string) {
 			By("准备非法 metric filter 声明")
 			instance := newInstance()
@@ -273,7 +273,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		}, "逗号"),
 	)
 
-	DescribeTable("UT-KSM-011 显式 podResources 完整下发且不伪造默认值", func(kubernetesVersion string) {
+	DescribeTable("UT-KSM-012 显式 podResources 完整下发且不伪造默认值", func(kubernetesVersion string) {
 		By("准备显式 requests 和 limits")
 		instance := newInstance()
 		instance.Spec.PodResources = &corev1.ResourceRequirements{
@@ -302,7 +302,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		Entry("Kubernetes 1.28", "v1.28.15"),
 	)
 
-	It("UT-KSM-012 在规划资源前拒绝缺少 Pod resourceClaims 声明的 claim", func() {
+	It("UT-KSM-013 在规划资源前拒绝缺少 Pod resourceClaims 声明的 claim", func() {
 		By("准备引用未开放 Pod resourceClaims 的容器资源声明")
 		instance := newInstance()
 		instance.Spec.PodResources = &corev1.ResourceRequirements{

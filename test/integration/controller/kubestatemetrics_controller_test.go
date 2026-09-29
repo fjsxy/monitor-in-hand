@@ -571,4 +571,3 @@ func condition(instance *monitoringv1alpha1.KubeStateMetrics, conditionType stri
 }
 
 func boolPointer(value bool) *bool { return &value }
-
