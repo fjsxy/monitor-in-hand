@@ -164,6 +164,22 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "enabled", "default")).To(BeTrue())
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "suspended", "default")).To(BeFalse())
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "default", "mode")).To(Equal("Deployment"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "collectors", "default", "mode")).To(Equal("Default"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "collectors", "properties", "mode", "enum")).To(ConsistOf("Default", "Include"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "metricFilter", "default", "mode")).To(Equal("All"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "metricFilter", "properties", "mode", "enum")).To(ConsistOf("All", "Allow", "Deny"))
+
+		// 验证稳定 API 只开放约定字段，不泄漏上游命令行透传入口。
+		specProperties, ok := nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties").(map[string]any)
+		Expect(ok).To(BeTrue())
+		specKeys := make([]string, 0, len(specProperties))
+		for key := range specProperties {
+			specKeys = append(specKeys, key)
+		}
+		sort.Strings(specKeys)
+		Expect(specKeys).To(Equal([]string{
+			"collectors", "deployment", "enabled", "metricFilter", "podResources", "suspended", "targetNamespace",
+		}), "CRD 不得暴露 image、version、extraArgs、opt-in metrics 或原始 allow/deny 参数")
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "status", "properties", "phase", "enum")).To(ConsistOf(
 			"Pending", "Deleting", "Disabling", "Disabled", "Reconciling", "Ready", "Degraded",
 		))
@@ -317,3 +333,4 @@ func firstContainer(deployment map[string]any) map[string]any {
 	Expect(ok).To(BeTrue())
 	return container
 }
+

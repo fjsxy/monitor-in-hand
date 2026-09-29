@@ -86,6 +86,28 @@ spec:
 
 Kubernetes 1.19.x 固定选择 kube-state-metrics 2.3.0，Kubernetes 1.28.x 固定选择 2.11.0。其他 minor 或缺失目标 Namespace 只更新 CR status，不创建受管资源。
 
+默认 collector 是两个版本共同支持的固定 28 项 catalog。也可以选择其中的显式子集，并用 Go regexp 的未锚定 `MatchString` 语义过滤指标；`podResources` 直接使用 Kubernetes `ResourceRequirements`，省略时不注入 requests/limits：
+
+```yaml
+spec:
+  targetNamespace: monitoring
+  collectors:
+    mode: Include
+    names: [pods, deployments]
+  metricFilter:
+    mode: Allow
+    patterns: [pod_info, '^kube_deployment_status_.*']
+  podResources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+```
+
+`collectors.mode` 仅支持 `Default`（`names` 必须为空）和 `Include`（非空、无重复且只能使用共同 catalog）；`metricFilter.mode` 仅支持 `All`、`Allow`、`Deny`。Allow/Deny pattern 必须非空、是合法 Go regexp 且不含逗号。解析后的 collector 列表通过 `status.effectiveCollectors` 报告。
+
 ## 部署预检
 
 在创建原生 `PrometheusAgent` 前，管理员必须用实际 Agent 计划使用的 namespace 和 runtime ServiceAccount 运行严格预检：

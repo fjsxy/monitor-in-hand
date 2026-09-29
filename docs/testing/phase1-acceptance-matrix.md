@@ -1,6 +1,6 @@
 # 一期验收矩阵
 
-本文件记录已经自动化并作为 blocking gate 执行的稳定场景。当前仅列出已由 GitHub Issue #51 交付的默认 `KubeStateMetrics` Deployment 切片；后续 ticket 追加自身场景，不改写已有 ID。
+本文件记录已经自动化并作为 blocking gate 执行的稳定场景。后续 ticket 追加自身场景，不改写已有 ID。
 
 | 场景 ID | 来源 | 层级 | 目标版本 | 动作与精确断言 | 失败证据 | 测试入口 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -17,3 +17,15 @@
 | `HELM-007` | #51 | Helm/RBAC | Chart | manager 具有 CR status 与默认 Deployment 调谐权限，且不含 Prometheus Operator API 权限 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
 | `E2E-119-KSM-001` | #51 | kind E2E | Kubernetes 1.19.16 | 最小 CR 实际运行 kube-state-metrics 2.3.0；验证 Deployment/Service/RBAC/labels/owner/status | 完整集群对象、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=1.19 ...` |
 | `E2E-128-KSM-001` | #51 | kind E2E | Kubernetes 1.28.15 | 最小 CR 实际运行 kube-state-metrics 2.11.0；验证 Deployment/Service/RBAC/labels/owner/status | 完整集群对象、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=1.28 ...` |
+| `UT-KSM-006` | #54 | 纯规划 | 1.19、1.28 | `Default` 固定解析为两个版本共同的 28 项 collector catalog，并显式生成 `--resources`；省略 `podResources` 时不注入资源默认值 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-007` | #54 | 纯规划 | 1.19、1.28 | `Include` 的显式 collector 同时成为实际参数与 `effectiveCollectors` | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-008` | #54 | 纯规划 | 1.19、1.28 | 拒绝 Default 携带 names、Include 空集合、重复项与共同 catalog 外名称，返回 `InvalidSpec` 且零资源 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-009` | #54 | 纯规划 | 1.19、1.28 | Allow/Deny 分别映射 metric allowlist/denylist，pattern 不被隐式锚定 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-010` | #54 | 纯规划 | 1.19、1.28 | 拒绝 mode/list 冲突、空项、非法 Go regexp 与含逗号项；合法零命中 pattern 不要求预知指标 catalog | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-011` | #54 | 纯规划 | 1.19、1.28 | 显式 `podResources` 完整下发 requests/limits，不伪造项目默认值 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `IT-KSM-006` | #54 | envtest | API Server 1.28；目标 profile 1.19、1.28 | API 配置贯通 Deployment args/resources 与 status effective collectors；已应用配置变为非法后 workload 不被重写 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-007` | #54 | envtest | API Server 1.28 | 非法配置优先于缺失 Namespace 返回 InvalidSpec；零资源、无定时重试、相同 generation 不重复写 status，其他实例不受影响，新 generation 可恢复 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-008` | #54 | envtest | API Server 1.28；目标 profile 1.19、1.28 | Deny filter 映射为两个版本 workload 的 metric denylist，effective collectors 与参数一致 | Ginkgo failure、API object | `make test-integration` |
+| `E2E-119-KSM-002` / `E2E-128-KSM-002` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | Include pods、未锚定 Allow pattern 和显式 podResources 作用于真实 workload 与 scrape | 完整集群对象、Events、metrics 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
+| `E2E-119-KSM-003` / `E2E-128-KSM-003` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | Deny pattern 从真实 scrape 排除匹配指标，同时保留其他 collector 指标 | 完整集群对象、Events、metrics 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
+| `E2E-119-KSM-004` / `E2E-128-KSM-004` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | 非法 regexp 仅降级当前实例、无 workload/status 重写，并保持 Operator 和合法实例可用 | 完整集群对象、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
