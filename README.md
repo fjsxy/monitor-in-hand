@@ -86,6 +86,32 @@ spec:
 
 Kubernetes 1.19.x 固定选择 kube-state-metrics 2.3.0，Kubernetes 1.28.x 固定选择 2.11.0。其他 minor 或缺失目标 Namespace 只更新 CR status，不创建受管资源。
 
+## 部署预检
+
+在创建原生 `PrometheusAgent` 前，管理员必须用实际 Agent 计划使用的 namespace 和 runtime ServiceAccount 运行严格预检：
+
+```bash
+hack/preflight.sh \
+  --agent-namespace monitoring \
+  --agent-service-account prometheus-agent \
+  --config-namespaces monitoring,shared-monitoring \
+  --discovery-namespaces default,applications \
+  --operator-namespace prometheus-operator \
+  --operator-deployment prometheus-operator
+```
+
+`--config-namespaces` 是四类采集配置可能被选中的 namespace；`--discovery-namespaces` 是 Agent 一期 Kubernetes discovery 可能读取的 namespace。两者均接受逗号分隔列表，或单独的 `*` 表示要求覆盖全部 namespace。默认查找 `prometheus-operator/prometheus-operator` Deployment；可用 `--context` 选择 kubeconfig context，用 `--timeout-seconds` 调整 1–900 秒的 reconcile 上限。完整输入见：
+
+```bash
+hack/preflight.sh --help
+```
+
+`make preflight` 是便利包装，参数分别为 `AGENT_NAMESPACE`、`AGENT_SERVICE_ACCOUNT`、`CONFIG_NAMESPACES`、`DISCOVERY_NAMESPACES`、`OPERATOR_NAMESPACE`、`OPERATOR_DEPLOYMENT`、`KUBE_CONTEXT` 和 `PREFLIGHT_TIMEOUT_SECONDS`。GNU Make 只保留成功/失败；需要区分精确退出码的自动化应直接调用 `hack/preflight.sh`。
+
+预检依次验证 Kubernetes 1.19.x/1.28.x 版本事实、五类 CRD/API/schema、Prometheus Operator watch scope 与 RBAC、非 `default` runtime ServiceAccount 的 discovery RBAC，以及最小 reconcile。最后一步仅创建一个名为 `mih-preflight-*` 的零副本 Agent；无论成功或失败，都使用 UID precondition 仅删除该 Agent，由 ownerReference 前台级联清理它的外部生成资源。预检不安装、升级、修改或接管 Prometheus Operator 及采集配置，也不会让可观测组件管控 Operator 依赖 Prometheus Operator。
+
+标准输出是 JSON Lines：每行包含 `level`、`check`、`status`、`reason`、`message` 和 `details`。退出码为 `0` 表示通过，`1` 表示环境不具备支持资格或检查无法完成，`2` 表示输入无效。任一失败都是阻断性的，不会静默降级。
+
 ## Helm values
 
 Chart 只开放以下配置：

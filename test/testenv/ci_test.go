@@ -60,6 +60,10 @@ var _ = Describe("双版本一期验收门禁", func() {
 			)),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("name", "E2E 严格部署预检"),
+			HaveKeyWithValue("run", ContainSubstring("make e2e-preflight")),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "E2E 默认 KubeStateMetrics Deployment"),
 			HaveKeyWithValue("run", ContainSubstring("make e2e-default-deployment")),
 		)))
@@ -92,6 +96,9 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(makefile)).To(ContainSubstring("go run github.com/onsi/ginkgo/v2/ginkgo"))
 		Expect(string(makefile)).To(ContainSubstring("--junit-report"))
+		Expect(string(makefile)).To(ContainSubstring("e2e-preflight:"))
+		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/preflight"`))
+		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/kubestatemetrics"`))
 		Expect(string(makefile)).NotTo(ContainSubstring("./hack/e2e-default-deployment.sh"))
 
 		By("确认旧 shell 业务断言入口已被删除")
