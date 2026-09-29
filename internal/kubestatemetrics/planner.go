@@ -441,4 +441,3 @@ var _ runtime.Object = &appsv1.Deployment{}
 func boolPointer(value bool) *bool    { return &value }
 func int32Pointer(value int32) *int32 { return &value }
 func int64Pointer(value int64) *int64 { return &value }
-
