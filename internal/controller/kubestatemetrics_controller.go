@@ -318,7 +318,8 @@ func (r *KubeStateMetricsReconciler) deleteOwnedResources(ctx context.Context, i
 		if !current.GetDeletionTimestamp().IsZero() {
 			continue
 		}
-		if err := r.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+		uid := current.GetUID()
+		if err := r.Delete(ctx, current, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil && !apierrors.IsNotFound(err) {
 			deleteErrors = append(deleteErrors, fmt.Errorf("删除受管资源 %T %q: %w", current, key.String(), err))
 		}
 	}

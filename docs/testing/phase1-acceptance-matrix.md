@@ -25,6 +25,11 @@
 | `UT-KSM-017` | #55 | 纯规划 | 1.19、1.28 | 零匹配只规划非 workload 资源，同时保留待删除 workload 的稳定身份 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-KSM-018` | #55 | 纯规划 | 通用 | 非法 namespace regex 优先于缺失 targetNamespace 报告 InvalidSpec | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-KSM-019` | #55 | 纯规划 | 1.19、1.28 | Namespace 集合增删使计划在零匹配、扩展、归零与恢复之间确定性切换 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-GH53-001` | #53 | 纯规划/命名 | 通用 | CR name 是唯一业务身份；点号替换或超长时使用可读前缀与原始名称 SHA-256 前 8 位，基础名最长 47 字符且 targetNamespace 不参与计算 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-GH53-002` | #53 | 纯规划/资源元数据 | 1.28 | 全部直接受管资源和 Pod 使用完整稳定 labels；Service selector 仅使用 name、instance 与 endpoint-group，不使用 version 或 role | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-GH53-003` | #53 | controller/Kubernetes I/O | 通用 | finalizer 删除带有已分类对象 UID 前置条件，竞态窗口中的同名冲突替换对象不被误删；managedResources 不参与所有权判定 | Go test failure | `go test ./internal/controller` |
+| `UT-KSM-GH53-004` | #53 | controller/Kubernetes I/O | 通用 | 模糊部分写入返回 `ApplyFailed`，已持久化资源不回滚，后续调谐从当前状态继续收敛 | Go test failure | `go test ./internal/controller` |
+| `UT-KSM-GH53-005` | #53 | controller/Kubernetes I/O | 通用 | 同 Namespace 多实例的稳定身份和 owner UID 隔离；已拥有 Service 漂移恢复；旧 UID 冲突保持原样并可恢复；停用一个实例不影响另一个 | Go test failure | `go test ./internal/controller` |
 
 ## HELM
 
@@ -59,6 +64,11 @@
 | `IT-KSM-015` | #55 | envtest | API Server 1.28 | 已应用配置变为非法 regex 时只更新 InvalidSpec status，不部分修改既有 workload | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-016` | #55 | envtest | API Server 1.28 | Namespace watch 自动触发范围扩展、rollout、归零和恢复 | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-017` | #55 | envtest | API Server 1.28 | workload 仍在终止时持续 requeue，不提前报告稳定零匹配 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH53-001` | #53 | envtest | API Server 1.28 | 同一与不同 targetNamespace 的三实例保持 workload、Service selector、RBAC、status 和停用生命周期隔离 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH53-002` | #53 | envtest | API Server 1.28 | 无 owner、其他 owner 与同名旧 CR UID 对象均报告 `ResourceConflict`，不修改、删除或接管；冲突消失后恢复收敛 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH53-003` | #53 | envtest | API Server 1.28 | finalizer 只清理当前 CR UID 的稳定直接身份，保留旧 UID 同名对象和仅出现于 managedResources 的对象 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH53-004` | #53 | envtest | API Server 1.28 | 真实 API Server 中的多资源部分写入保留成功对象、报告 `ApplyFailed` 并在后续调谐补齐剩余资源 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH53-005` | #53 | envtest/manager watch | API Server 1.28 | 修改已拥有 Service 或删除已拥有 Deployment 时由直接资源 watch 自动触发调谐、恢复字段并以新 UID 重建 | Ginkgo failure、API object | `make test-integration` |
 
 ## E2E
 
@@ -72,6 +82,7 @@
 | `E2E-119-KSM-004` / `E2E-128-KSM-004` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | Deny pattern 从真实 scrape 排除匹配指标，同时保留其他 collector 指标 | 完整集群对象、Events、metrics 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-KSM-005` / `E2E-128-KSM-005` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | 非法 regexp 仅降级当前实例、无 workload/status 重写，并保持 Operator 和合法实例可用 | 完整集群对象、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-KSM-006` / `E2E-128-KSM-006` | #55 | kind E2E | Kubernetes 1.19.16、1.28.15 | 字面名称、完整 regex、substring 非命中、集合扩展、零匹配及自动恢复作用于真实可用 workload 与 KSM 指标 | 完整集群对象、conditions、Events、metrics 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
+| `E2E-119-KSM-GH53-001` / `E2E-128-KSM-GH53-001` | #53 | kind E2E | Kubernetes 1.19.16、1.28.15 | 点号名称的稳定摘要身份；同/不同 Namespace 多实例的 workload、Service endpoints、Pod labels、RBAC 与生命周期隔离；已拥有资源修改/删除漂移自动修复；无 owner、错误 owner 与旧 UID 预占均报告 `ResourceConflict` 并恢复；finalizer 保留旧 UID 对象；真实 RBAC 失败下保留部分写入并继续收敛 | 完整集群对象、endpoints、Pods、conditions、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-PREFLIGHT-001` | #58 | kind E2E/预检 | Kubernetes 1.19.16 | 一期支持环境使用显式 runtime ServiceAccount 时预检成功，并报告 Kubernetes 版本事实与 `PreflightPassed` | NDJSON diagnostics、集群对象 | `make e2e-preflight KUBERNETES_VERSION=1.19 ...` |
 | `E2E-128-PREFLIGHT-001` | #58 | kind E2E/预检 | Kubernetes 1.28.15 | 一期支持环境使用显式 runtime ServiceAccount 时预检成功，并报告 Kubernetes 版本事实与 `PreflightPassed` | NDJSON diagnostics、集群对象 | `make e2e-preflight KUBERNETES_VERSION=1.28 ...` |
 | `E2E-119-PREFLIGHT-002` | #58 | kind E2E/预检 | Kubernetes 1.19.16 | runtime ServiceAccount 缺失时预检非零退出，并报告 `RuntimeServiceAccountNotFound` 与 `PreflightFailed` | NDJSON diagnostics、退出码 | `make e2e-preflight KUBERNETES_VERSION=1.19 ...` |

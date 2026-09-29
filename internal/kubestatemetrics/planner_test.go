@@ -29,6 +29,65 @@ var _ = Describe("默认 Deployment 规划", func() {
 		}
 	}
 
+	It("UT-KSM-GH53-001 从 CR name 派生稳定且可冲突规避的实例身份", func() {
+		By("验证未转换的短名保持可读身份")
+		Expect(ksm.ManagedResourceName("primary-example")).To(Equal("ksm-primary-example"))
+
+		By("验证点号转换使用原始 CR name 的 SHA-256 前 8 位区分潜在重名")
+		Expect(ksm.ManagedResourceName("primary.example")).To(Equal("ksm-primary-example-16ac24d9"))
+		Expect(ksm.ManagedResourceName("primary.example")).NotTo(Equal(ksm.ManagedResourceName("primary-example")))
+
+		By("验证超长名称保留固定可读前缀和原始名称摘要")
+		name := "abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuv"
+		Expect(ksm.ManagedResourceName(name)).To(Equal("ksm-abcdefghijklmnopqrstuvwxyz-abcdefg-5e100601"))
+		Expect(ksm.ManagedResourceName(name)).To(HaveLen(47))
+
+		By("验证 targetNamespace 不参与实例身份计算")
+		instance := newInstance()
+		first, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{KubernetesVersion: "v1.28.15", TargetNamespaceExists: true, NamespaceNames: []string{"monitoring"}})
+		Expect(problem).To(BeNil())
+		instance.Spec.TargetNamespace = "replacement"
+		second, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{KubernetesVersion: "v1.28.15", TargetNamespaceExists: true, NamespaceNames: []string{"replacement"}})
+		Expect(problem).To(BeNil())
+		Expect(second.InstanceID).To(Equal(first.InstanceID))
+		Expect(second.Name).To(Equal(first.Name))
+	})
+
+	It("UT-KSM-GH53-002 为全部直接受管资源和 Pod 下发稳定标签与版本无关的 Service selector", func() {
+		By("执行最小受管实例的纯规划")
+		plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
+			KubernetesVersion:     "v1.28.15",
+			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
+		})
+		Expect(problem).To(BeNil())
+
+		By("验证全部直接受管资源使用完整稳定标签")
+		wantLabels := map[string]string{
+			"app.kubernetes.io/name":         "kube-state-metrics",
+			"app.kubernetes.io/instance":     "primary",
+			"app.kubernetes.io/managed-by":   "monitor-in-hand",
+			"app.kubernetes.io/version":      "2.11.0",
+			"monitor-in-hand/role":           "collector",
+			"monitor-in-hand/endpoint-group": "default",
+		}
+		for _, resource := range plan.Resources {
+			Expect(resource.GetLabels()).To(Equal(wantLabels))
+		}
+
+		By("验证 Pod 继承完整标签，Service selector 只使用不随版本和角色变化的身份")
+		deployment := deploymentFrom(plan)
+		Expect(deployment.Spec.Template.Labels).To(Equal(wantLabels))
+		service := serviceFrom(plan)
+		Expect(service.Spec.Selector).To(Equal(map[string]string{
+			"app.kubernetes.io/name":         "kube-state-metrics",
+			"app.kubernetes.io/instance":     "primary",
+			"monitor-in-hand/endpoint-group": "default",
+		}))
+		Expect(service.Spec.Selector).NotTo(HaveKey("app.kubernetes.io/version"))
+		Expect(service.Spec.Selector).NotTo(HaveKey("monitor-in-hand/role"))
+	})
+
 	DescribeTable("UT-KSM-001 为目标 Kubernetes minor 选择固定 profile 并规划完整资源",
 		func(kubernetesVersion, wantVersion, wantImage string, wantRBACResource string, hardened bool) {
 			plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
@@ -575,6 +634,16 @@ func deploymentFrom(plan *ksm.ResourcePlan) *appsv1.Deployment {
 		}
 	}
 	Fail("deployment not found in resource plan")
+	return nil
+}
+
+func serviceFrom(plan *ksm.ResourcePlan) *corev1.Service {
+	for _, resource := range plan.Resources {
+		if service, ok := resource.(*corev1.Service); ok {
+			return service
+		}
+	}
+	Fail("service not found in resource plan")
 	return nil
 }
 
