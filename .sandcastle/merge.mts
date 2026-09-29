@@ -53,6 +53,12 @@ export function selectResumablePullRequests(
 
 export interface MergeOperations {
   waitForCI(pr: ReviewedPullRequest): Promise<string>;
+  maxCIRepairAttempts?: number;
+  repairFailedCI?(
+    pr: ReviewedPullRequest,
+    failure: PullRequestCIFailedError,
+    attempt: number,
+  ): Promise<string>;
   rebaseOntoLatestBase(
     pr: ReviewedPullRequest,
     checkedHeadOid: string,
@@ -76,6 +82,19 @@ export type StatusCheck =
   | { state: string };
 
 export type CIState = "pending" | "passed" | "failed";
+
+export class PullRequestCIFailedError extends Error {
+  constructor(
+    readonly pullRequestNumber: number,
+    readonly headOid: string,
+    readonly failedChecks: string[],
+  ) {
+    super(
+      `PR #${pullRequestNumber} CI 失败：${failedChecks.join(", ")}`,
+    );
+    this.name = "PullRequestCIFailedError";
+  }
+}
 
 export function classifyCI(checks: StatusCheck[]): CIState {
   if (checks.length === 0) return "pending";
@@ -102,6 +121,41 @@ export function classifyCI(checks: StatusCheck[]): CIState {
   return pending ? "pending" : "passed";
 }
 
+async function waitForCIWithRepair(
+  pr: ReviewedPullRequest,
+  operations: MergeOperations,
+  repairBudget: { attempts: number },
+  initialExpectedHeadOid?: string,
+): Promise<string> {
+  let expectedHeadOid = initialExpectedHeadOid;
+  while (true) {
+    try {
+      const checkedHeadOid = await operations.waitForCI(pr);
+      if (expectedHeadOid && checkedHeadOid !== expectedHeadOid) {
+        throw new Error(`PR #${pr.number} 等待 CI 期间 head 已变化。`);
+      }
+      return checkedHeadOid;
+    } catch (error) {
+      if (
+        !(error instanceof PullRequestCIFailedError) ||
+        !operations.repairFailedCI ||
+        repairBudget.attempts >= (operations.maxCIRepairAttempts ?? 0)
+      ) {
+        throw error;
+      }
+      if (expectedHeadOid && error.headOid !== expectedHeadOid) {
+        throw new Error(`PR #${pr.number} CI 失败前 head 已变化。`);
+      }
+      repairBudget.attempts += 1;
+      expectedHeadOid = await operations.repairFailedCI(
+        pr,
+        error,
+        repairBudget.attempts,
+      );
+    }
+  }
+}
+
 export async function mergeReviewedPullRequests(
   pullRequests: ReviewedPullRequest[],
   operations: MergeOperations,
@@ -113,17 +167,24 @@ export async function mergeReviewedPullRequests(
 
   for (const [index, pr] of ordered.entries()) {
     try {
-      const checkedHeadOid = await operations.waitForCI(pr);
+      const repairBudget = { attempts: 0 };
+      const checkedHeadOid = await waitForCIWithRepair(
+        pr,
+        operations,
+        repairBudget,
+      );
       const rebasedHeadOid = await operations.rebaseOntoLatestBase(
         pr,
         checkedHeadOid,
       );
       let mergeHeadOid = checkedHeadOid;
       if (rebasedHeadOid !== checkedHeadOid) {
-        mergeHeadOid = await operations.waitForCI(pr);
-        if (mergeHeadOid !== rebasedHeadOid) {
-          throw new Error(`PR #${pr.number} 在 rebase 后 head 已变化。`);
-        }
+        mergeHeadOid = await waitForCIWithRepair(
+          pr,
+          operations,
+          repairBudget,
+          rebasedHeadOid,
+        );
       }
       await operations.mergeWithRebase(pr, mergeHeadOid);
       await operations.verifyMerged(pr);

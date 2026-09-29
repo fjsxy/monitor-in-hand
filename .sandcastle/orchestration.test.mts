@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   branchForIssue,
+  ciRepairPromptArgs,
   parseBlockerNumbers,
   promptArgsForIssue,
   selectFrontier,
@@ -113,6 +114,42 @@ test("prompt 模板中的变量都有调度参数", () => {
       `${path} 存在未提供的模板变量`,
     );
   }
+});
+
+test("CI repair prompt 获得 PR、失败 head、checks 与重试次数", () => {
+  const args = ciRepairPromptArgs(
+      issue(56),
+      "codex/issue-56",
+      72,
+      "abc123",
+      ["test-environment (1.19)", "test-environment (1.28)"],
+      2,
+    );
+  assert.deepEqual(
+    args,
+    {
+      TASK_ID: "56",
+      ISSUE_TITLE: "Ticket 56",
+      BRANCH: "codex/issue-56",
+      PR_NUMBER: "72",
+      FAILED_HEAD_OID: "abc123",
+      FAILED_CHECKS: "test-environment (1.19), test-environment (1.28)",
+      REPAIR_ATTEMPT: "2",
+    },
+  );
+
+  const template = readFileSync(".sandcastle/ci-repair-prompt.md", "utf8");
+  const variables = [
+    ...new Set(
+      [...template.matchAll(/\{\{([A-Z0-9_]+)\}\}/g)].map(
+        (match) => match[1]!,
+      ),
+    ),
+  ];
+  assert.deepEqual(
+    variables.filter((variable) => !(variable in args)),
+    [],
+  );
 });
 
 test("promptArgs 不覆盖 Sandcastle 内置的 TARGET_BRANCH", () => {

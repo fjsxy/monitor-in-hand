@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import * as sandcastle from "@ai-hero/sandcastle";
 import type { AgentProvider } from "@ai-hero/sandcastle";
 import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
-import { promptArgsForIssue } from "./orchestration.mts";
+import { ciRepairPromptArgs, promptArgsForIssue } from "./orchestration.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
 
 const branch = `codex/sandcastle-smoke-${process.pid}`;
@@ -27,8 +27,11 @@ const fakeAgent: AgentProvider = {
   buildPrintCommand: ({ prompt }) => {
     const expectedDiff = `git diff ${targetBranch}...${branch}`;
     const expectedRebase = `rebase 到 \`${targetBranch}\` 时的冲突`;
+    const expectedCIRepair = "修复 PR #999";
     if (
-      (!prompt.includes(expectedDiff) && !prompt.includes(expectedRebase)) ||
+      (!prompt.includes(expectedDiff) &&
+        !prompt.includes(expectedRebase) &&
+        !prompt.includes(expectedCIRepair)) ||
       prompt.includes("{{TARGET_BRANCH}}")
     ) {
       throw new Error("Sandcastle built-in prompt arguments were not substituted");
@@ -97,6 +100,24 @@ try {
   });
   if (!conflictRun.completionSignal) {
     throw new Error("Sandcastle merge conflict prompt smoke did not complete");
+  }
+
+  const ciRepairRun = await sandbox.run({
+    name: "ci-repair-prompt-smoke",
+    agent: fakeAgent,
+    maxIterations: 1,
+    promptFile: "./.sandcastle/ci-repair-prompt.md",
+    promptArgs: ciRepairPromptArgs(
+      { number: 56, title: "Sandcastle smoke" },
+      branch,
+      999,
+      "deadbeef",
+      ["test-environment"],
+      1,
+    ),
+  });
+  if (!ciRepairRun.completionSignal) {
+    throw new Error("Sandcastle CI repair prompt smoke did not complete");
   }
 
   process.stdout.write(result.stdout);

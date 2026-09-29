@@ -3,11 +3,16 @@ import * as sandcastle from "@ai-hero/sandcastle";
 import { stageCodexAuth } from "./auth.mts";
 import {
   classifyCI,
+  PullRequestCIFailedError,
   type MergeOperations,
   type ReviewedPullRequest,
   type StatusCheck,
 } from "./merge.mts";
-import { promptArgsForIssue, type IssueRecord } from "./orchestration.mts";
+import {
+  ciRepairPromptArgs,
+  promptArgsForIssue,
+  type IssueRecord,
+} from "./orchestration.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
 import { withAgentIdleTimeout } from "./runtime-config.mts";
 
@@ -51,7 +56,7 @@ type GitHubStatusCheck = StatusCheck & {
   context?: string;
 };
 
-interface PullRequestSnapshot {
+export interface PullRequestSnapshot {
   number: number;
   state: "OPEN" | "CLOSED" | "MERGED";
   isDraft: boolean;
@@ -59,6 +64,24 @@ interface PullRequestSnapshot {
   headRefOid: string;
   baseRefName: string;
   statusCheckRollup: GitHubStatusCheck[];
+}
+
+export interface CIRepairAgentInput {
+  pr: ReviewedPullRequest;
+  issue: IssueRecord;
+  failure: PullRequestCIFailedError;
+  attempt: number;
+}
+
+export interface CIRepairDependencies {
+  fetchPullRequest(number: number): PullRequestSnapshot;
+  runCIRepairAgent(input: CIRepairAgentInput): Promise<{
+    repairedHeadOid: string;
+  }>;
+  pushRepairedBranch(
+    pr: ReviewedPullRequest,
+    expectedHeadOid: string,
+  ): void;
 }
 
 function fetchPullRequest(number: number): PullRequestSnapshot {
@@ -109,14 +132,113 @@ async function waitForPullRequestCI(
     }
     if (state === "passed") return snapshot.headRefOid;
     if (state === "failed") {
-      throw new Error(
-        `PR #${pr.number} CI 失败：${failedCheckNames(snapshot.statusCheckRollup).join(", ")}`,
+      throw new PullRequestCIFailedError(
+        pr.number,
+        snapshot.headRefOid,
+        failedCheckNames(snapshot.statusCheckRollup),
       );
     }
     await delay(pollMs);
   }
 
   throw new Error(`PR #${pr.number} 等待 CI 超时。`);
+}
+
+async function runCIRepairAgent(
+  input: CIRepairAgentInput,
+  options: {
+    codexAuthFile: string;
+    ghToken: string;
+    agent: ReturnType<typeof sandcastle.codex>;
+    maxIterations: number;
+    idleTimeoutSeconds: number;
+  },
+): Promise<{ repairedHeadOid: string }> {
+  const stagedAuth = stageCodexAuth(options.codexAuthFile);
+  let sandbox: Awaited<ReturnType<typeof sandcastle.createSandbox>> | undefined;
+  let repairedHeadOid: string | undefined;
+  let preservedWorktreePath: string | undefined;
+
+  try {
+    sandbox = await sandcastle.createSandbox({
+      branch: input.pr.branch,
+      sandbox: createIssueSandboxProvider(options.ghToken, stagedAuth.mount),
+      hooks: {
+        sandbox: {
+          onSandboxReady: [
+            {
+              command:
+                "codex login status && gh auth status && go mod download",
+              timeoutMs: 300_000,
+            },
+          ],
+        },
+      },
+      copyToWorktree: [".agents"],
+    });
+
+    const currentHead = await sandbox.exec("git rev-parse HEAD");
+    if (
+      currentHead.exitCode !== 0 ||
+      currentHead.stdout.trim() !== input.failure.headOid
+    ) {
+      throw new Error(
+        `PR #${input.pr.number} repair 前本地 head 与失败 head 不一致。`,
+      );
+    }
+
+    const repair = await sandbox.run(
+      withAgentIdleTimeout(options.idleTimeoutSeconds, {
+        name: `issue-${input.pr.issue}-ci-repair-${input.attempt}`,
+        agent: options.agent,
+        maxIterations: options.maxIterations,
+        promptFile: "./.sandcastle/ci-repair-prompt.md",
+        promptArgs: ciRepairPromptArgs(
+          input.issue,
+          input.pr.branch,
+          input.pr.number,
+          input.failure.headOid,
+          input.failure.failedChecks,
+          input.attempt,
+        ),
+      }),
+    );
+    if (!repair.completionSignal) {
+      throw new Error(
+        `PR #${input.pr.number} repair agent 未发出完成信号。`,
+      );
+    }
+    if (repair.commits.length === 0) {
+      throw new Error(`PR #${input.pr.number} repair agent 没有产生 commit。`);
+    }
+
+    const verify = await sandbox.exec(
+      'test -z "$(git status --porcelain)" && git rev-parse HEAD',
+    );
+    if (verify.exitCode !== 0 || !verify.stdout.trim()) {
+      throw new Error(`PR #${input.pr.number} repair 后工作区不干净。`);
+    }
+    repairedHeadOid = verify.stdout.trim();
+    if (repairedHeadOid === input.failure.headOid) {
+      throw new Error(`PR #${input.pr.number} repair 后 head 未变化。`);
+    }
+  } finally {
+    if (sandbox) {
+      const closeResult = await sandbox.close();
+      preservedWorktreePath = closeResult.preservedWorktreePath;
+      if (preservedWorktreePath) {
+        console.warn(
+          `PR #${input.pr.number} repair worktree 已保留：${preservedWorktreePath}`,
+        );
+      }
+    }
+    stagedAuth.cleanup();
+  }
+
+  if (!repairedHeadOid || preservedWorktreePath) {
+    throw new Error(`PR #${input.pr.number} repair 结果未达到可推送状态。`);
+  }
+  return { repairedHeadOid };
 }
 
 async function resolveRebaseWithAgent(
@@ -259,20 +381,92 @@ async function resolveRebaseWithAgent(
   return rebasedHeadOid;
 }
 
-export function createGitHubMergeOperations(options: {
-  baseBranch: string;
-  codexAuthFile: string;
-  ghToken: string;
-  agent: ReturnType<typeof sandcastle.codex>;
-  maxIterations: number;
-  idleTimeoutSeconds: number;
-  ciTimeoutMs: number;
-  ciPollMs: number;
-  issuesByNumber: Map<number, IssueRecord>;
-}): MergeOperations {
+export function createGitHubMergeOperations(
+  options: {
+    baseBranch: string;
+    codexAuthFile: string;
+    ghToken: string;
+    agent: ReturnType<typeof sandcastle.codex>;
+    maxIterations: number;
+    maxCIRepairAttempts: number;
+    idleTimeoutSeconds: number;
+    ciTimeoutMs: number;
+    ciPollMs: number;
+    issuesByNumber: Map<number, IssueRecord>;
+  },
+  dependencies?: CIRepairDependencies,
+): MergeOperations {
+  const repairDependencies: CIRepairDependencies = dependencies ?? {
+    fetchPullRequest,
+    runCIRepairAgent: (input) =>
+      runCIRepairAgent(input, {
+        codexAuthFile: options.codexAuthFile,
+        ghToken: options.ghToken,
+        agent: options.agent,
+        maxIterations: options.maxIterations,
+        idleTimeoutSeconds: options.idleTimeoutSeconds,
+      }),
+    pushRepairedBranch(pr, expectedHeadOid) {
+      command("git", [
+        "push",
+        `--force-with-lease=refs/heads/${pr.branch}:${expectedHeadOid}`,
+        "origin",
+        `${pr.branch}:refs/heads/${pr.branch}`,
+      ]);
+    },
+  };
+
   return {
+    maxCIRepairAttempts: options.maxCIRepairAttempts,
     waitForCI: (pr) =>
       waitForPullRequestCI(pr, options.ciTimeoutMs, options.ciPollMs),
+
+    async repairFailedCI(pr, failure, attempt) {
+      const issue = options.issuesByNumber.get(pr.issue);
+      if (!issue) throw new Error(`找不到 PR #${pr.number} 对应的 Issue。`);
+      if (failure.pullRequestNumber !== pr.number) {
+        throw new Error(`PR #${pr.number} 的 CI failure 身份不匹配。`);
+      }
+
+      const assertFailedHeadUnchanged = () => {
+        const snapshot = repairDependencies.fetchPullRequest(pr.number);
+        if (
+          snapshot.state !== "OPEN" ||
+          snapshot.isDraft ||
+          snapshot.baseRefName !== options.baseBranch ||
+          snapshot.headRefName !== pr.branch ||
+          snapshot.headRefOid !== failure.headOid
+        ) {
+          throw new Error(`PR #${pr.number} repair 前状态或 head 已变化。`);
+        }
+      };
+
+      assertFailedHeadUnchanged();
+      console.log(
+        `PR #${pr.number} 启动第 ${attempt}/${options.maxCIRepairAttempts} 次 CI 自动修复：${failure.failedChecks.join(", ")}`,
+      );
+      const result = await repairDependencies.runCIRepairAgent({
+        pr,
+        issue,
+        failure,
+        attempt,
+      });
+      assertFailedHeadUnchanged();
+      repairDependencies.pushRepairedBranch(pr, failure.headOid);
+
+      const published = repairDependencies.fetchPullRequest(pr.number);
+      if (
+        published.state !== "OPEN" ||
+        published.headRefOid !== result.repairedHeadOid ||
+        published.headRefOid === failure.headOid
+      ) {
+        throw new Error(`PR #${pr.number} repair 推送后 head 回读不一致。`);
+      }
+      console.log(
+        `PR #${pr.number} repair 已推送 head ${published.headRefOid.slice(0, 12)}，等待新一轮 CI。`,
+      );
+      return published.headRefOid;
+    },
 
     async rebaseOntoLatestBase(pr, checkedHeadOid) {
       const before = fetchPullRequest(pr.number);

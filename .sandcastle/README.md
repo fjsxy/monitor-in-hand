@@ -10,9 +10,10 @@
 - 每个 ticket 使用 `codex/issue-<n>` 独立分支和 Sandcastle worktree。
 - 默认最多并行 3 个 ticket，每个 implementer 最多运行 3 次。
 - 并行 implementer 和 reviewer 完成后 push 分支并创建 PR；随后按 Issue 编号进入串行 merge 队列。
-- merge 队列等待 PR 的全部 CI checks 成功，使用最新 `main` rebase 分支；如有冲突，启动 resolver 并重新 code-review，推送后再次等待 CI。
+- merge 队列等待 PR 的全部 CI checks 成功；CI 失败时基于失败 head 启动 repair agent，读取失败 logs/artifacts、提交并带 lease 推送，然后等待新一轮 CI，达到重试上限才阻塞队列。
+- CI 通过后使用最新 `main` rebase 分支；如有冲突，启动 resolver 并重新 code-review，推送后再次等待 CI。
 - 最终执行带 head commit 锁的 `rebase merge` 并回读 `MERGED` 状态；任一 PR 阻塞时停止队列，后续 PR 保持 open。
-- 再次运行时会恢复带 Sandcastle 标记、分支和关闭 Issue 引用一致的 open PR，继续等待或合并，不重复实现 ticket。
+- 再次运行时会恢复带 Sandcastle 标记、分支和关闭 Issue 引用一致的 open PR，继续修复、等待或合并，不重复实现 ticket。
 - 完成信号表示“实现已达到可提 PR”，不是 Issue 已完成；Issue 仅在 PR 通过 CI 并成功合并后关闭。
 - 如果 agent 或 reviewer 未发出完成信号，保留分支，不创建 PR，命令以失败退出。
 
@@ -59,6 +60,7 @@ npm run sandcastle
 - `SANDCASTLE_MODEL`：默认 `gpt-5.6-sol`；reasoning effort 固定为 `high`。
 - `SANDCASTLE_MAX_PARALLEL`：默认 `3`。
 - `SANDCASTLE_MAX_ITERATIONS`：默认 `3`。
+- `SANDCASTLE_MAX_CI_REPAIR_ATTEMPTS`：单个 PR 的 CI 失败自动修复次数，默认 `2`；设为 `0` 可关闭自动修复。
 - `SANDCASTLE_IDLE_TIMEOUT_SECONDS`：agent 连续没有 stdout 时的终止门限，默认 `1800` 秒。Codex 在处理较大 tool output 或执行 high reasoning 时可能长时间不输出；该门限不代表单条 shell 命令的 timeout。
 - `SANDCASTLE_CI_TIMEOUT_MINUTES`：单次等待某个 PR CI 的最长时间，默认 `60`。
 - `SANDCASTLE_CI_POLL_SECONDS`：CI 状态轮询间隔，默认 `15`。

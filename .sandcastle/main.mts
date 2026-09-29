@@ -20,6 +20,7 @@ import { createGitHubMergeOperations } from "./github-merge.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
 import {
   resolveAgentIdleTimeoutSeconds,
+  resolveMaxCIRepairAttempts,
   withAgentIdleTimeout,
 } from "./runtime-config.mts";
 
@@ -383,6 +384,10 @@ async function main(): Promise<void> {
     process.env.SANDCASTLE_CI_POLL_SECONDS || localEnv.SANDCASTLE_CI_POLL_SECONDS,
     15,
   );
+  const maxCIRepairAttempts = resolveMaxCIRepairAttempts(
+    process.env,
+    localEnv,
+  );
 
   const issues = fetchIssues();
   const resumablePullRequests = fetchResumablePullRequests(
@@ -488,6 +493,7 @@ async function main(): Promise<void> {
         ghToken,
         agent,
         maxIterations,
+        maxCIRepairAttempts,
         idleTimeoutSeconds,
         ciTimeoutMs: ciTimeoutMinutes * 60_000,
         ciPollMs: ciPollSeconds * 1_000,

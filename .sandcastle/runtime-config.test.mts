@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   resolveAgentIdleTimeoutSeconds,
+  resolveMaxCIRepairAttempts,
   withAgentIdleTimeout,
 } from "./runtime-config.mts";
 
@@ -31,4 +32,29 @@ test("所有 agent run options 注入同一 idle timeout", () => {
     maxIterations: 3,
     idleTimeoutSeconds: 1_800,
   });
+});
+
+test("CI 自动修复默认最多两次，并支持进程环境覆盖", () => {
+  assert.equal(resolveMaxCIRepairAttempts({}, {}), 2);
+  assert.equal(
+    resolveMaxCIRepairAttempts(
+      { SANDCASTLE_MAX_CI_REPAIR_ATTEMPTS: "4" },
+      { SANDCASTLE_MAX_CI_REPAIR_ATTEMPTS: "3" },
+    ),
+    4,
+  );
+  assert.equal(
+    resolveMaxCIRepairAttempts(
+      { SANDCASTLE_MAX_CI_REPAIR_ATTEMPTS: "invalid" },
+      {},
+    ),
+    2,
+  );
+  assert.equal(
+    resolveMaxCIRepairAttempts(
+      { SANDCASTLE_MAX_CI_REPAIR_ATTEMPTS: "0" },
+      {},
+    ),
+    0,
+  );
 });

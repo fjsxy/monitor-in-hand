@@ -77,3 +77,20 @@ export function promptArgsForIssue(
     BRANCH: branch,
   };
 }
+
+export function ciRepairPromptArgs(
+  issue: Pick<IssueRecord, "number" | "title">,
+  branch: string,
+  pullRequestNumber: number,
+  failedHeadOid: string,
+  failedChecks: string[],
+  repairAttempt: number,
+): Record<string, string> {
+  return {
+    ...promptArgsForIssue(issue, branch),
+    PR_NUMBER: String(pullRequestNumber),
+    FAILED_HEAD_OID: failedHeadOid,
+    FAILED_CHECKS: failedChecks.join(", "),
+    REPAIR_ATTEMPT: String(repairAttempt),
+  };
+}

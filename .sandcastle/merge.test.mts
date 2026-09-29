@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  PullRequestCIFailedError,
   classifyCI,
   mergeReviewedPullRequests,
   selectResumablePullRequests,
@@ -97,6 +98,146 @@ test("任一 PR 阻塞时停止队列并保留后续 PR", async () => {
   assert.deepEqual(events, ["wait:53"]);
 });
 
+test("CI 失败时有界调用 repair，并在新一轮 CI 通过后继续合并", async () => {
+  const events: string[] = [];
+  let waitCount = 0;
+  const operations: MergeOperations = {
+    maxCIRepairAttempts: 2,
+    async waitForCI(pr) {
+      waitCount += 1;
+      events.push(`wait:${pr.issue}:${waitCount}`);
+      if (waitCount < 3) {
+        throw new PullRequestCIFailedError(
+          pr.number,
+          `${pr.issue}-head-${waitCount}`,
+          [`test-environment-${waitCount}`],
+        );
+      }
+      return `${pr.issue}-head-3`;
+    },
+    async repairFailedCI(pr, failure, attempt) {
+      events.push(
+        `repair:${pr.issue}:${attempt}:${failure.headOid}:${failure.failedChecks.join(",")}`,
+      );
+      return `${pr.issue}-head-${attempt + 1}`;
+    },
+    async rebaseOntoLatestBase(pr, checkedHeadOid) {
+      events.push(`rebase:${pr.issue}:${checkedHeadOid}`);
+      return checkedHeadOid;
+    },
+    async mergeWithRebase(pr, checkedHeadOid) {
+      events.push(`merge:${pr.issue}:${checkedHeadOid}`);
+    },
+    async verifyMerged(pr) {
+      events.push(`verify:${pr.issue}`);
+    },
+  };
+
+  const results = await mergeReviewedPullRequests([pullRequest(56)], operations);
+
+  assert.deepEqual(results, [{ issue: 56, pr: 156, status: "merged" }]);
+  assert.deepEqual(events, [
+    "wait:56:1",
+    "repair:56:1:56-head-1:test-environment-1",
+    "wait:56:2",
+    "repair:56:2:56-head-2:test-environment-2",
+    "wait:56:3",
+    "rebase:56:56-head-3",
+    "merge:56:56-head-3",
+    "verify:56",
+  ]);
+});
+
+test("rebase 前后的 CI repair 共用同一重试预算并接受 repair 产生的新 head", async () => {
+  const events: string[] = [];
+  let waitCount = 0;
+  const operations: MergeOperations = {
+    maxCIRepairAttempts: 2,
+    async waitForCI(pr) {
+      waitCount += 1;
+      events.push(`wait:${waitCount}`);
+      if (waitCount === 1) {
+        throw new PullRequestCIFailedError(pr.number, "head-1", ["quality"]);
+      }
+      if (waitCount === 2) return "head-2";
+      if (waitCount === 3) {
+        throw new PullRequestCIFailedError(
+          pr.number,
+          "head-rebased",
+          ["test-environment"],
+        );
+      }
+      return "head-3";
+    },
+    async repairFailedCI(_pr, _failure, attempt) {
+      events.push(`repair:${attempt}`);
+      return attempt === 1 ? "head-2" : "head-3";
+    },
+    async rebaseOntoLatestBase() {
+      events.push("rebase");
+      return "head-rebased";
+    },
+    async mergeWithRebase(_pr, checkedHeadOid) {
+      events.push(`merge:${checkedHeadOid}`);
+    },
+    async verifyMerged() {
+      events.push("verify");
+    },
+  };
+
+  const results = await mergeReviewedPullRequests([pullRequest(56)], operations);
+
+  assert.deepEqual(results, [{ issue: 56, pr: 156, status: "merged" }]);
+  assert.deepEqual(events, [
+    "wait:1",
+    "repair:1",
+    "wait:2",
+    "rebase",
+    "wait:3",
+    "repair:2",
+    "wait:4",
+    "merge:head-3",
+    "verify",
+  ]);
+});
+
+test("CI repair 达到上限后保持 blocked 且不再启动 agent", async () => {
+  const attempts: number[] = [];
+  let head = "head-1";
+  const operations: MergeOperations = {
+    maxCIRepairAttempts: 2,
+    async waitForCI(pr) {
+      throw new PullRequestCIFailedError(pr.number, head, ["quality"]);
+    },
+    async repairFailedCI(_pr, _failure, attempt) {
+      attempts.push(attempt);
+      head = `head-${attempt + 1}`;
+      return head;
+    },
+    async rebaseOntoLatestBase() {
+      throw new Error("不应执行");
+    },
+    async mergeWithRebase() {
+      throw new Error("不应执行");
+    },
+    async verifyMerged() {
+      throw new Error("不应执行");
+    },
+  };
+
+  const results = await mergeReviewedPullRequests([pullRequest(56)], operations);
+
+  assert.deepEqual(attempts, [1, 2]);
+  assert.deepEqual(results, [
+    {
+      issue: 56,
+      pr: 156,
+      status: "blocked",
+      detail: "PR #156 CI 失败：quality",
+    },
+  ]);
+});
+
 test("CI 只有在存在检查且全部成功结束时才通过", () => {
   assert.equal(classifyCI([]), "pending");
   assert.equal(
@@ -142,11 +283,11 @@ test("rebase 后 head 被再次替换时拒绝合并", async () => {
     await mergeReviewedPullRequests([pullRequest(53)], operations),
     [
       {
-        issue: 53,
-        pr: 153,
-        status: "blocked",
-        detail: "PR #153 在 rebase 后 head 已变化。",
-      },
+      issue: 53,
+      pr: 153,
+      status: "blocked",
+      detail: "PR #153 等待 CI 期间 head 已变化。",
+    },
     ],
   );
 });
