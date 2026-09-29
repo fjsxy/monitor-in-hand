@@ -23,6 +23,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -608,6 +609,319 @@ spec:
 			return nil
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
 	}, SpecTimeout(20*time.Minute))
+
+	It(fmt.Sprintf("[%s] 覆盖多实例隔离、漂移修复与冲突恢复", ownershipScenarioID()), func(ctx SpecContext) {
+		const (
+			primaryInstance   = "gh53.primary"
+			primaryInstanceID = "gh53-primary-dc21f262"
+			secondaryInstance = "gh53-secondary"
+			primaryManaged    = "ksm-gh53-primary-dc21f262"
+			secondaryManaged  = "ksm-gh53-secondary"
+		)
+
+		By("在同一 targetNamespace 创建两个独立实例并等待真实 workload 可用")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+---
+apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+`, primaryInstance, targetNamespace, secondaryInstance, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		waitForInstanceReady(ctx, primaryInstance, primaryManaged)
+		waitForInstanceReady(ctx, secondaryInstance, secondaryManaged)
+
+		By("验证两套 Service、Pod endpoints 和 RBAC 只使用自己的稳定实例身份")
+		for _, expected := range []struct {
+			instance   string
+			instanceID string
+			managed    string
+		}{{primaryInstance, primaryInstanceID, primaryManaged}, {secondaryInstance, secondaryInstance, secondaryManaged}} {
+			service, err := getObject[corev1.Service](ctx, targetNamespace, "service", expected.managed)
+			Expect(err).NotTo(HaveOccurred())
+			assertStableLabels(service, expected.instanceID)
+			Expect(service.Spec.Selector).To(Equal(map[string]string{
+				"app.kubernetes.io/name":         "kube-state-metrics",
+				"app.kubernetes.io/instance":     expected.instanceID,
+				"monitor-in-hand/endpoint-group": "default",
+			}))
+			Expect(service.Spec.Selector).NotTo(HaveKey("app.kubernetes.io/version"))
+			Expect(service.Spec.Selector).NotTo(HaveKey("monitor-in-hand/role"))
+			Eventually(func() error {
+				endpoints, getErr := getObject[corev1.Endpoints](ctx, targetNamespace, "endpoints", expected.managed)
+				if getErr != nil {
+					return getErr
+				}
+				if len(endpoints.Subsets) != 1 || len(endpoints.Subsets[0].Addresses) != 1 || endpoints.Subsets[0].Addresses[0].TargetRef == nil {
+					return fmt.Errorf("%s endpoints 尚未收敛: %+v", expected.managed, endpoints.Subsets)
+				}
+				pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", endpoints.Subsets[0].Addresses[0].TargetRef.Name)
+				if getErr != nil {
+					return getErr
+				}
+				assertStableLabels(pod, expected.instanceID)
+				if pod.Labels["app.kubernetes.io/instance"] != expected.instanceID || pod.Labels["monitor-in-hand/endpoint-group"] != "default" {
+					return fmt.Errorf("%s endpoint Pod labels=%v", expected.managed, pod.Labels)
+				}
+				return nil
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+			role, err := getObject[rbacv1.ClusterRole](ctx, "", "clusterrole", expected.managed)
+			Expect(err).NotTo(HaveOccurred())
+			assertStableLabels(role, expected.instanceID)
+			Expect(role.OwnerReferences).To(HaveLen(1))
+			binding, err := getObject[rbacv1.ClusterRoleBinding](ctx, "", "clusterrolebinding", expected.managed)
+			Expect(err).NotTo(HaveOccurred())
+			assertStableLabels(binding, expected.instanceID)
+			Expect(binding.Subjects).To(ContainElement(SatisfyAll(HaveField("Name", expected.managed), HaveField("Namespace", targetNamespace))))
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", expected.managed)
+			Expect(err).NotTo(HaveOccurred())
+			assertStableLabels(deployment, expected.instanceID)
+			serviceAccount, err := getObject[corev1.ServiceAccount](ctx, targetNamespace, "serviceaccount", expected.managed)
+			Expect(err).NotTo(HaveOccurred())
+			assertStableLabels(serviceAccount, expected.instanceID)
+		}
+
+		By("在不同 targetNamespace 创建同类实例，验证 namespaced 资源落点与 cluster-scoped RBAC 仍独立")
+		crossNamespace := "mih-gh53-cross-" + strings.ReplaceAll(active.kubernetes, ".", "")
+		const crossInstance = "gh53-cross-namespace"
+		const crossManaged = "ksm-gh53-cross-namespace"
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "create", "namespace", crossNamespace)
+		crossManifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+`, crossInstance, crossNamespace)
+		runWithInput(ctx, repoRoot, crossManifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		Eventually(func() error {
+			deployment, getErr := getObject[appsv1.Deployment](ctx, crossNamespace, "deployment", crossManaged)
+			if getErr != nil {
+				return getErr
+			}
+			if deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("跨 Namespace Deployment 尚未可用")
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+		Expect(objectAbsent(ctx, targetNamespace, "deployment", crossManaged)).To(Succeed())
+		crossBinding, err := getObject[rbacv1.ClusterRoleBinding](ctx, "", "clusterrolebinding", crossManaged)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(crossBinding.Subjects).To(ContainElement(SatisfyAll(HaveField("Name", crossManaged), HaveField("Namespace", crossNamespace))))
+
+		By("修改已拥有 Service 并删除已拥有 Deployment，验证 direct-resource watch 自动修复")
+		primaryDeployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", primaryManaged)
+		Expect(err).NotTo(HaveOccurred())
+		oldDeploymentUID := primaryDeployment.UID
+		driftPatch := `{"metadata":{"labels":{"drifted":"true"}},"spec":{"selector":{"drifted":"true"}}}`
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+			"patch", "service/"+primaryManaged, "--type=merge", "--patch", driftPatch)
+		Eventually(func() error {
+			service, getErr := getObject[corev1.Service](ctx, targetNamespace, "service", primaryManaged)
+			if getErr != nil {
+				return getErr
+			}
+			selector := service.Spec.Selector
+			if _, drifted := service.Labels["drifted"]; drifted || len(selector) != 3 ||
+				selector["app.kubernetes.io/name"] != "kube-state-metrics" ||
+				selector["app.kubernetes.io/instance"] != primaryInstanceID ||
+				selector["monitor-in-hand/endpoint-group"] != "default" {
+				return fmt.Errorf("Service 漂移尚未修复: labels=%v selector=%v", service.Labels, service.Spec.Selector)
+			}
+			return nil
+		}, time.Minute, time.Second).Should(Succeed())
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+			"delete", "deployment/"+primaryManaged, "--wait=true")
+		Eventually(func() error {
+			deployment, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", primaryManaged)
+			if getErr != nil {
+				return getErr
+			}
+			if deployment.UID == oldDeploymentUID || deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("重建 Deployment 尚未可用: oldUID=%s currentUID=%s available=%d", oldDeploymentUID, deployment.UID, deployment.Status.AvailableReplicas)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+
+		By("分别以无 owner、错误 owner 和同名旧 UID 预占身份，验证完整所有权分类与冲突恢复")
+		secondaryObject, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", secondaryInstance)
+		Expect(err).NotTo(HaveOccurred())
+		conflicts := []struct {
+			class     string
+			instance  string
+			managed   string
+			ownerYAML string
+			ownerUID  string
+		}{
+			{class: "none", instance: "gh53-conflict-none", managed: "ksm-gh53-conflict-none"},
+			{
+				class: "wrong", instance: "gh53-conflict-wrong", managed: "ksm-gh53-conflict-wrong", ownerUID: string(secondaryObject.UID),
+				ownerYAML: fmt.Sprintf("  ownerReferences:\n  - apiVersion: monitoring.fjsxy.github.io/v1alpha1\n    kind: KubeStateMetrics\n    name: %s\n    uid: %s\n    controller: true", secondaryInstance, secondaryObject.UID),
+			},
+			{
+				class: "old", instance: "gh53-conflict-old", managed: "ksm-gh53-conflict-old", ownerUID: "uid-from-deleted-cr",
+				ownerYAML: "  finalizers:\n  - tests.monitor-in-hand/preserve-old-uid\n  ownerReferences:\n  - apiVersion: monitoring.fjsxy.github.io/v1alpha1\n    kind: KubeStateMetrics\n    name: gh53-conflict-old\n    uid: uid-from-deleted-cr\n    controller: true",
+			},
+		}
+		for _, conflict := range conflicts {
+			By(fmt.Sprintf("预占 %s 分类的 ClusterRole 身份", conflict.class))
+			conflictRole := fmt.Sprintf(`apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: %s
+  labels:
+    preserve: %q
+%s
+rules:
+  - apiGroups: ["example.test"]
+    resources: ["sentinels"]
+    verbs: ["get"]
+`, conflict.managed, conflict.class, conflict.ownerYAML)
+			runWithInput(ctx, repoRoot, conflictRole, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+			conflictManifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+`, conflict.instance, targetNamespace)
+			runWithInput(ctx, repoRoot, conflictManifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+			Eventually(func() error {
+				instance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", conflict.instance)
+				if getErr != nil {
+					return getErr
+				}
+				if !conditionMatches(instance.Status.Conditions, "Degraded", metav1.ConditionTrue, "ResourceConflict") || len(instance.Status.ManagedResources) != 0 {
+					return fmt.Errorf("%s 冲突 status 尚未收敛: %+v", conflict.class, instance.Status)
+				}
+				return nil
+			}, time.Minute, time.Second).Should(Succeed())
+			preservedRole, getErr := getObject[rbacv1.ClusterRole](ctx, "", "clusterrole", conflict.managed)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(preservedRole.Labels).To(Equal(map[string]string{"preserve": conflict.class}))
+			Expect(preservedRole.Rules).To(ConsistOf(rbacv1.PolicyRule{APIGroups: []string{"example.test"}, Resources: []string{"sentinels"}, Verbs: []string{"get"}}))
+			if conflict.ownerUID == "" {
+				Expect(preservedRole.OwnerReferences).To(BeEmpty())
+			} else {
+				Expect(preservedRole.OwnerReferences).To(ContainElement(HaveField("UID", types.UID(conflict.ownerUID))))
+			}
+			Expect(objectAbsent(ctx, targetNamespace, "deployment", conflict.managed)).To(Succeed())
+			Expect(objectAbsent(ctx, targetNamespace, "serviceaccount", conflict.managed)).To(Succeed())
+
+			By(fmt.Sprintf("移除 %s 冲突后等待定时重试恢复", conflict.class))
+			if conflict.class == "old" {
+				run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "patch", "clusterrole/"+conflict.managed,
+					"--type=merge", "--patch", `{"metadata":{"finalizers":[]}}`)
+			}
+			run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "clusterrole/"+conflict.managed,
+				"--ignore-not-found=true", "--wait=true")
+			waitForInstanceReady(ctx, conflict.instance, conflict.managed)
+
+			if conflict.class == "old" {
+				By("将恢复后的 Deployment 改为旧 CR UID owner，验证 finalizer 不删除它")
+				oldOwnerPatch := fmt.Sprintf(`{"metadata":{"annotations":{"preserve":"old-uid"},"finalizers":["tests.monitor-in-hand/preserve-old-uid"],"ownerReferences":[{"apiVersion":"monitoring.fjsxy.github.io/v1alpha1","kind":"KubeStateMetrics","name":%q,"uid":"uid-from-deleted-cr","controller":true}]}}`, conflict.instance)
+				run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+					"patch", "deployment/"+conflict.managed, "--type=merge", "--patch", oldOwnerPatch)
+				run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "kubestatemetrics/"+conflict.instance, "--wait=true", "--timeout=180s")
+				preservedDeployment, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", conflict.managed)
+				Expect(getErr).NotTo(HaveOccurred())
+				Expect(preservedDeployment.Annotations).To(HaveKeyWithValue("preserve", "old-uid"))
+				run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+					"patch", "deployment/"+conflict.managed, "--type=merge", "--patch", `{"metadata":{"finalizers":[]}}`)
+				run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+					"delete", "deployment/"+conflict.managed, "--ignore-not-found=true", "--wait=true")
+			} else {
+				run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "kubestatemetrics/"+conflict.instance, "--wait=true", "--timeout=180s")
+			}
+		}
+
+		By("暂时撤销 Operator 的 Deployment 写权限，验证真实部分写入报告 ApplyFailed 且不回滚")
+		const managerRoleName = "monitor-in-hand-manager-role"
+		managerRole, err := getObject[rbacv1.ClusterRole](ctx, "", "clusterrole", managerRoleName)
+		Expect(err).NotTo(HaveOccurred())
+		originalManagerRules := managerRole.DeepCopy().Rules
+		restrictedManagerRules := managerRole.DeepCopy().Rules
+		for ruleIndex := range restrictedManagerRules {
+			rule := &restrictedManagerRules[ruleIndex]
+			if !contains(rule.APIGroups, "apps") || !contains(rule.Resources, "deployments") {
+				continue
+			}
+			verbs := make([]string, 0, len(rule.Verbs))
+			for _, verb := range rule.Verbs {
+				if verb != "create" && verb != "update" && verb != "patch" {
+					verbs = append(verbs, verb)
+				}
+			}
+			rule.Verbs = verbs
+		}
+		managerRoleRestricted := true
+		DeferCleanup(func() {
+			if managerRoleRestricted {
+				replaceClusterRoleRules(context.Background(), managerRoleName, originalManagerRules)
+			}
+		})
+		replaceClusterRoleRules(ctx, managerRoleName, restrictedManagerRules)
+		const partialInstance = "gh53-partial-apply"
+		const partialManaged = "ksm-gh53-partial-apply"
+		partialManifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+`, partialInstance, targetNamespace)
+		runWithInput(ctx, repoRoot, partialManifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		Eventually(func() error {
+			instance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", partialInstance)
+			if getErr != nil {
+				return getErr
+			}
+			if !conditionMatches(instance.Status.Conditions, "Degraded", metav1.ConditionTrue, "ApplyFailed") {
+				return fmt.Errorf("部分写入尚未报告 ApplyFailed: %+v", instance.Status)
+			}
+			return nil
+		}, time.Minute, time.Second).Should(Succeed())
+		_, err = getObject[corev1.ServiceAccount](ctx, targetNamespace, "serviceaccount", partialManaged)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[corev1.Service](ctx, targetNamespace, "service", partialManaged)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[rbacv1.ClusterRole](ctx, "", "clusterrole", partialManaged)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[rbacv1.ClusterRoleBinding](ctx, "", "clusterrolebinding", partialManaged)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(objectAbsent(ctx, targetNamespace, "deployment", partialManaged)).To(Succeed())
+
+		By("恢复 Operator 写权限，验证后续调谐保留已成功资源并补齐 workload")
+		partialService, err := getObject[corev1.Service](ctx, targetNamespace, "service", partialManaged)
+		Expect(err).NotTo(HaveOccurred())
+		partialServiceUID := partialService.UID
+		replaceClusterRoleRules(ctx, managerRoleName, originalManagerRules)
+		managerRoleRestricted = false
+		waitForInstanceReady(ctx, partialInstance, partialManaged)
+		partialService, err = getObject[corev1.Service](ctx, targetNamespace, "service", partialManaged)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(partialService.UID).To(Equal(partialServiceUID))
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "kubestatemetrics/"+partialInstance, "--wait=true", "--timeout=180s")
+
+		By("删除主实例，验证 finalizer 只清理其资源且不影响其他实例")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "kubestatemetrics/"+primaryInstance, "--wait=true", "--timeout=180s")
+		for _, resource := range []struct {
+			namespace string
+			kind      string
+		}{{targetNamespace, "deployment"}, {targetNamespace, "service"}, {targetNamespace, "serviceaccount"}, {"", "clusterrole"}, {"", "clusterrolebinding"}} {
+			Expect(objectAbsent(ctx, resource.namespace, resource.kind, primaryManaged)).To(Succeed())
+		}
+		waitForInstanceReady(ctx, secondaryInstance, secondaryManaged)
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "kubestatemetrics/"+crossInstance, "--wait=true", "--timeout=180s")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "namespace/"+crossNamespace, "--wait=true")
+	}, SpecTimeout(20*time.Minute))
 })
 
 func stableScenarioID() string {
@@ -635,6 +949,17 @@ func dynamicNamespaceScenarioID() string {
 		return "E2E-128-KSM-006"
 	}
 	return "E2E-UNSUPPORTED-KSM-006"
+}
+
+func ownershipScenarioID() string {
+	ids := map[string]string{
+		"1.19": "E2E-119-KSM-GH53-001",
+		"1.28": "E2E-128-KSM-GH53-001",
+	}
+	if id, supported := ids[os.Getenv("KUBERNETES_VERSION")]; supported {
+		return id
+	}
+	return "E2E-UNSUPPORTED-KSM-GH53-001"
 }
 
 func configurationScenarioID(sequence string) string {
@@ -737,18 +1062,24 @@ func assertVersionSecurity(podSpec corev1.PodSpec, security *corev1.SecurityCont
 }
 
 func assertManagedMetadata(object metav1.Object, ownerUID string) {
-	labels := object.GetLabels()
-	Expect(labels).To(SatisfyAll(
-		HaveKeyWithValue("app.kubernetes.io/name", "kube-state-metrics"),
-		HaveKeyWithValue("app.kubernetes.io/instance", instanceName),
-		HaveKeyWithValue("app.kubernetes.io/managed-by", "monitor-in-hand"),
-		HaveKeyWithValue("app.kubernetes.io/version", active.version),
-	))
+	assertStableLabels(object, instanceName)
 	owners := object.GetOwnerReferences()
 	Expect(owners).To(HaveLen(1))
 	Expect(string(owners[0].UID)).To(Equal(ownerUID))
 	Expect(owners[0].Controller).NotTo(BeNil())
 	Expect(*owners[0].Controller).To(BeTrue())
+}
+
+func assertStableLabels(object metav1.Object, expectedInstanceID string) {
+	labels := object.GetLabels()
+	Expect(labels).To(SatisfyAll(
+		HaveKeyWithValue("app.kubernetes.io/name", "kube-state-metrics"),
+		HaveKeyWithValue("app.kubernetes.io/instance", expectedInstanceID),
+		HaveKeyWithValue("app.kubernetes.io/managed-by", "monitor-in-hand"),
+		HaveKeyWithValue("app.kubernetes.io/version", active.version),
+		HaveKeyWithValue("monitor-in-hand/role", "collector"),
+		HaveKeyWithValue("monitor-in-hand/endpoint-group", "default"),
+	))
 }
 
 func conditionIsTrue(conditions []metav1.Condition, conditionType string, generation int64) bool {
@@ -987,6 +1318,15 @@ func getObject[T any](ctx context.Context, namespace, kind, name string) (*T, er
 		return nil, fmt.Errorf("解析 %s/%s: %w", kind, name, err)
 	}
 	return object, nil
+}
+
+func replaceClusterRoleRules(ctx context.Context, name string, rules []rbacv1.PolicyRule) {
+	role, err := getObject[rbacv1.ClusterRole](ctx, "", "clusterrole", name)
+	Expect(err).NotTo(HaveOccurred())
+	role.Rules = rules
+	manifest, err := json.Marshal(role)
+	Expect(err).NotTo(HaveOccurred())
+	runWithInput(ctx, repoRoot, string(manifest), kubectlBin, "--context", kubeContext, "replace", "--filename", "-")
 }
 
 func run(ctx context.Context, dir string, extraEnv []string, name string, args ...string) {

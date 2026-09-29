@@ -28,8 +28,24 @@ import (
 
 type fixedServerVersion struct{ gitVersion string }
 
+type serviceCreateAfterWriteErrorClient struct {
+	client.Client
+	failed bool
+}
+
 func (f fixedServerVersion) ServerVersion() (*version.Info, error) {
 	return &version.Info{GitVersion: f.gitVersion}, nil
+}
+
+func (c *serviceCreateAfterWriteErrorClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
+	if _, ok := object.(*corev1.Service); ok && !c.failed {
+		c.failed = true
+		if err := c.Client.Create(ctx, object, options...); err != nil {
+			return err
+		}
+		return fmt.Errorf("injected ambiguous service apply failure")
+	}
+	return c.Client.Create(ctx, object, options...)
 }
 
 var _ = Describe("KubeStateMetrics reconciliation", func() {
@@ -228,6 +244,254 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(occupied.Rules).To(ConsistOf(rbacv1.PolicyRule{APIGroups: []string{"example.test"}, Resources: []string{"sentinels"}, Verbs: []string{"get"}}))
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.ServiceAccount{})).To(MatchError(ContainSubstring("not found")))
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(MatchError(ContainSubstring("not found")))
+	})
+
+	It("IT-KSM-GH53-001 同一与不同 targetNamespace 的多实例保持资源、状态与生命周期隔离", func() {
+		By("在共享和独立 Namespace 中准备三个不同业务身份的受管实例")
+		sharedNamespace := "it-gh53-shared-" + suffix
+		isolatedNamespace := "it-gh53-isolated-" + suffix
+		for _, namespace := range []string{sharedNamespace, isolatedNamespace} {
+			Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		}
+		instances := []*monitoringv1alpha1.KubeStateMetrics{
+			{ObjectMeta: metav1.ObjectMeta{Name: "gh53-shared-a-" + suffix}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: sharedNamespace}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "gh53-shared-b-" + suffix}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: sharedNamespace}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "gh53-isolated-" + suffix}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: isolatedNamespace}},
+		}
+		for _, instance := range instances {
+			Expect(testClient.Create(ctx, instance)).To(Succeed())
+			reconcile(instance.Name, "v1.28.15")
+		}
+
+		By("验证每个实例拥有独立 workload、Service endpoints 选择身份、RBAC 和 status")
+		for _, instance := range instances {
+			resourceName := ksm.ManagedResourceName(instance.Name)
+			deployment := &appsv1.Deployment{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: instance.Spec.TargetNamespace, Name: resourceName}, deployment)).To(Succeed())
+			Expect(deployment.OwnerReferences).To(ContainElement(HaveField("UID", instance.UID)))
+			expectStableManagedLabels(deployment.Labels, instance.Name, "2.11.0")
+			expectStableManagedLabels(deployment.Spec.Template.Labels, instance.Name, "2.11.0")
+			service := &corev1.Service{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: instance.Spec.TargetNamespace, Name: resourceName}, service)).To(Succeed())
+			expectStableManagedLabels(service.Labels, instance.Name, "2.11.0")
+			Expect(service.Spec.Selector).To(Equal(map[string]string{
+				"app.kubernetes.io/name":         "kube-state-metrics",
+				"app.kubernetes.io/instance":     instance.Name,
+				"monitor-in-hand/endpoint-group": "default",
+			}))
+			serviceAccount := &corev1.ServiceAccount{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: instance.Spec.TargetNamespace, Name: resourceName}, serviceAccount)).To(Succeed())
+			expectStableManagedLabels(serviceAccount.Labels, instance.Name, "2.11.0")
+			clusterRole := &rbacv1.ClusterRole{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, clusterRole)).To(Succeed())
+			expectStableManagedLabels(clusterRole.Labels, instance.Name, "2.11.0")
+			clusterRoleBinding := &rbacv1.ClusterRoleBinding{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, clusterRoleBinding)).To(Succeed())
+			expectStableManagedLabels(clusterRoleBinding.Labels, instance.Name, "2.11.0")
+			actual := &monitoringv1alpha1.KubeStateMetrics{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: instance.Name}, actual)).To(Succeed())
+			Expect(actual.Status.ManagedResources).To(HaveLen(5))
+		}
+
+		By("停用共享 Namespace 中的一个实例，验证其他实例的资源和状态不受影响")
+		first := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: instances[0].Name}, first)).To(Succeed())
+		first.Spec.Enabled = boolPointer(false)
+		Expect(testClient.Update(ctx, first)).To(Succeed())
+		reconcile(first.Name, "v1.28.15")
+		reconcile(first.Name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: first.Name}, first)).To(Succeed())
+		Expect(first.Status.Phase).To(Equal(monitoringv1alpha1.KubeStateMetricsPhaseDisabled))
+		for _, sibling := range instances[1:] {
+			resourceName := ksm.ManagedResourceName(sibling.Name)
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: sibling.Spec.TargetNamespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRole{})).To(Succeed())
+			actual := &monitoringv1alpha1.KubeStateMetrics{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: sibling.Name}, actual)).To(Succeed())
+			Expect(actual.Status.ManagedResources).To(HaveLen(5))
+			Expect(condition(actual, "Degraded").Status).To(Equal(metav1.ConditionFalse))
+		}
+	})
+
+	DescribeTable("IT-KSM-GH53-002 无 owner、错误 owner 与旧 CR UID 均报告 ResourceConflict 并可在冲突消失后恢复",
+		func(ownerClass string) {
+			By("准备当前 CR 和占用其期望 Service 身份的冲突对象")
+			namespace := "it-gh53-conflict-" + ownerClass + "-" + suffix
+			name := "gh53-conflict-" + ownerClass + "-" + suffix
+			resourceName := ksm.ManagedResourceName(name)
+			Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+			instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace}}
+			Expect(testClient.Create(ctx, instance)).To(Succeed())
+			owners := []metav1.OwnerReference(nil)
+			controllerOwner := true
+			switch ownerClass {
+			case "wrong":
+				owners = []metav1.OwnerReference{{APIVersion: monitoringv1alpha1.GroupVersion.String(), Kind: "KubeStateMetrics", Name: "another-instance", UID: types.UID("uid-another-instance"), Controller: &controllerOwner}}
+			case "old":
+				owners = []metav1.OwnerReference{{APIVersion: monitoringv1alpha1.GroupVersion.String(), Kind: "KubeStateMetrics", Name: name, UID: types.UID("uid-from-deleted-cr"), Controller: &controllerOwner}}
+			}
+			occupied := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace, Annotations: map[string]string{"preserve": ownerClass}, OwnerReferences: owners}, Spec: corev1.ServiceSpec{Selector: map[string]string{"preserve": "true"}, Ports: []corev1.ServicePort{{Name: "sentinel", Port: 9090}}}}
+			Expect(testClient.Create(ctx, occupied)).To(Succeed())
+			beforeResourceVersion := occupied.ResourceVersion
+
+			By("调谐并验证冲突对象未被修改、删除或接管，其余资源零写入")
+			reconcile(name, "v1.28.15")
+			actual := &monitoringv1alpha1.KubeStateMetrics{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			Expect(condition(actual, "Degraded")).To(SatisfyAll(HaveField("Status", metav1.ConditionTrue), HaveField("Reason", ksm.ReasonResourceConflict)))
+			Expect(testClient.Get(ctx, client.ObjectKeyFromObject(occupied), occupied)).To(Succeed())
+			Expect(occupied.ResourceVersion).To(Equal(beforeResourceVersion))
+			Expect(occupied.Annotations).To(HaveKeyWithValue("preserve", ownerClass))
+			Expect(occupied.Spec.Selector).To(Equal(map[string]string{"preserve": "true"}))
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.ServiceAccount{})).To(Satisfy(apierrors.IsNotFound))
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRole{})).To(Satisfy(apierrors.IsNotFound))
+
+			By("移除冲突对象后重试，验证当前实例创建全部直接受管资源")
+			Expect(testClient.Delete(ctx, occupied)).To(Succeed())
+			reconcile(name, "v1.28.15")
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			Expect(actual.Status.ManagedResources).To(HaveLen(5))
+			Expect(condition(actual, "Degraded").Status).To(Equal(metav1.ConditionFalse))
+		},
+		Entry("无 ownerReference", "none"),
+		Entry("其他实例 owner", "wrong"),
+		Entry("同名已删除 CR 的旧 UID", "old"),
+	)
+
+	It("IT-KSM-GH53-003 finalizer 只清理当前 CR UID 的直接受管资源并忽略 managedResources 污染", func() {
+		By("准备已收敛实例，将 Deployment 改为同名旧 UID owner 并向 status 注入非受管引用")
+		namespace := "it-gh53-finalizer-" + suffix
+		name := "gh53-finalizer-" + suffix
+		resourceName := ksm.ManagedResourceName(name)
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace}}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		controllerOwner := true
+		deployment.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: monitoringv1alpha1.GroupVersion.String(), Kind: "KubeStateMetrics", Name: name,
+			UID: types.UID("uid-from-deleted-cr"), Controller: &controllerOwner,
+		}}
+		deployment.Annotations = map[string]string{"preserve": "old-uid"}
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+		unrelated := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "gh53-status-only-" + suffix, Namespace: namespace}}
+		Expect(testClient.Create(ctx, unrelated)).To(Succeed())
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Status.ManagedResources = append(actual.Status.ManagedResources, monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "ConfigMap", Namespace: namespace, Name: unrelated.Name})
+		Expect(testClient.Status().Update(ctx, actual)).To(Succeed())
+
+		By("删除 CR 并调谐到 finalizer 完成")
+		Expect(testClient.Delete(ctx, actual)).To(Succeed())
+		reconcile(name, "version-must-not-be-read")
+		reconcile(name, "version-must-not-be-read")
+
+		By("验证当前 UID 的四类资源被清理，旧 UID 对象与 status-only 对象保留")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		Expect(deployment.Annotations).To(HaveKeyWithValue("preserve", "old-uid"))
+		Expect(testClient.Get(ctx, client.ObjectKeyFromObject(unrelated), unrelated)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.Service{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRole{})).To(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("IT-KSM-GH53-004 多资源写入部分失败时保留已写入资源并在后续调谐继续收敛", func() {
+		By("使用真实 API Server 准备实例，在 Service 已持久化后注入一次模糊写入错误")
+		namespace := "it-gh53-partial-" + suffix
+		name := "gh53-partial-" + suffix
+		resourceName := ksm.ManagedResourceName(name)
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace}}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		failingClient := &serviceCreateAfterWriteErrorClient{Client: testClient}
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{Client: failingClient, ServerVersion: fixedServerVersion{gitVersion: "v1.28.15"}}
+		request := ctrl.Request{NamespacedName: types.NamespacedName{Name: name}}
+		_, err := reconciler.Reconcile(ctx, request)
+		Expect(err).To(MatchError(ContainSubstring("injected ambiguous service apply failure")))
+
+		By("验证失败前与模糊成功的资源保留，未执行的 Deployment 不存在且 status 报告 ApplyFailed")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.ServiceAccount{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRole{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: resourceName}, &rbacv1.ClusterRoleBinding{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.Service{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Degraded")).To(SatisfyAll(HaveField("Status", metav1.ConditionTrue), HaveField("Reason", ksm.ReasonApplyFailed)))
+
+		By("重试同一 generation，验证不回滚已正确写入的资源并补齐 Deployment")
+		service := &corev1.Service{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		serviceUID := service.UID
+		_, err = reconciler.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.UID).To(Equal(serviceUID))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.ManagedResources).To(HaveLen(5))
+		Expect(condition(actual, "Degraded").Status).To(Equal(metav1.ConditionFalse))
+	})
+
+	It("IT-KSM-GH53-005 watch 直接受管资源并及时修复修改与删除漂移", func() {
+		By("启动真实 manager 与全部直接受管资源 watch")
+		manager, err := ctrl.NewManager(testConfig, ctrl.Options{Scheme: testScheme, Metrics: server.Options{BindAddress: "0"}, HealthProbeBindAddress: "0"})
+		Expect(err).NotTo(HaveOccurred())
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{Client: manager.GetClient(), ServerVersion: fixedServerVersion{gitVersion: "v1.28.15"}}
+		Expect(reconciler.SetupWithManager(manager)).To(Succeed())
+		managerContext, cancelManager := context.WithCancel(ctx)
+		managerDone := make(chan error, 1)
+		go func() { managerDone <- manager.Start(managerContext) }()
+		Expect(manager.GetCache().WaitForCacheSync(ctx)).To(BeTrue())
+		DeferCleanup(func() {
+			cancelManager()
+			Eventually(managerDone, 5*time.Second).Should(Receive(BeNil()))
+		})
+
+		By("创建实例并等待 manager 自动创建资源")
+		namespace := "it-gh53-watch-" + suffix
+		name := "gh53-watch-" + suffix
+		resourceName := ksm.ManagedResourceName(name)
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace}}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Succeed())
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.Service{})).To(Succeed())
+		}, 5*time.Second).Should(Succeed())
+
+		By("修改已拥有 Service 的可变字段，验证 owner watch 自动恢复声明状态")
+		service := &corev1.Service{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		service.Labels = map[string]string{"drifted": "true"}
+		service.Spec.Selector = map[string]string{"drifted": "true"}
+		Expect(testClient.Update(ctx, service)).To(Succeed())
+		Eventually(func(g Gomega) {
+			current := &corev1.Service{}
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, current)).To(Succeed())
+			g.Expect(current.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "monitor-in-hand"))
+			g.Expect(current.Labels).NotTo(HaveKey("drifted"))
+			g.Expect(current.Spec.Selector).To(Equal(map[string]string{
+				"app.kubernetes.io/name":         "kube-state-metrics",
+				"app.kubernetes.io/instance":     name,
+				"monitor-in-hand/endpoint-group": "default",
+			}))
+		}, 5*time.Second).Should(Succeed())
+
+		By("删除已拥有 Deployment，验证 delete watch 以新 UID 重建同一稳定身份")
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		oldUID := deployment.UID
+		Expect(testClient.Delete(ctx, deployment)).To(Succeed())
+		Eventually(func(g Gomega) {
+			current := &appsv1.Deployment{}
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, current)).To(Succeed())
+			g.Expect(current.UID).NotTo(Equal(oldUID))
+			g.Expect(current.OwnerReferences).To(ContainElement(HaveField("UID", instance.UID)))
+		}, 5*time.Second).Should(Succeed())
 	})
 
 	DescribeTable("IT-KSM-010 将 collectors、metric filter 与 podResources 贯通到 workload 和 status", func(gitVersion, caseSuffix string) {
@@ -780,6 +1044,17 @@ func condition(instance *monitoringv1alpha1.KubeStateMetrics, conditionType stri
 	}
 	Fail("condition not found: " + conditionType)
 	return metav1.Condition{}
+}
+
+func expectStableManagedLabels(labels map[string]string, instanceID, version string) {
+	Expect(labels).To(SatisfyAll(
+		HaveKeyWithValue("app.kubernetes.io/name", "kube-state-metrics"),
+		HaveKeyWithValue("app.kubernetes.io/instance", instanceID),
+		HaveKeyWithValue("app.kubernetes.io/managed-by", "monitor-in-hand"),
+		HaveKeyWithValue("app.kubernetes.io/version", version),
+		HaveKeyWithValue("monitor-in-hand/role", "collector"),
+		HaveKeyWithValue("monitor-in-hand/endpoint-group", "default"),
+	))
 }
 
 func boolPointer(value bool) *bool { return &value }
