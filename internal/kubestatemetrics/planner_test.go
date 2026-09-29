@@ -201,6 +201,61 @@ var _ = Describe("默认 Deployment 规划", func() {
 	})
 })
 
+var _ = Describe("受管实例 phase 推导", func() {
+	disabled := false
+	condition := func(conditionType string, status metav1.ConditionStatus, reasons ...string) metav1.Condition {
+		reason := "Test"
+		if len(reasons) > 0 {
+			reason = reasons[0]
+		}
+		return metav1.Condition{Type: conditionType, Status: status, Reason: reason, LastTransitionTime: metav1.Now()}
+	}
+
+	DescribeTable("UT-KSM-007 按生命周期优先级从删除状态与 conditions 推导 phase",
+		func(instance *monitoringv1alpha1.KubeStateMetrics, want monitoringv1alpha1.KubeStateMetricsPhase) {
+			Expect(ksm.DerivePhase(instance)).To(Equal(want))
+		},
+		Entry("删除不可被其他状态覆盖", &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &metav1.Time{Time: metav1.Now().Time}},
+			Status: monitoringv1alpha1.KubeStateMetricsStatus{Conditions: []metav1.Condition{
+				condition("Degraded", metav1.ConditionTrue),
+			}},
+		}, monitoringv1alpha1.KubeStateMetricsPhaseDeleting),
+		Entry("停用中的失败仍为 Disabling", &monitoringv1alpha1.KubeStateMetrics{
+			Status: monitoringv1alpha1.KubeStateMetricsStatus{Conditions: []metav1.Condition{
+				condition("Progressing", metav1.ConditionTrue, ksm.ReasonDisabling),
+				condition("Degraded", metav1.ConditionTrue),
+			}},
+		}, monitoringv1alpha1.KubeStateMetricsPhaseDisabling),
+		Entry("停用完成", &monitoringv1alpha1.KubeStateMetrics{
+			Status: monitoringv1alpha1.KubeStateMetricsStatus{Conditions: []metav1.Condition{
+				condition("Ready", metav1.ConditionFalse, ksm.ReasonDisabled),
+			}},
+		}, monitoringv1alpha1.KubeStateMetricsPhaseDisabled),
+		Entry("启用实例优先报告故障", &monitoringv1alpha1.KubeStateMetrics{
+			Status: monitoringv1alpha1.KubeStateMetricsStatus{Conditions: []metav1.Condition{
+				condition("Degraded", metav1.ConditionTrue),
+				condition("Progressing", metav1.ConditionTrue),
+				condition("Ready", metav1.ConditionTrue),
+			}},
+		}, monitoringv1alpha1.KubeStateMetricsPhaseDegraded),
+		Entry("无故障时优先报告调谐中", &monitoringv1alpha1.KubeStateMetrics{
+			Status: monitoringv1alpha1.KubeStateMetricsStatus{Conditions: []metav1.Condition{
+				condition("Progressing", metav1.ConditionTrue),
+				condition("Ready", metav1.ConditionTrue),
+			}},
+		}, monitoringv1alpha1.KubeStateMetricsPhaseReconciling),
+		Entry("已就绪", &monitoringv1alpha1.KubeStateMetrics{
+			Status: monitoringv1alpha1.KubeStateMetricsStatus{Conditions: []metav1.Condition{
+				condition("Ready", metav1.ConditionTrue),
+			}},
+		}, monitoringv1alpha1.KubeStateMetricsPhaseReady),
+		Entry("spec 停用但尚无已观察 conditions", &monitoringv1alpha1.KubeStateMetrics{
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{Enabled: &disabled},
+		}, monitoringv1alpha1.KubeStateMetricsPhasePending),
+	)
+})
+
 func policyRulesAllow(rules []rbacv1.PolicyRule, apiGroup, resource, verb string) bool {
 	for _, rule := range rules {
 		if (slices.Contains(rule.APIGroups, apiGroup) || slices.Contains(rule.APIGroups, "*")) &&

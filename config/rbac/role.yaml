@@ -42,6 +42,7 @@ rules:
   - services
   verbs:
   - create
+  - delete
   - get
   - list
   - patch
@@ -70,6 +71,7 @@ rules:
   - deployments
   verbs:
   - create
+  - delete
   - get
   - list
   - patch
@@ -139,6 +141,12 @@ rules:
 - apiGroups:
   - monitoring.fjsxy.github.io
   resources:
+  - kubestatemetrics/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - monitoring.fjsxy.github.io
+  resources:
   - kubestatemetrics/status
   verbs:
   - get
@@ -167,6 +175,7 @@ rules:
   - clusterroles
   verbs:
   - create
+  - delete
   - get
   - list
   - patch

@@ -30,6 +30,8 @@ const (
 	targetNamespace   = "monitor-in-hand-test"
 	instanceName      = "default-deployment"
 	managedName       = "ksm-default-deployment"
+	lifecycleName     = "lifecycle"
+	lifecycleManaged  = "ksm-lifecycle"
 )
 
 type scenario struct {
@@ -191,6 +193,130 @@ spec:
 		By("通过真实 Service 端口读取指标，确认 kube-state-metrics 可用")
 		assertMetricsAvailable(ctx)
 	}, SpecTimeout(15*time.Minute))
+
+	It(fmt.Sprintf("[%s] 覆盖停用、挂起、恢复与 finalizer 删除阻塞", lifecycleScenarioID()), func(ctx SpecContext) {
+		By("创建独立的生命周期受管实例并等待其就绪")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+`, lifecycleName, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		Eventually(func() error {
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", lifecycleName)
+			if err != nil {
+				return err
+			}
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", lifecycleManaged)
+			if err != nil {
+				return err
+			}
+			if instance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("生命周期实例尚未就绪: phase=%s available=%d", instance.Status.Phase, deployment.Status.AvailableReplicas)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+
+		By("停用实例并确认全部五类直接受管资源消失，CR 保留为 Disabled")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "patch", "kubestatemetrics/"+lifecycleName,
+			"--type=merge", "--patch", `{"spec":{"enabled":false}}`)
+		Eventually(func() error {
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", lifecycleName)
+			if err != nil {
+				return err
+			}
+			if instance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseDisabled || instance.Status.ObservedGeneration != instance.Generation {
+				return fmt.Errorf("status 尚未 Disabled: phase=%s observed=%d generation=%d", instance.Status.Phase, instance.Status.ObservedGeneration, instance.Generation)
+			}
+			return allLifecycleResourcesAbsent(ctx)
+		}, 2*time.Minute, time.Second).Should(Succeed())
+
+		By("重新启用并等待当前声明重建完整 workload")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "patch", "kubestatemetrics/"+lifecycleName,
+			"--type=merge", "--patch", `{"spec":{"enabled":true}}`)
+		Eventually(func() error {
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", lifecycleName)
+			if err != nil {
+				return err
+			}
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", lifecycleManaged)
+			if err != nil {
+				return err
+			}
+			if instance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("重新启用尚未就绪: phase=%s available=%d", instance.Status.Phase, deployment.Status.AvailableReplicas)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+
+		By("挂起实例并确认只删除 Deployment，保留 Service、ServiceAccount 与 RBAC")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "patch", "kubestatemetrics/"+lifecycleName,
+			"--type=merge", "--patch", `{"spec":{"suspended":true}}`)
+		Eventually(func() error {
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", lifecycleName)
+			if err != nil {
+				return err
+			}
+			if instance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady ||
+				!conditionMatches(instance.Status.Conditions, "Ready", metav1.ConditionTrue, "Suspended") ||
+				!conditionMatches(instance.Status.Conditions, "Available", metav1.ConditionFalse, "Suspended") {
+				return fmt.Errorf("挂起 status 尚未收敛: phase=%s conditions=%v", instance.Status.Phase, instance.Status.Conditions)
+			}
+			return objectAbsent(ctx, targetNamespace, "deployment", lifecycleManaged)
+		}, 2*time.Minute, time.Second).Should(Succeed())
+		_, err := getObject[corev1.Service](ctx, targetNamespace, "service", lifecycleManaged)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[corev1.ServiceAccount](ctx, targetNamespace, "serviceaccount", lifecycleManaged)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[rbacv1.ClusterRole](ctx, "", "clusterrole", lifecycleManaged)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[rbacv1.ClusterRoleBinding](ctx, "", "clusterrolebinding", lifecycleManaged)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("恢复 workload 后设置阻塞 finalizer，再删除 CR")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "patch", "kubestatemetrics/"+lifecycleName,
+			"--type=merge", "--patch", `{"spec":{"suspended":false}}`)
+		Eventually(func() error {
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", lifecycleManaged)
+			if err != nil {
+				return err
+			}
+			if deployment.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("恢复后的 Deployment availableReplicas=%d", deployment.Status.AvailableReplicas)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+			"patch", "deployment/"+lifecycleManaged, "--type=merge", "--patch", `{"metadata":{"finalizers":["tests.monitor-in-hand/block-deletion"]}}`)
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "delete", "kubestatemetrics/"+lifecycleName, "--wait=false")
+
+		By("确认受管资源阻塞期间 CR 保持 Deleting 和清理 finalizer")
+		Eventually(func() error {
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", lifecycleName)
+			if err != nil {
+				return err
+			}
+			deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", lifecycleManaged)
+			if err != nil {
+				return err
+			}
+			if instance.DeletionTimestamp.IsZero() || instance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseDeleting ||
+				!contains(instance.Finalizers, "monitoring.fjsxy.github.io/kubestatemetrics-cleanup") || deployment.DeletionTimestamp.IsZero() {
+				return fmt.Errorf("删除尚未被 finalizer 正确阻塞: phase=%s crFinalizers=%v deploymentDeleting=%t",
+					instance.Status.Phase, instance.Finalizers, !deployment.DeletionTimestamp.IsZero())
+			}
+			return nil
+		}, 2*time.Minute, time.Second).Should(Succeed())
+
+		By("解除受管资源阻塞，确认清理完成后 CR 才消失")
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+			"patch", "deployment/"+lifecycleManaged, "--type=merge", "--patch", `{"metadata":{"finalizers":[]}}`)
+		Eventually(func() error {
+			return objectAbsent(ctx, "", "kubestatemetrics", lifecycleName)
+		}, 2*time.Minute, time.Second).Should(Succeed())
+	}, SpecTimeout(20*time.Minute))
 })
 
 func stableScenarioID() string {
@@ -198,6 +324,16 @@ func stableScenarioID() string {
 		return selected.id
 	}
 	return "E2E-UNSUPPORTED-KSM-001"
+}
+
+func lifecycleScenarioID() string {
+	if active.kubernetes == "1.19" {
+		return "E2E-119-KSM-002"
+	}
+	if active.kubernetes == "1.28" {
+		return "E2E-128-KSM-002"
+	}
+	return "E2E-UNSUPPORTED-KSM-002"
 }
 
 func scenarioFor(version string) scenario {
@@ -286,6 +422,58 @@ func assertManagedMetadata(object metav1.Object, ownerUID string) {
 func conditionIsTrue(conditions []metav1.Condition, conditionType string, generation int64) bool {
 	for _, condition := range conditions {
 		if condition.Type == conditionType && condition.Status == metav1.ConditionTrue && condition.ObservedGeneration == generation {
+			return true
+		}
+	}
+	return false
+}
+
+func conditionMatches(conditions []metav1.Condition, conditionType string, status metav1.ConditionStatus, reason string) bool {
+	for _, condition := range conditions {
+		if condition.Type == conditionType && condition.Status == status && condition.Reason == reason {
+			return true
+		}
+	}
+	return false
+}
+
+func allLifecycleResourcesAbsent(ctx context.Context) error {
+	for _, resource := range []struct {
+		namespace string
+		kind      string
+	}{
+		{targetNamespace, "deployment"},
+		{targetNamespace, "service"},
+		{targetNamespace, "serviceaccount"},
+		{"", "clusterrole"},
+		{"", "clusterrolebinding"},
+	} {
+		if err := objectAbsent(ctx, resource.namespace, resource.kind, lifecycleManaged); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func objectAbsent(ctx context.Context, namespace, kind, name string) error {
+	args := []string{"--context", kubeContext}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+	args = append(args, "get", kind+"/"+name)
+	output, err := exec.CommandContext(ctx, kubectlBin, args...).CombinedOutput()
+	if err == nil {
+		return fmt.Errorf("%s/%s 仍然存在", kind, name)
+	}
+	if !strings.Contains(string(output), "NotFound") && !strings.Contains(string(output), "not found") {
+		return fmt.Errorf("检查 %s/%s 是否消失: %w: %s", kind, name, err, output)
+	}
+	return nil
+}
+
+func contains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
 			return true
 		}
 	}

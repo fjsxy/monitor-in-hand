@@ -113,6 +113,7 @@ func run(ctx context.Context, healthProbeBindAddress, logLevelText string) error
 	if err := (&ksmcontroller.KubeStateMetricsReconciler{
 		Client:        mgr.GetClient(),
 		ServerVersion: apiDiscovery,
+		Recorder:      mgr.GetEventRecorderFor("kubestatemetrics-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("注册 KubeStateMetrics controller: %w", err)
 	}

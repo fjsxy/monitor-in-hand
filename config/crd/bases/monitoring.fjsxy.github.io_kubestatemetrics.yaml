@@ -67,13 +67,13 @@ spec:
                 type: object
               enabled:
                 default: true
-                description: Enabled defaults to true. Full disable lifecycle behavior
-                  is delivered separately.
+                description: Enabled controls whether directly managed resources exist
+                  and defaults to true.
                 type: boolean
               suspended:
                 default: false
-                description: Suspended defaults to false. Full suspend lifecycle behavior
-                  is delivered separately.
+                description: Suspended stops the workload while retaining its Service,
+                  ServiceAccount, and RBAC.
                 type: boolean
               targetNamespace:
                 description: TargetNamespace must name an existing Namespace. The
@@ -186,6 +186,10 @@ spec:
                 description: KubeStateMetricsPhase summarizes the reconciliation state
                   of a managed instance.
                 enum:
+                - Pending
+                - Deleting
+                - Disabling
+                - Disabled
                 - Reconciling
                 - Ready
                 - Degraded
