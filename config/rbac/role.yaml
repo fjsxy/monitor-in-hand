@@ -61,7 +61,6 @@ rules:
   resources:
   - daemonsets
   - replicasets
-  - statefulsets
   verbs:
   - list
   - watch
@@ -69,6 +68,7 @@ rules:
   - apps
   resources:
   - deployments
+  - statefulsets
   verbs:
   - create
   - delete
@@ -173,6 +173,8 @@ rules:
   resources:
   - clusterrolebindings
   - clusterroles
+  - rolebindings
+  - roles
   verbs:
   - create
   - delete
@@ -180,14 +182,6 @@ rules:
   - list
   - patch
   - update
-  - watch
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
-  - rolebindings
-  - roles
-  verbs:
-  - list
   - watch
 - apiGroups:
   - storage.k8s.io

@@ -30,6 +30,15 @@
 | `UT-KSM-GH53-003` | #53 | controller/Kubernetes I/O | 通用 | finalizer 删除带有已分类对象 UID 前置条件，竞态窗口中的同名冲突替换对象不被误删；managedResources 不参与所有权判定 | Go test failure | `go test ./internal/controller` |
 | `UT-KSM-GH53-004` | #53 | controller/Kubernetes I/O | 通用 | 模糊部分写入返回 `ApplyFailed`，已持久化资源不回滚，后续调谐从当前状态继续收敛 | Go test failure | `go test ./internal/controller` |
 | `UT-KSM-GH53-005` | #53 | controller/Kubernetes I/O | 通用 | 同 Namespace 多实例的稳定身份和 owner UID 隔离；已拥有 Service 漂移恢复；旧 UID 冲突保持原样并可恢复；停用一个实例不影响另一个 | Go test failure | `go test ./internal/controller` |
+| `UT-KSM-GH56-001` | #56 | 纯规划 | 1.19、1.28 | 判别 union 拒绝 mode/分支不匹配与 `shards < 2`，返回 `InvalidSpec` 且零资源 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-GH56-002` | #56 | 纯规划 | 1.19、1.28 | 规划指定副本数的 StatefulSet、自动分片参数、单一 headless Service、Role/RoleBinding，并统一继承 collector/metric/namespace/resources | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-GH56-003` | #56 | controller 边界 | 通用 | 旧 Deployment 删除失败时不创建 StatefulSet，status 同时报告 `SwitchingDeploymentMode` 阶段、`DeleteFailed` 与真实旧 workload 可用性 | Go test failure、status | `go test ./internal/controller` |
+| `UT-KSM-GH56-004` | #56 | controller 边界 | 通用 | 旧 workload 读取失败时保留上次观测事实，status 以当前 generation 报告 `SwitchingDeploymentMode` 和 `ObservationFailed` | Go test failure、status | `go test ./internal/controller` |
+| `UT-KSM-GH56-005` | #56 | controller 边界 | 通用 | 切回 Deployment 时读取待清理分片 RBAC 失败，status 仍报告 `SwitchingDeploymentMode` 和 `ObservationFailed` | Go test failure、status | `go test ./internal/controller` |
+| `UT-KSM-GH56-006` | #56 | controller 边界 | 通用 | 资源写入后读取 StatefulSet 可用副本失败，status 报告当前 generation 的 `ObservationFailed` 而非留下成功或空白状态 | Go test failure、status | `go test ./internal/controller` |
+| `UT-KSM-GH56-007` | #56 | controller 边界 | 通用 | topology 所有权预检的 API 读取失败时，status 仍报告当前 generation 的 `SwitchingDeploymentMode` 和 `ObservationFailed` | Go test failure、status | `go test ./internal/controller` |
+| `UT-KSM-GH56-008` | #56 | controller 边界 | 通用 | 检查终止中受管资源的 API 读取失败时，status 仍报告当前 generation 的 `SwitchingDeploymentMode` 和 `ObservationFailed` | Go test failure、status | `go test ./internal/controller` |
+| `UT-KSM-GH56-009` | #56 | controller 边界 | 通用 | 资源问题已识别但回写 status 前的实际 topology 观测又失败时，以 `ObservationFailed` 落盘切换阶段 | Go test failure、status | `go test ./internal/controller` |
 
 ## HELM
 
@@ -40,8 +49,8 @@
 | `HELM-003` | #49 | Helm/健康端点 | Chart | health listener、container port、liveness 与 readiness 使用同一可配置端口 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
 | `HELM-004` | #49 | Helm/values schema | Chart | render 阶段拒绝特权或越界端口、不支持的日志级别、Windows selector 冲突与未声明 values | Ginkgo failure、Helm error | `make test-helm HELM=helm` |
 | `HELM-005` | #49 | Helm/配置面 | Chart | 仅开放约定的 scheduling、resources、health port 与 log level，且自定义值准确下发 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
-| `HELM-006` | #51、#52、#54 | Helm/生成物 | Chart | Helm CRD 与 Kubebuilder 生成源逐字同步，并包含 lifecycle、deployment、collectors、metricFilter、podResources 的 schema/defaults 且不暴露原始参数透传 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
-| `HELM-007` | #51、#52 | Helm/RBAC | Chart | manager 具有 CR status/finalizer、默认 Deployment 与生命周期清理所需权限，且不含 Prometheus Operator API 权限 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
+| `HELM-006` | #51、#52、#54、#56 | Helm/生成物 | Chart | Helm CRD 与 Kubebuilder 生成源逐字同步，并包含 lifecycle、deployment 判别 union、collectors、metricFilter、podResources 的 schema/defaults 且不暴露原始参数透传 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
+| `HELM-007` | #51、#52、#56 | Helm/RBAC | Chart | manager 具有 CR status/finalizer、Deployment/StatefulSet、cluster/namespaced RBAC 与生命周期清理所需权限，且不含 Prometheus Operator API 权限 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
 
 ## IT
 
@@ -69,6 +78,11 @@
 | `IT-KSM-GH53-003` | #53 | envtest | API Server 1.28 | finalizer 只清理当前 CR UID 的稳定直接身份，保留旧 UID 同名对象和仅出现于 managedResources 的对象 | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-GH53-004` | #53 | envtest | API Server 1.28 | 真实 API Server 中的多资源部分写入保留成功对象、报告 `ApplyFailed` 并在后续调谐补齐剩余资源 | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-GH53-005` | #53 | envtest/manager watch | API Server 1.28 | 修改已拥有 Service 或删除已拥有 Deployment 时由直接资源 watch 自动触发调谐、恢复字段并以新 UID 重建 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH56-001` | #56 | envtest | API Server 1.28；目标 profile 1.19、1.28 | 实际写入 StatefulSet、Service、Role/RoleBinding，并从 StatefulSet availability 回写七个受管资源与 Pod status | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH56-002` | #56 | envtest | API Server 1.28 | 用 workload finalizer 验证 Deployment/StatefulSet 往返 delete-before-create，等待期间不改 Service selector 或模式 RBAC | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH56-003` | #56 | envtest | API Server 1.28 | `shards=1` 被 controller 报告为 `InvalidSpec`，不写入受管资源 | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH56-004` | #56 | envtest | API Server 1.28 | 切回 Deployment 时如果分片 Role 已不属于当前 UID，则预检报告 `ResourceConflict`、保留 RoleBinding 并不创建 workload | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH56-005` | #56 | envtest | API Server 1.28 | 全新默认 Deployment 未应用分片拓扑时，无关的同名 Role/RoleBinding 不会触发分片清理或阻断 workload | Ginkgo failure、API object | `make test-integration` |
 
 ## E2E
 
@@ -83,6 +97,8 @@
 | `E2E-119-KSM-005` / `E2E-128-KSM-005` | #54 | kind E2E | Kubernetes 1.19.16、1.28.15 | 非法 regexp 仅降级当前实例、无 workload/status 重写，并保持 Operator 和合法实例可用 | 完整集群对象、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-KSM-006` / `E2E-128-KSM-006` | #55 | kind E2E | Kubernetes 1.19.16、1.28.15 | 字面名称、完整 regex、substring 非命中、集合扩展、零匹配及自动恢复作用于真实可用 workload 与 KSM 指标 | 完整集群对象、conditions、Events、metrics 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-KSM-GH53-001` / `E2E-128-KSM-GH53-001` | #53 | kind E2E | Kubernetes 1.19.16、1.28.15 | 点号名称的稳定摘要身份；同/不同 Namespace 多实例的 workload、Service endpoints、Pod labels、RBAC 与生命周期隔离；已拥有资源修改/删除漂移自动修复；无 owner、错误 owner 与旧 UID 预占均报告 `ResourceConflict` 并恢复；finalizer 保留旧 UID 对象；真实 RBAC 失败下保留部分写入并继续收敛 | 完整集群对象、endpoints、Pods、conditions、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
+| `E2E-119-KSM-GH56-001` / `E2E-128-KSM-GH56-001` | #56 | kind E2E | Kubernetes 1.19.16、1.28.15 | 真实两分片 StatefulSet 暴露两个 endpoints，逐 Pod telemetry 报告唯一 ordinal/total-shards，每个 Pod 继承过滤/资源，RBAC/status 正确并完成模式往返 | 完整集群对象、conditions、Endpoints、telemetry 与 Operator logs | `make e2e-kubestatemetrics KUBERNETES_VERSION=<minor> ...` |
+| `E2E-119-KSM-GH56-002` / `E2E-128-KSM-GH56-002` | #56 | kind E2E | Kubernetes 1.19.16、1.28.15 | `shards=1` 在真实集群报告 `InvalidSpec` 且零受管资源 | 完整集群对象、conditions 与 Operator logs | `make e2e-kubestatemetrics KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-PREFLIGHT-001` | #58 | kind E2E/预检 | Kubernetes 1.19.16 | 一期支持环境使用显式 runtime ServiceAccount 时预检成功，并报告 Kubernetes 版本事实与 `PreflightPassed` | NDJSON diagnostics、集群对象 | `make e2e-preflight KUBERNETES_VERSION=1.19 ...` |
 | `E2E-128-PREFLIGHT-001` | #58 | kind E2E/预检 | Kubernetes 1.28.15 | 一期支持环境使用显式 runtime ServiceAccount 时预检成功，并报告 Kubernetes 版本事实与 `PreflightPassed` | NDJSON diagnostics、集群对象 | `make e2e-preflight KUBERNETES_VERSION=1.28 ...` |
 | `E2E-119-PREFLIGHT-002` | #58 | kind E2E/预检 | Kubernetes 1.19.16 | runtime ServiceAccount 缺失时预检非零退出，并报告 `RuntimeServiceAccountNotFound` 与 `PreflightFailed` | NDJSON diagnostics、退出码 | `make e2e-preflight KUBERNETES_VERSION=1.19 ...` |

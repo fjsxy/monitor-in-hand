@@ -50,8 +50,8 @@ type KubeStateMetricsReconciler struct {
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets;nodes;pods;resourcequotas;replicationcontrollers;limitranges;persistentvolumeclaims;persistentvolumes;endpoints,verbs=list;watch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=statefulsets;daemonsets;replicasets,verbs=list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=list;watch
 // +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=list;watch
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
@@ -64,7 +64,7 @@ type KubeStateMetricsReconciler struct {
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=list;watch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	instance := &monitoringv1alpha1.KubeStateMetrics{}
@@ -149,6 +149,9 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 		conflictCandidates = append(append([]client.Object(nil), resources...), plan.Workloads...)
 	}
 	if conflict, err := r.findOwnershipConflict(ctx, conflictCandidates); err != nil {
+		if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, err); statusErr != nil {
+			return ctrl.Result{}, fmt.Errorf("%v；并且更新 topology 预检失败 status: %w", err, statusErr)
+		}
 		return ctrl.Result{}, err
 	} else if conflict != nil {
 		if err := r.updateProblemStatus(ctx, instance, conflict); err != nil {
@@ -156,9 +159,16 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 		}
 		return ctrl.Result{RequeueAfter: dependencyRetryInterval}, nil
 	}
+	// 目标身份通过冲突预检后，模式切换先只删旧 workload；确认消失后才调整 Service/RBAC 并创建新 workload。
+	if result, handled, err := r.reconcileDeploymentModeTransition(ctx, instance, plan); handled {
+		return result, err
+	}
 	// 恢复或普通调谐遇到终止中的旧资源时，等待 API 确认删除，避免 apply 与删除交错。
 	if !suspended {
 		if waiting, err := r.terminatingManagedResources(ctx, plan.Resources); err != nil {
+			if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, err); statusErr != nil {
+				return ctrl.Result{}, fmt.Errorf("%v；并且更新终止观测失败 status: %w", err, statusErr)
+			}
 			return ctrl.Result{}, err
 		} else if len(waiting) > 0 {
 			if err := r.updateCleanupStatus(ctx, instance, waiting, ksm.ReasonWaitingForDeletion, nil); err != nil {
@@ -202,11 +212,14 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 		return ctrl.Result{}, nil
 	}
 
-	deployment := &appsv1.Deployment{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: instance.Spec.TargetNamespace, Name: plan.Name}, deployment); err != nil {
-		return ctrl.Result{}, fmt.Errorf("读取已应用 Deployment: %w", err)
+	availablePods, err := r.workloadAvailablePods(ctx, instance.Spec.TargetNamespace, plan)
+	if err != nil {
+		if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, err); statusErr != nil {
+			return ctrl.Result{}, fmt.Errorf("%v；并且更新 topology 观测失败 status: %w", err, statusErr)
+		}
+		return ctrl.Result{}, err
 	}
-	if err := r.updateSuccessStatus(ctx, instance, plan, deployment.Status.AvailableReplicas); err != nil {
+	if err := r.updateSuccessStatus(ctx, instance, plan, availablePods); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
@@ -289,6 +302,163 @@ func (r *KubeStateMetricsReconciler) reconcileDeletion(ctx context.Context, inst
 	return ctrl.Result{}, nil
 }
 
+func (r *KubeStateMetricsReconciler) reconcileDeploymentModeTransition(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan) (ctrl.Result, bool, error) {
+	// 先按稳定身份读取目标模式之外的 workload，它是本轮唯一允许先行删除的资源。
+	obsolete := obsoleteWorkload(instance, plan)
+	current, err := emptyObjectFor(obsolete)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+	key := client.ObjectKeyFromObject(obsolete)
+	if err := r.Get(ctx, key, current); err != nil && !apierrors.IsNotFound(err) {
+		readErr := fmt.Errorf("读取待切换旧 workload %T %q: %w", obsolete, key.String(), err)
+		if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, readErr); statusErr != nil {
+			return ctrl.Result{}, true, fmt.Errorf("%v；并且更新拓扑观测失败 status: %w", readErr, statusErr)
+		}
+		return ctrl.Result{}, true, readErr
+	} else if err == nil {
+		// 确认旧 workload 归属后用 UID 前置条件发出删除，避免误删同名重建对象。
+		if !managedByInstance(current, instance) {
+			problem := &ksm.Problem{Reason: ksm.ReasonResourceConflict, Message: fmt.Sprintf("模式切换的旧 %s %q 不由当前 KubeStateMetrics UID 管理", managedResourceReference(current).Kind, key.String())}
+			if statusErr := r.updateProblemStatus(ctx, instance, problem); statusErr != nil {
+				return ctrl.Result{}, true, statusErr
+			}
+			return ctrl.Result{RequeueAfter: dependencyRetryInterval}, true, nil
+		}
+		if current.GetDeletionTimestamp().IsZero() {
+			uid := current.GetUID()
+			if deleteErr := r.Delete(ctx, current, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+				statusErr := r.updateModeTransitionStatus(ctx, instance, plan.Mode, "删除旧 workload 失败", deleteErr)
+				if statusErr != nil {
+					return ctrl.Result{}, true, fmt.Errorf("删除旧 workload 失败: %v；并且更新失败 status: %w", deleteErr, statusErr)
+				}
+				return ctrl.Result{}, true, deleteErr
+			}
+		}
+		// 删除已发出但必须等待 API 确认消失，期间仅更新反映旧拓扑的过渡 status。
+		if err := r.updateModeTransitionStatus(ctx, instance, plan.Mode, "等待旧 workload 消失", nil); err != nil {
+			return ctrl.Result{}, true, err
+		}
+		return ctrl.Result{RequeueAfter: cleanupRetryInterval}, true, nil
+	}
+
+	// 切回 Deployment 时先清理仅服务于自动分片的 Role/RoleBinding，不把它们遗留为受管资源。
+	if plan.Mode == monitoringv1alpha1.DeploymentModeDeployment {
+		obsoleteRBAC := []client.Object{
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: plan.Name, Namespace: instance.Spec.TargetNamespace}},
+			&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: plan.Name, Namespace: instance.Spec.TargetNamespace}},
+		}
+		applied, err := r.shardedTopologyWasApplied(ctx, instance, plan.Name, obsoleteRBAC)
+		if err != nil {
+			if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, err); statusErr != nil {
+				return ctrl.Result{}, true, fmt.Errorf("%v；并且更新拓扑观测失败 status: %w", err, statusErr)
+			}
+			return ctrl.Result{}, true, err
+		}
+		if !applied {
+			return ctrl.Result{}, false, nil
+		}
+		found, conflict, cleanupErr := r.deleteModeSpecificResources(ctx, instance, obsoleteRBAC)
+		if conflict != nil {
+			if err := r.updateProblemStatus(ctx, instance, conflict); err != nil {
+				return ctrl.Result{}, true, err
+			}
+			return ctrl.Result{RequeueAfter: dependencyRetryInterval}, true, nil
+		}
+		if cleanupErr != nil || len(found) > 0 {
+			if err := r.updateModeTransitionStatus(ctx, instance, plan.Mode, "正在清理分片模式 RBAC", cleanupErr); err != nil {
+				return ctrl.Result{}, true, err
+			}
+			if cleanupErr != nil {
+				return ctrl.Result{}, true, cleanupErr
+			}
+			return ctrl.Result{RequeueAfter: cleanupRetryInterval}, true, nil
+		}
+	}
+	return ctrl.Result{}, false, nil
+}
+
+func obsoleteWorkload(instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan) client.Object {
+	metadata := metav1.ObjectMeta{Name: plan.Name, Namespace: instance.Spec.TargetNamespace}
+	if plan.Mode == monitoringv1alpha1.DeploymentModeStatefulSetSharded {
+		return &appsv1.Deployment{ObjectMeta: metadata}
+	}
+	return &appsv1.StatefulSet{ObjectMeta: metadata}
+}
+
+func (r *KubeStateMetricsReconciler) shardedTopologyWasApplied(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, name string, modeResources []client.Object) (bool, error) {
+	if instance.Status.DeploymentMode == monitoringv1alpha1.DeploymentModeStatefulSetSharded {
+		return true, nil
+	}
+	// status 不完整时，由当前 UID 拥有的 sharded Service selector 或模式 RBAC 作为已应用证据。
+	service := &corev1.Service{}
+	serviceKey := client.ObjectKey{Namespace: instance.Spec.TargetNamespace, Name: name}
+	if err := r.Get(ctx, serviceKey, service); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("检查已应用分片 Service %q: %w", serviceKey.String(), err)
+		}
+	} else if managedByInstance(service, instance) && service.Spec.Selector["monitor-in-hand/endpoint-group"] == "sharded" {
+		return true, nil
+	}
+	for _, identity := range modeResources {
+		current, err := emptyObjectFor(identity)
+		if err != nil {
+			return false, err
+		}
+		key := client.ObjectKeyFromObject(identity)
+		if err := r.Get(ctx, key, current); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, fmt.Errorf("检查已应用分片资源 %T %q: %w", identity, key.String(), err)
+		}
+		if managedByInstance(current, instance) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *KubeStateMetricsReconciler) deleteModeSpecificResources(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, identities []client.Object) ([]monitoringv1alpha1.ManagedResourceReference, *ksm.Problem, error) {
+	var owned []client.Object
+	var references []monitoringv1alpha1.ManagedResourceReference
+	// 先完整预检模式专属资源的所有权，任一同名外部对象都会阻断切换且不部分删除。
+	for _, identity := range identities {
+		current, err := emptyObjectFor(identity)
+		if err != nil {
+			return references, nil, err
+		}
+		key := client.ObjectKeyFromObject(identity)
+		if err := r.Get(ctx, key, current); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return references, nil, fmt.Errorf("读取待清理模式资源 %T %q: %w", identity, key.String(), err)
+		}
+		if !managedByInstance(current, instance) {
+			return references, &ksm.Problem{
+				Reason:  ksm.ReasonResourceConflict,
+				Message: fmt.Sprintf("模式专属的 %s %q 已存在但不由当前 KubeStateMetrics UID 管理", managedResourceReference(current).Kind, key.String()),
+			}, nil
+		}
+		owned = append(owned, current)
+		references = append(references, managedResourceReference(current))
+	}
+
+	// 全部对象通过预检后再以 UID 前置条件发出删除，供下一轮确认消失。
+	var deleteErrors []error
+	for _, current := range owned {
+		if !current.GetDeletionTimestamp().IsZero() {
+			continue
+		}
+		uid := current.GetUID()
+		if err := r.Delete(ctx, current, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil && !apierrors.IsNotFound(err) {
+			deleteErrors = append(deleteErrors, fmt.Errorf("删除模式专属资源 %T %q: %w", current, client.ObjectKeyFromObject(current).String(), err))
+		}
+	}
+	return references, nil, errors.Join(deleteErrors...)
+}
+
 // deleteManagedResources 只按稳定身份查找资源，并再次核对 controller owner，避免删除同名非受管对象。
 func (r *KubeStateMetricsReconciler) deleteManagedResources(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics) ([]monitoringv1alpha1.ManagedResourceReference, error) {
 	return r.deleteOwnedResources(ctx, instance, directManagedResources(instance))
@@ -364,8 +534,11 @@ func directManagedResources(instance *monitoringv1alpha1.KubeStateMetrics) []cli
 	}
 	return []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
 		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: name}},
 		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: name}},
 	}
@@ -374,7 +547,9 @@ func directManagedResources(instance *monitoringv1alpha1.KubeStateMetrics) []cli
 func nonWorkloadResources(resources []client.Object) []client.Object {
 	result := make([]client.Object, 0, len(resources))
 	for _, resource := range resources {
-		if _, workload := resource.(*appsv1.Deployment); !workload {
+		switch resource.(type) {
+		case *appsv1.Deployment, *appsv1.StatefulSet:
+		default:
 			result = append(result, resource)
 		}
 	}
@@ -384,7 +559,8 @@ func nonWorkloadResources(resources []client.Object) []client.Object {
 func workloadResources(resources []client.Object) []client.Object {
 	result := make([]client.Object, 0, 1)
 	for _, resource := range resources {
-		if _, workload := resource.(*appsv1.Deployment); workload {
+		switch resource.(type) {
+		case *appsv1.Deployment, *appsv1.StatefulSet:
 			result = append(result, resource)
 		}
 	}
@@ -494,6 +670,11 @@ func (r *KubeStateMetricsReconciler) apply(ctx context.Context, desired client.O
 		case *rbacv1.ClusterRoleBinding:
 			actual.RoleRef = desired.(*rbacv1.ClusterRoleBinding).RoleRef
 			actual.Subjects = desired.(*rbacv1.ClusterRoleBinding).Subjects
+		case *rbacv1.Role:
+			actual.Rules = desired.(*rbacv1.Role).Rules
+		case *rbacv1.RoleBinding:
+			actual.RoleRef = desired.(*rbacv1.RoleBinding).RoleRef
+			actual.Subjects = desired.(*rbacv1.RoleBinding).Subjects
 		case *corev1.Service:
 			wanted := desired.(*corev1.Service)
 			if actual.Spec.ClusterIP != "" && actual.Spec.ClusterIP != corev1.ClusterIPNone {
@@ -517,6 +698,12 @@ func (r *KubeStateMetricsReconciler) apply(ctx context.Context, desired client.O
 			for index := range wanted.Spec.Template.Spec.Containers {
 				wanted.Spec.Template.Spec.Containers[index].DeepCopyInto(&actual.Spec.Template.Spec.Containers[index])
 			}
+		case *appsv1.StatefulSet:
+			wanted := desired.(*appsv1.StatefulSet)
+			actual.Spec.Replicas = wanted.Spec.Replicas
+			actual.Spec.Selector = wanted.Spec.Selector.DeepCopy()
+			actual.Spec.ServiceName = wanted.Spec.ServiceName
+			wanted.Spec.Template.DeepCopyInto(&actual.Spec.Template)
 		default:
 			return fmt.Errorf("不支持的受管资源类型 %T", current)
 		}
@@ -540,6 +727,109 @@ func hasManagingOwner(resource client.Object, expected metav1.OwnerReference) bo
 		}
 	}
 	return false
+}
+
+func (r *KubeStateMetricsReconciler) updateModeTransitionStatus(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, targetMode monitoringv1alpha1.DeploymentMode, stage string, transitionErr error) error {
+	// 从 API 实际对象重建过渡期资源与 Pod 计数，不把目标计划提前写入 status。
+	resources, mode, desiredPods, availablePods, err := r.observeManagedState(ctx, instance)
+	if err != nil {
+		if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, targetMode, err); statusErr != nil {
+			return fmt.Errorf("%v；并且更新 topology 观测失败 status: %w", err, statusErr)
+		}
+		return err
+	}
+	before := instance.Status.DeepCopy()
+	instance.Status.ObservedGeneration = instance.Generation
+	instance.Status.ManagedResources = resources
+	instance.Status.DeploymentMode = mode
+	instance.Status.DesiredPods = desiredPods
+	instance.Status.AvailablePods = availablePods
+	message := fmt.Sprintf("正从 %s 切换到 %s：%s", mode, targetMode, stage)
+	// 分别报告推进阶段、旧 workload 剩余可用性与删除故障，使管理员能区分允许的空窗和真实失败。
+	setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, ksm.ReasonSwitchingDeploymentMode, message)
+	setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionTrue, ksm.ReasonSwitchingDeploymentMode, message)
+	if availablePods > 0 {
+		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "WorkloadStillAvailable", "旧 workload 在终止期间仍有可用 Pod")
+	} else {
+		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, ksm.ReasonSwitchingDeploymentMode, "切换期间暂无可用 workload")
+	}
+	if transitionErr != nil {
+		setCondition(&instance.Status, instance.Generation, "Degraded", metav1.ConditionTrue, ksm.ReasonDeleteFailed, fmt.Sprintf("%s: %v", stage, transitionErr))
+	} else {
+		setCondition(&instance.Status, instance.Generation, "Degraded", metav1.ConditionFalse, ksm.ReasonSwitchingDeploymentMode, "模式切换未发生故障")
+	}
+	return r.writeStatusIfChanged(ctx, instance, *before)
+}
+
+func (r *KubeStateMetricsReconciler) updateTopologyObservationFailureStatus(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, targetMode monitoringv1alpha1.DeploymentMode, observationErr error) error {
+	before := instance.Status.DeepCopy()
+	instance.Status.ObservedGeneration = instance.Generation
+	progressReason := ksm.ReasonObservationFailed
+	message := fmt.Sprintf("正在收敛到 %s：无法确认互斥 workload：%v", targetMode, observationErr)
+	if instance.Status.DeploymentMode != "" && instance.Status.DeploymentMode != targetMode {
+		progressReason = ksm.ReasonSwitchingDeploymentMode
+		message = fmt.Sprintf("正从 %s 切换到 %s：无法读取旧 workload：%v", instance.Status.DeploymentMode, targetMode, observationErr)
+	}
+	// 读取失败时保留上一次成功观测的资源与 Pod 数，同时明确标记切换阶段和观测故障。
+	setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, progressReason, message)
+	setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionTrue, progressReason, message)
+	if instance.Status.DesiredPods > 0 && instance.Status.AvailablePods >= instance.Status.DesiredPods {
+		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "LastObservedWorkloadAvailable", "上一次成功观测的 workload 可用")
+	} else {
+		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, ksm.ReasonObservationFailed, "无法确认切换期 workload 可用性")
+	}
+	setCondition(&instance.Status, instance.Generation, "Degraded", metav1.ConditionTrue, ksm.ReasonObservationFailed, message)
+	return r.writeStatusIfChanged(ctx, instance, *before)
+}
+
+func (r *KubeStateMetricsReconciler) observeManagedState(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics) ([]monitoringv1alpha1.ManagedResourceReference, monitoringv1alpha1.DeploymentMode, int32, int32, error) {
+	var resources []monitoringv1alpha1.ManagedResourceReference
+	var mode monitoringv1alpha1.DeploymentMode
+	var desiredPods, availablePods int32
+	var endpointGroup string
+	// 逐个读取稳定身份，仅用当前 UID 真正拥有的对象构造切换期 status。
+	for _, identity := range directManagedResources(instance) {
+		current, err := emptyObjectFor(identity)
+		if err != nil {
+			return nil, "", 0, 0, err
+		}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(identity), current); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, "", 0, 0, err
+		}
+		if !managedByInstance(current, instance) {
+			continue
+		}
+		resources = append(resources, managedResourceReference(current))
+		switch workload := current.(type) {
+		case *appsv1.Deployment:
+			mode = monitoringv1alpha1.DeploymentModeDeployment
+			if workload.Spec.Replicas != nil {
+				desiredPods = *workload.Spec.Replicas
+			}
+			availablePods = workload.Status.AvailableReplicas
+		case *appsv1.StatefulSet:
+			mode = monitoringv1alpha1.DeploymentModeStatefulSetSharded
+			if workload.Spec.Replicas != nil {
+				desiredPods = *workload.Spec.Replicas
+			}
+			availablePods = workload.Status.ReadyReplicas
+		case *corev1.Service:
+			endpointGroup = workload.Spec.Selector["monitor-in-hand/endpoint-group"]
+		}
+	}
+	// workload 短暂不存在时，用尚未调整的 Service endpoint-group 表示当前真实拓扑。
+	if mode == "" {
+		switch endpointGroup {
+		case "default":
+			mode = monitoringv1alpha1.DeploymentModeDeployment
+		case "sharded":
+			mode = monitoringv1alpha1.DeploymentModeStatefulSetSharded
+		}
+	}
+	return resources, mode, desiredPods, availablePods, nil
 }
 
 func (r *KubeStateMetricsReconciler) updateCleanupStatus(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, resources []monitoringv1alpha1.ManagedResourceReference, reason string, cleanupErr error) error {
@@ -583,7 +873,7 @@ func (r *KubeStateMetricsReconciler) updateSuspendedStatus(ctx context.Context, 
 	instance.Status.ObservedGeneration = instance.Generation
 	instance.Status.AppliedTargetNamespace = instance.Spec.TargetNamespace
 	instance.Status.KubeStateMetricsVersion = plan.Profile.Version
-	instance.Status.DeploymentMode = monitoringv1alpha1.DeploymentModeDeployment
+	instance.Status.DeploymentMode = plan.Mode
 	instance.Status.DesiredPods = 0
 	instance.Status.AvailablePods = 0
 	instance.Status.ManagedResources = append(managedResourceReferences(nonWorkloadResources(plan.Resources)), workloads...)
@@ -638,12 +928,52 @@ func (r *KubeStateMetricsReconciler) updateProblemStatus(ctx context.Context, in
 		instance.Status.DesiredPods = 0
 		instance.Status.AvailablePods = 0
 		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, problem.Reason, problem.Message)
-	} else if instance.Status.DesiredPods > 0 && instance.Status.AvailablePods >= instance.Status.DesiredPods {
-		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "MinimumReplicasAvailable", "已应用的受管 workload 仍然可用")
 	} else {
-		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, "MinimumReplicasUnavailable", "已应用的受管 workload 当前不可用")
+		resources, mode, desiredPods, availablePods, err := r.observeManagedState(ctx, instance)
+		if err != nil {
+			// 丢弃尚未持久化的 problem conditions，改为从上次真实 status 报告二次观测故障。
+			instance.Status = *before
+			targetMode := instance.Spec.Deployment.Mode
+			if targetMode == "" {
+				targetMode = monitoringv1alpha1.DeploymentModeDeployment
+			}
+			observationErr := fmt.Errorf("更新问题 status 前读取实际受管资源: %w", err)
+			if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, targetMode, observationErr); statusErr != nil {
+				return fmt.Errorf("%v；并且更新 topology 观测失败 status: %w", observationErr, statusErr)
+			}
+			return observationErr
+		}
+		instance.Status.ManagedResources = resources
+		instance.Status.DeploymentMode = mode
+		instance.Status.DesiredPods = desiredPods
+		instance.Status.AvailablePods = availablePods
+		if desiredPods > 0 && availablePods >= desiredPods {
+			setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "MinimumReplicasAvailable", "已应用的受管 workload 仍然可用")
+		} else {
+			setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, "MinimumReplicasUnavailable", "已应用的受管 workload 当前不可用")
+		}
 	}
 	return r.writeStatusIfChanged(ctx, instance, *before)
+}
+
+func (r *KubeStateMetricsReconciler) workloadAvailablePods(ctx context.Context, namespace string, plan *ksm.ResourcePlan) (int32, error) {
+	key := client.ObjectKey{Namespace: namespace, Name: plan.Name}
+	switch plan.Mode {
+	case monitoringv1alpha1.DeploymentModeDeployment:
+		deployment := &appsv1.Deployment{}
+		if err := r.Get(ctx, key, deployment); err != nil {
+			return 0, fmt.Errorf("读取已应用 Deployment: %w", err)
+		}
+		return deployment.Status.AvailableReplicas, nil
+	case monitoringv1alpha1.DeploymentModeStatefulSetSharded:
+		statefulSet := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, key, statefulSet); err != nil {
+			return 0, fmt.Errorf("读取已应用 StatefulSet: %w", err)
+		}
+		return statefulSet.Status.ReadyReplicas, nil
+	default:
+		return 0, fmt.Errorf("不支持的已规划部署模式 %q", plan.Mode)
+	}
 }
 
 func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan, availablePods int32) error {
@@ -651,20 +981,20 @@ func (r *KubeStateMetricsReconciler) updateSuccessStatus(ctx context.Context, in
 	instance.Status.ObservedGeneration = instance.Generation
 	instance.Status.AppliedTargetNamespace = instance.Spec.TargetNamespace
 	instance.Status.KubeStateMetricsVersion = plan.Profile.Version
-	instance.Status.DeploymentMode = monitoringv1alpha1.DeploymentModeDeployment
+	instance.Status.DeploymentMode = plan.Mode
 	instance.Status.EffectiveCollectors = append([]string(nil), plan.EffectiveCollectors...)
 	instance.Status.EffectiveNamespaceCount = int32(len(plan.EffectiveNamespaces))
-	instance.Status.DesiredPods = 1
+	instance.Status.DesiredPods = plan.DesiredPods
 	instance.Status.AvailablePods = availablePods
 	instance.Status.ManagedResources = managedResourceReferences(plan.Resources)
-	if availablePods >= 1 {
+	if availablePods >= plan.DesiredPods {
 		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionTrue, "ReconcileSucceeded", "受管实例已就绪")
 		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionFalse, "ReconcileSucceeded", "无需继续推进")
-		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "MinimumReplicasAvailable", "单副本 Deployment 可用")
+		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionTrue, "MinimumReplicasAvailable", fmt.Sprintf("%s 的 %d 个 Pod 全部可用", plan.Mode, plan.DesiredPods))
 	} else {
-		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, "DeploymentProgressing", "等待单副本 Deployment 可用")
-		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionTrue, "DeploymentProgressing", "等待单副本 Deployment 可用")
-		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, "MinimumReplicasUnavailable", "单副本 Deployment 尚不可用")
+		setCondition(&instance.Status, instance.Generation, "Ready", metav1.ConditionFalse, "WorkloadProgressing", fmt.Sprintf("等待 %s 的 %d 个 Pod 可用", plan.Mode, plan.DesiredPods))
+		setCondition(&instance.Status, instance.Generation, "Progressing", metav1.ConditionTrue, "WorkloadProgressing", fmt.Sprintf("当前可用 Pod %d/%d", availablePods, plan.DesiredPods))
+		setCondition(&instance.Status, instance.Generation, "Available", metav1.ConditionFalse, "MinimumReplicasUnavailable", "受管 workload 尚未全部可用")
 	}
 	setCondition(&instance.Status, instance.Generation, "Degraded", metav1.ConditionFalse, "ReconcileSucceeded", "未发现调谐故障")
 	return r.writeStatusIfChanged(ctx, instance, *before)
@@ -677,7 +1007,7 @@ func (r *KubeStateMetricsReconciler) updateNoNamespaceMatchedStatus(ctx context.
 	instance.Status.Phase = monitoringv1alpha1.KubeStateMetricsPhaseReady
 	instance.Status.AppliedTargetNamespace = instance.Spec.TargetNamespace
 	instance.Status.KubeStateMetricsVersion = plan.Profile.Version
-	instance.Status.DeploymentMode = monitoringv1alpha1.DeploymentModeDeployment
+	instance.Status.DeploymentMode = plan.Mode
 	instance.Status.EffectiveCollectors = append([]string(nil), plan.EffectiveCollectors...)
 	instance.Status.EffectiveNamespaceCount = 0
 	instance.Status.DesiredPods = 0
@@ -778,8 +1108,14 @@ func managedResourceReference(resource client.Object) monitoringv1alpha1.Managed
 		reference.APIVersion, reference.Kind = rbacv1.SchemeGroupVersion.String(), "ClusterRole"
 	case *rbacv1.ClusterRoleBinding:
 		reference.APIVersion, reference.Kind = rbacv1.SchemeGroupVersion.String(), "ClusterRoleBinding"
+	case *rbacv1.Role:
+		reference.APIVersion, reference.Kind = rbacv1.SchemeGroupVersion.String(), "Role"
+	case *rbacv1.RoleBinding:
+		reference.APIVersion, reference.Kind = rbacv1.SchemeGroupVersion.String(), "RoleBinding"
 	case *appsv1.Deployment:
 		reference.APIVersion, reference.Kind = appsv1.SchemeGroupVersion.String(), "Deployment"
+	case *appsv1.StatefulSet:
+		reference.APIVersion, reference.Kind = appsv1.SchemeGroupVersion.String(), "StatefulSet"
 	}
 	return reference
 }
@@ -797,10 +1133,13 @@ func (r *KubeStateMetricsReconciler) SetupWithManager(manager ctrl.Manager) erro
 		For(&monitoringv1alpha1.KubeStateMetrics{}).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.requestsForNamespace)).
 		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.ClusterRole{}).
 		Owns(&rbacv1.ClusterRoleBinding{}).
+		Owns(&rbacv1.Role{}).
+		Owns(&rbacv1.RoleBinding{}).
 		Complete(r)
 }
 

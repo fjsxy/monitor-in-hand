@@ -1,6 +1,6 @@
 # monitor-in-hand
 
-面向单个 Kubernetes 集群的可观测组件管控 Operator。当前提供可安装、可探活的控制面，以及 cluster-scoped `KubeStateMetrics` API 的默认单副本 Deployment 调谐。
+面向单个 Kubernetes 集群的可观测组件管控 Operator。当前提供可安装、可探活的控制面，以及 cluster-scoped `KubeStateMetrics` API 的默认单副本 Deployment 与 experimental StatefulSetSharded 调谐。
 
 发布镜像位于 Docker Hub：`docker.io/fjsxy/monitor-in-hand:<version>`。Chart 使用 `appVersion` 选择固定镜像 tag。
 
@@ -31,10 +31,10 @@ make verify-generated
 make smoke-install
 ```
 
-`make test` 会下载固定的 Kubernetes 1.28 envtest 资产并执行 controller integration tests。默认 Deployment 的真实集群验收复用双版本测试环境：
+`make test` 会下载固定的 Kubernetes 1.28 envtest 资产并执行 controller integration tests。两种 KubeStateMetrics 部署模式的真实集群验收复用双版本测试环境：
 
 ```bash
-make e2e-default-deployment KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119 HELM=helm
+make e2e-kubestatemetrics KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119 HELM=helm
 ```
 
 该命令需要对应 `test-env-up` 创建的集群以及可用的 Docker socket；CI 在 Kubernetes 1.19 与 1.28 两个 blocking matrix legs 中运行它。
@@ -85,6 +85,19 @@ spec:
 ```
 
 Kubernetes 1.19.x 固定选择 kube-state-metrics 2.3.0，Kubernetes 1.28.x 固定选择 2.11.0。其他 minor 或缺失目标 Namespace 只更新 CR status，不创建受管资源。
+
+`StatefulSetSharded` 是 experimental 部署模式；它通过判别 union 的专属分支声明至少两个 shard，并用一个 headless Service 暴露所有 shard endpoints：
+
+```yaml
+spec:
+  targetNamespace: monitoring
+  deployment:
+    mode: StatefulSetSharded
+    statefulSetSharded:
+      shards: 3
+```
+
+只有 `mode: StatefulSetSharded` 可以携带 `statefulSetSharded`；`Deployment` 与 `StatefulSetSharded` 往返切换时会先确认旧 workload 消失，因此允许短暂采集空窗。
 
 默认 collector 是两个版本共同支持的固定 28 项 catalog。也可以选择其中的显式子集，并用 Go regexp 的未锚定 `MatchString` 语义过滤指标；`podResources` 直接使用 Kubernetes `ResourceRequirements`，省略时不注入 requests/limits：
 

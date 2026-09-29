@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	monitoringv1alpha1 "github.com/fjsxy/monitor-in-hand/api/v1alpha1"
@@ -445,6 +446,117 @@ var _ = Describe("默认 Deployment 规划", func() {
 	})
 })
 
+var _ = Describe("StatefulSetSharded 判别 union", func() {
+	DescribeTable("UT-KSM-GH56-001 拒绝分支与 mode 不匹配或分片数不足的声明",
+		func(deployment monitoringv1alpha1.KubeStateMetricsDeploymentSpec, wantMessage string) {
+			By("准备非法的部署模式判别 union")
+			instance := &monitoringv1alpha1.KubeStateMetrics{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-sharding", UID: types.UID("uid-56-invalid")},
+				Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+					TargetNamespace: "monitoring",
+					Deployment:      deployment,
+				},
+			}
+
+			expectInvalidSpecAcrossProfiles(instance, wantMessage)
+		},
+		Entry("Deployment 不接受 StatefulSetSharded 分支", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDeployment,
+			StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+				Shards: 2,
+			},
+		}, "statefulSetSharded"),
+		Entry("StatefulSetSharded 要求对应分支", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+		}, "statefulSetSharded"),
+		Entry("StatefulSetSharded 至少两个分片", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+			StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+				Shards: 1,
+			},
+		}, "至少为 2"),
+	)
+
+	DescribeTable("UT-KSM-GH56-002 为两个版本规划统一的自动分片资源",
+		func(kubernetesVersion string) {
+			By("准备显式 collector、metric filter、namespace 和 resources 的分片声明")
+			resources := &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("25m")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+			}
+			instance := &monitoringv1alpha1.KubeStateMetrics{
+				ObjectMeta: metav1.ObjectMeta{Name: "sharded", UID: types.UID("uid-56-sharded")},
+				Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+					TargetNamespace: "monitoring",
+					Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+						Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+						StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+							Shards: 3,
+						},
+					},
+					Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{
+						Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods", "deployments"},
+					},
+					MetricFilter: monitoringv1alpha1.KubeStateMetricsMetricFilter{
+						Mode: monitoringv1alpha1.MetricFilterModeAllow, Patterns: []string{"kube_pod_info"},
+					},
+					NamespaceFilter: monitoringv1alpha1.NamespaceFilter{
+						Mode: monitoringv1alpha1.NamespaceFilterModeInclude, Names: []string{"team-a", "team-b"},
+					},
+					PodResources: resources,
+				},
+			}
+
+			By("执行纯规划并验证七类目标资源")
+			plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
+				KubernetesVersion:     kubernetesVersion,
+				TargetNamespaceExists: true,
+				NamespaceNames:        []string{"monitoring", "team-a", "team-b"},
+			})
+			Expect(problem).To(BeNil())
+			Expect(plan.Mode).To(Equal(monitoringv1alpha1.DeploymentModeStatefulSetSharded))
+			Expect(plan.DesiredPods).To(Equal(int32(3)))
+			Expect(plan.Resources).To(HaveLen(7))
+
+			statefulSet := statefulSetFrom(plan)
+			Expect(*statefulSet.Spec.Replicas).To(Equal(int32(3)))
+			Expect(statefulSet.Spec.ServiceName).To(Equal("ksm-sharded"))
+			container := statefulSet.Spec.Template.Spec.Containers[0]
+			Expect(container.Args).To(Equal([]string{
+				"--resources=pods,deployments",
+				"--metric-allowlist=kube_pod_info",
+				"--namespaces=team-a,team-b",
+				"--pod=$(POD_NAME)",
+				"--pod-namespace=$(POD_NAMESPACE)",
+			}))
+			Expect(container.Env).To(ConsistOf(
+				corev1.EnvVar{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+				corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+			))
+			Expect(container.Resources).To(Equal(*resources))
+
+			service := resourceOfType[*corev1.Service](plan)
+			Expect(service.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone))
+			Expect(service.Spec.Selector).To(SatisfyAll(
+				HaveKeyWithValue("app.kubernetes.io/instance", "sharded"),
+				HaveKeyWithValue("monitor-in-hand/endpoint-group", "sharded"),
+				Not(HaveKey("app.kubernetes.io/version")),
+			))
+			role := resourceOfType[*rbacv1.Role](plan)
+			Expect(role.Namespace).To(Equal("monitoring"))
+			Expect(role.Rules).To(ConsistOf(
+				rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get"}},
+				rbacv1.PolicyRule{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{"ksm-sharded"}, Verbs: []string{"get"}},
+			))
+			roleBinding := resourceOfType[*rbacv1.RoleBinding](plan)
+			Expect(roleBinding.RoleRef).To(Equal(rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "ksm-sharded"}))
+			Expect(roleBinding.Subjects).To(Equal([]rbacv1.Subject{{Kind: "ServiceAccount", Name: "ksm-sharded", Namespace: "monitoring"}}))
+		},
+		Entry("Kubernetes 1.19", "v1.19.16"),
+		Entry("Kubernetes 1.28", "v1.28.15"),
+	)
+})
+
 var _ = Describe("受管实例 phase 推导", func() {
 	disabled := false
 	condition := func(conditionType string, status metav1.ConditionStatus, reasons ...string) metav1.Condition {
@@ -645,6 +757,21 @@ func serviceFrom(plan *ksm.ResourcePlan) *corev1.Service {
 	}
 	Fail("service not found in resource plan")
 	return nil
+}
+
+func statefulSetFrom(plan *ksm.ResourcePlan) *appsv1.StatefulSet {
+	return resourceOfType[*appsv1.StatefulSet](plan)
+}
+
+func resourceOfType[T client.Object](plan *ksm.ResourcePlan) T {
+	for _, planned := range plan.Resources {
+		if resource, ok := planned.(T); ok {
+			return resource
+		}
+	}
+	Fail(fmt.Sprintf("resource %T not found in resource plan", *new(T)))
+	var zero T
+	return zero
 }
 
 func expectInvalidSpecAcrossProfiles(instance *monitoringv1alpha1.KubeStateMetrics, wantMessage string) {

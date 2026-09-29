@@ -72,7 +72,7 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
+.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-kubestatemetrics e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
 test: manifests verify-generated generate fmt typecheck test-unit test-integration test-helm test-testenv ## Run all tests.
 
 test-unit: ## Run control-plane unit tests.
@@ -119,12 +119,14 @@ e2e-preflight: ## Verify strict deployment preflight against the current pinned 
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/preflight" \
 		./test/e2e/preflight
 
-e2e-default-deployment: ## Verify KubeStateMetrics configuration against real managed workloads.
+e2e-kubestatemetrics: ## Verify KubeStateMetrics deployment modes against real managed workloads.
 	mkdir -p "$(E2E_REPORT_DIR)/kubestatemetrics"
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
 		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=20m \
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/kubestatemetrics" \
 		./test/e2e/kubestatemetrics
+
+e2e-default-deployment: e2e-kubestatemetrics ## Compatibility alias for the original E2E entry point.
 
 test-env-up: ## Create the pinned external test environment for one supported Kubernetes minor.
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" ./hack/test-env.sh up

@@ -27,6 +27,8 @@ const (
 	ReasonApplyFailed                  = "ApplyFailed"
 	ReasonUnsupportedKubernetesVersion = "UnsupportedKubernetesVersion"
 	ReasonNoNamespaceMatched           = "NoNamespaceMatched"
+	ReasonSwitchingDeploymentMode      = "SwitchingDeploymentMode"
+	ReasonObservationFailed            = "ObservationFailed"
 
 	labelName          = "app.kubernetes.io/name"
 	labelInstance      = "app.kubernetes.io/instance"
@@ -64,6 +66,8 @@ type ResourcePlan struct {
 	Profile             Profile
 	InstanceID          string
 	Name                string
+	Mode                monitoringv1alpha1.DeploymentMode
+	DesiredPods         int32
 	EffectiveCollectors []string
 	EffectiveNamespaces []string
 	Resources           []client.Object
@@ -94,7 +98,19 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 	if mode == "" {
 		mode = monitoringv1alpha1.DeploymentModeDeployment
 	}
-	if mode != monitoringv1alpha1.DeploymentModeDeployment {
+	switch mode {
+	case monitoringv1alpha1.DeploymentModeDeployment:
+		if instance.Spec.Deployment.StatefulSetSharded != nil {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.statefulSetSharded 仅能在 mode 为 StatefulSetSharded 时声明"}
+		}
+	case monitoringv1alpha1.DeploymentModeStatefulSetSharded:
+		if instance.Spec.Deployment.StatefulSetSharded == nil {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.mode 为 StatefulSetSharded 时必须声明 statefulSetSharded 分支"}
+		}
+		if instance.Spec.Deployment.StatefulSetSharded.Shards < 2 {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.statefulSetSharded.shards 必须至少为 2"}
+		}
+	default:
 		return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.deployment.mode %q 不受支持", mode)}
 	}
 	if instance.Spec.PodResources != nil && len(instance.Spec.PodResources.Claims) != 0 {
@@ -135,20 +151,32 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 	containerArgs := []string{"--resources=" + strings.Join(effectiveCollectors, ",")}
 	containerArgs = append(containerArgs, metricFilterArgs...)
 	containerArgs = append(containerArgs, "--namespaces="+strings.Join(effectiveNamespaces, ","))
-	nonWorkloads, deployment := deploymentResources(instance, profile, instanceID, name, containerArgs)
-	// Deployment 是当前模式唯一 workload；零匹配时从期望资源中分离，但保留其身份供 controller 安全删除。
+	var nonWorkloads []client.Object
+	var workload client.Object
+	desiredPods := int32(1)
+	if mode == monitoringv1alpha1.DeploymentModeStatefulSetSharded {
+		desiredPods = instance.Spec.Deployment.StatefulSetSharded.Shards
+		nonWorkloads, workload = statefulSetShardedResources(instance, profile, instanceID, name, containerArgs, desiredPods)
+	} else {
+		nonWorkloads, workload = deploymentResources(instance, profile, instanceID, name, containerArgs)
+	}
+	// 当前模式只规划一个 workload；零匹配时从期望资源中分离，但保留其身份供 controller 安全删除。
 	resources := append([]client.Object(nil), nonWorkloads...)
 	if len(effectiveNamespaces) > 0 {
-		resources = append(resources, deployment)
+		resources = append(resources, workload)
+	} else {
+		desiredPods = 0
 	}
 	return &ResourcePlan{
 		Profile:             profile,
 		InstanceID:          instanceID,
 		Name:                name,
+		Mode:                mode,
+		DesiredPods:         desiredPods,
 		EffectiveCollectors: effectiveCollectors,
 		EffectiveNamespaces: effectiveNamespaces,
 		Resources:           resources,
-		Workloads:           []client.Object{deployment},
+		Workloads:           []client.Object{workload},
 	}, nil
 }
 
@@ -358,7 +386,11 @@ func stableInstanceID(name string) string {
 }
 
 func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string) ([]client.Object, *appsv1.Deployment) {
-	labels := managedLabels(instanceID, profile.Version)
+	return deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, containerArgs, "default")
+}
+
+func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string, endpointGroup string) ([]client.Object, *appsv1.Deployment) {
+	labels := managedLabels(instanceID, profile.Version, endpointGroup)
 	podResources := corev1.ResourceRequirements{}
 	if instance.Spec.PodResources != nil {
 		podResources = *instance.Spec.PodResources.DeepCopy()
@@ -366,7 +398,7 @@ func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile 
 	selector := map[string]string{
 		labelName:          "kube-state-metrics",
 		labelInstance:      instanceID,
-		labelEndpointGroup: "default",
+		labelEndpointGroup: endpointGroup,
 	}
 	owner := managingOwner(instance)
 	namespace := instance.Spec.TargetNamespace
@@ -443,14 +475,52 @@ func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile 
 	return []client.Object{serviceAccount, clusterRole, clusterRoleBinding, service}, deployment
 }
 
-func managedLabels(instanceID, version string) map[string]string {
+func statefulSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string, shards int32) ([]client.Object, client.Object) {
+	// 先复用与 Deployment 一致的 Pod、ServiceAccount、Cluster RBAC 和 headless Service 契约，仅切换 endpoint-group。
+	shardingArgs := append(append([]string(nil), containerArgs...), "--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)")
+	nonWorkloads, deployment := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, shardingArgs, "sharded")
+	// 通过 Downward API 把每个 Pod 的唯一身份交给上游 automated sharding。
+	container := &deployment.Spec.Template.Spec.Containers[0]
+	container.Env = []corev1.EnvVar{
+		{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+	}
+	// 将已统一解析的 Pod template 放入指定副本数的 StatefulSet，以稳定 ordinal 支持自动分片。
+	statefulSet := &appsv1.StatefulSet{
+		ObjectMeta: *deployment.ObjectMeta.DeepCopy(),
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:    int32Pointer(shards),
+			Selector:    deployment.Spec.Selector.DeepCopy(),
+			ServiceName: name,
+			Template:    *deployment.Spec.Template.DeepCopy(),
+		},
+	}
+	labels := managedLabels(instanceID, profile.Version, "sharded")
+	owner := managingOwner(instance)
+	// 最后添加仅分片模式需要的 namespaced RBAC，限定只读自身 Pod 和对应 StatefulSet。
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Spec.TargetNamespace, Labels: copyLabels(labels), OwnerReferences: []metav1.OwnerReference{owner}},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get"}},
+			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{name}, Verbs: []string{"get"}},
+		},
+	}
+	roleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Spec.TargetNamespace, Labels: copyLabels(labels), OwnerReferences: []metav1.OwnerReference{owner}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: instance.Spec.TargetNamespace}},
+	}
+	return append(nonWorkloads, role, roleBinding), statefulSet
+}
+
+func managedLabels(instanceID, version, endpointGroup string) map[string]string {
 	return map[string]string{
 		labelName:          "kube-state-metrics",
 		labelInstance:      instanceID,
 		labelManagedBy:     "monitor-in-hand",
 		labelVersion:       version,
 		labelRole:          "collector",
-		labelEndpointGroup: "default",
+		labelEndpointGroup: endpointGroup,
 	}
 }
 
@@ -510,6 +580,7 @@ func commonRules(includeServiceAccountsAndIngressClasses bool) []rbacv1.PolicyRu
 
 // Ensure every desired resource can be handled through the controller-runtime client.
 var _ runtime.Object = &appsv1.Deployment{}
+var _ runtime.Object = &appsv1.StatefulSet{}
 
 func boolPointer(value bool) *bool    { return &value }
 func int32Pointer(value int32) *int32 { return &value }

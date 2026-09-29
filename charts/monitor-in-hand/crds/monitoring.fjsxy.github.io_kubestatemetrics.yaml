@@ -83,7 +83,21 @@ spec:
                     description: Mode is the selected workload topology.
                     enum:
                     - Deployment
+                    - StatefulSetSharded
                     type: string
+                  statefulSetSharded:
+                    description: |-
+                      StatefulSetSharded configures the experimental StatefulSetSharded mode.
+                      It must be present only when mode is StatefulSetSharded.
+                    properties:
+                      shards:
+                        description: Shards is the number of automated kube-state-metrics
+                          shards and must be at least two.
+                        format: int32
+                        type: integer
+                    required:
+                    - shards
+                    type: object
                 type: object
               enabled:
                 default: true

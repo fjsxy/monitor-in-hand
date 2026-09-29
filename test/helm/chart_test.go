@@ -166,6 +166,9 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "namespaceFilter", "default", "mode")).To(Equal("All"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "namespaceFilter", "properties", "mode", "enum")).To(ConsistOf("All", "Include"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "default", "mode")).To(Equal("Deployment"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "properties", "mode", "enum")).To(ConsistOf("Deployment", "StatefulSetSharded"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "properties", "statefulSetSharded", "properties", "shards", "type")).To(Equal("integer"))
+		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "deployment", "properties", "statefulSetSharded", "required")).To(ContainElement("shards"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "collectors", "default", "mode")).To(Equal("Default"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "collectors", "properties", "mode", "enum")).To(ConsistOf("Default", "Include"))
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "metricFilter", "default", "mode")).To(Equal("All"))
@@ -187,7 +190,7 @@ var _ = Describe("Operator Helm chart", func() {
 		))
 	})
 
-	It("HELM-007 只授予默认 Deployment 与生命周期调谐所需业务权限", func() {
+	It("HELM-007 只授予两种部署模式与生命周期调谐所需业务权限", func() {
 		role := objectByKind(renderChart(), "ClusterRole")
 		rules := nested(role, "rules").([]any)
 
@@ -203,7 +206,7 @@ var _ = Describe("Operator Helm chart", func() {
 		)))
 		Expect(rules).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("apiGroups", ConsistOf("apps")),
-			HaveKeyWithValue("resources", ConsistOf("deployments")),
+			HaveKeyWithValue("resources", ConsistOf("deployments", "statefulsets")),
 			HaveKeyWithValue("verbs", ConsistOf("create", "delete", "get", "list", "patch", "update", "watch")),
 		)))
 		Expect(rules).To(ContainElement(SatisfyAll(
@@ -213,7 +216,7 @@ var _ = Describe("Operator Helm chart", func() {
 		)))
 		Expect(rules).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("apiGroups", ConsistOf("rbac.authorization.k8s.io")),
-			HaveKeyWithValue("resources", ConsistOf("clusterrolebindings", "clusterroles")),
+			HaveKeyWithValue("resources", ConsistOf("clusterrolebindings", "clusterroles", "rolebindings", "roles")),
 			HaveKeyWithValue("verbs", ConsistOf("create", "delete", "get", "list", "patch", "update", "watch")),
 		)))
 		Expect(string(mustRenderChart())).NotTo(ContainSubstring("monitoring.coreos.com"))
