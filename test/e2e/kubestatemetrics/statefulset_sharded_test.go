@@ -238,12 +238,16 @@ func statefulShardedScenarioID(sequence string) string {
 }
 
 func waitForShardedTopology(ctx SpecContext, instanceName, managedName string, shards int32) {
+	overlapObserved := false
 	Eventually(func() error {
 		statefulSet, err := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", managedName)
 		if err != nil {
 			return err
 		}
 		if err := objectAbsent(ctx, targetNamespace, "deployment", managedName); err != nil {
+			if strings.Contains(err.Error(), "仍然存在") {
+				overlapObserved = true
+			}
 			return fmt.Errorf("确认旧 Deployment 已消失: %w", err)
 		}
 		if statefulSet.Status.ReadyReplicas != shards {
@@ -261,15 +265,20 @@ func waitForShardedTopology(ctx SpecContext, instanceName, managedName string, s
 		}
 		return nil
 	}, 5*time.Minute, 2*time.Second).Should(Succeed())
+	Expect(overlapObserved).To(BeFalse(), "模式切换轮询期间不得同时观察到 Deployment 与 StatefulSet")
 }
 
 func waitForDeploymentTopology(ctx SpecContext, instanceName, managedName string) {
+	overlapObserved := false
 	Eventually(func() error {
 		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", managedName)
 		if err != nil {
 			return err
 		}
 		if err := objectAbsent(ctx, targetNamespace, "statefulset", managedName); err != nil {
+			if strings.Contains(err.Error(), "仍然存在") {
+				overlapObserved = true
+			}
 			return fmt.Errorf("确认旧 StatefulSet 已消失: %w", err)
 		}
 		if deployment.Status.AvailableReplicas != 1 {
@@ -287,4 +296,5 @@ func waitForDeploymentTopology(ctx SpecContext, instanceName, managedName string
 		}
 		return nil
 	}, 5*time.Minute, 2*time.Second).Should(Succeed())
+	Expect(overlapObserved).To(BeFalse(), "模式切换轮询期间不得同时观察到 StatefulSet 与 Deployment")
 }
