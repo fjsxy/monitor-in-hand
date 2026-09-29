@@ -65,6 +65,7 @@ func (c partiallyFailingClient) Create(ctx context.Context, object client.Object
 func (c *replacingBeforeDeleteClient) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {
 	if _, ok := object.(*appsv1.Deployment); ok && !c.replaced {
 		c.replaced = true
+		// 在真正处理带 UID 前置条件的删除前，用同名新 UID 对象替换已分类的旧对象，复现读取与删除之间的竞态窗口。
 		if err := c.Client.Delete(ctx, object); err != nil {
 			return err
 		}
@@ -77,6 +78,7 @@ func (c *replacingBeforeDeleteClient) Delete(ctx context.Context, object client.
 		if err := c.Client.Create(ctx, replacement); err != nil {
 			return err
 		}
+		// fake client 不会模拟 API Server 的删除前置条件，因此显式拒绝针对旧 UID 的删除请求。
 		deleteOptions := (&client.DeleteOptions{}).ApplyOptions(options)
 		if deleteOptions.Preconditions != nil && deleteOptions.Preconditions.UID != nil && *deleteOptions.Preconditions.UID != replacement.UID {
 			return errors.New("delete UID precondition rejected conflicting replacement")

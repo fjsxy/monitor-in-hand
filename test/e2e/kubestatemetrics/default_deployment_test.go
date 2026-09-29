@@ -620,21 +620,8 @@ spec:
 		)
 
 		By("在同一 targetNamespace 创建两个独立实例并等待真实 workload 可用")
-		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
-kind: KubeStateMetrics
-metadata:
-  name: %s
-spec:
-  targetNamespace: %s
----
-apiVersion: monitoring.fjsxy.github.io/v1alpha1
-kind: KubeStateMetrics
-metadata:
-  name: %s
-spec:
-  targetNamespace: %s
-`, primaryInstance, targetNamespace, secondaryInstance, targetNamespace)
-		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		applyKubeStateMetrics(ctx, primaryInstance, targetNamespace)
+		applyKubeStateMetrics(ctx, secondaryInstance, targetNamespace)
 		waitForInstanceReady(ctx, primaryInstance, primaryManaged)
 		waitForInstanceReady(ctx, secondaryInstance, secondaryManaged)
 
@@ -693,14 +680,7 @@ spec:
 		const crossInstance = "gh53-cross-namespace"
 		const crossManaged = "ksm-gh53-cross-namespace"
 		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "create", "namespace", crossNamespace)
-		crossManifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
-kind: KubeStateMetrics
-metadata:
-  name: %s
-spec:
-  targetNamespace: %s
-`, crossInstance, crossNamespace)
-		runWithInput(ctx, repoRoot, crossManifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		applyKubeStateMetrics(ctx, crossInstance, crossNamespace)
 		Eventually(func() error {
 			deployment, getErr := getObject[appsv1.Deployment](ctx, crossNamespace, "deployment", crossManaged)
 			if getErr != nil {
@@ -785,14 +765,7 @@ rules:
     verbs: ["get"]
 `, conflict.managed, conflict.class, conflict.ownerYAML)
 			runWithInput(ctx, repoRoot, conflictRole, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
-			conflictManifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
-kind: KubeStateMetrics
-metadata:
-  name: %s
-spec:
-  targetNamespace: %s
-`, conflict.instance, targetNamespace)
-			runWithInput(ctx, repoRoot, conflictManifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+			applyKubeStateMetrics(ctx, conflict.instance, targetNamespace)
 			Eventually(func() error {
 				instance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", conflict.instance)
 				if getErr != nil {
@@ -870,14 +843,7 @@ spec:
 		replaceClusterRoleRules(ctx, managerRoleName, restrictedManagerRules)
 		const partialInstance = "gh53-partial-apply"
 		const partialManaged = "ksm-gh53-partial-apply"
-		partialManifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
-kind: KubeStateMetrics
-metadata:
-  name: %s
-spec:
-  targetNamespace: %s
-`, partialInstance, targetNamespace)
-		runWithInput(ctx, repoRoot, partialManifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		applyKubeStateMetrics(ctx, partialInstance, targetNamespace)
 		Eventually(func() error {
 			instance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", partialInstance)
 			if getErr != nil {
@@ -1327,6 +1293,17 @@ func replaceClusterRoleRules(ctx context.Context, name string, rules []rbacv1.Po
 	manifest, err := json.Marshal(role)
 	Expect(err).NotTo(HaveOccurred())
 	runWithInput(ctx, repoRoot, string(manifest), kubectlBin, "--context", kubeContext, "replace", "--filename", "-")
+}
+
+func applyKubeStateMetrics(ctx context.Context, name, namespace string) {
+	manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+`, name, namespace)
+	runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
 }
 
 func run(ctx context.Context, dir string, extraEnv []string, name string, args ...string) {
