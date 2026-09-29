@@ -419,20 +419,35 @@ var _ = Describe("默认 Deployment 规划", func() {
 		))
 	})
 
-	It("UT-KSM-005 Operator RBAC 覆盖两个 profile 下放的全部权限", func() {
+	It("UT-KSM-005 Operator RBAC 覆盖两个 profile 与分片模式下放的全部权限", func() {
+		By("读取由 Kubebuilder RBAC markers 生成的 Operator ClusterRole")
 		manifest, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", "role.yaml"))
 		Expect(err).NotTo(HaveOccurred())
 		managerRole := &rbacv1.ClusterRole{}
 		Expect(yaml.Unmarshal(manifest, managerRole)).To(Succeed())
 
 		for _, version := range []string{"v1.19.16", "v1.28.15"} {
-			plan, problem := ksm.BuildPlan(newInstance(), ksm.ClusterFacts{
+			By(fmt.Sprintf("规划 %s 的 StatefulSetSharded 资源及其全部下放权限", version))
+			instance := newInstance()
+			instance.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+				Mode:               monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+				StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{Shards: 2},
+			}
+			plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
 				KubernetesVersion:     version,
 				TargetNamespaceExists: true,
 				NamespaceNames:        []string{"monitoring"},
 			})
 			Expect(problem).To(BeNil())
-			for _, delegated := range plan.Profile.Rules {
+			delegatedRules := append([]rbacv1.PolicyRule(nil), plan.Profile.Rules...)
+			for _, planned := range plan.Resources {
+				if role, ok := planned.(*rbacv1.Role); ok {
+					delegatedRules = append(delegatedRules, role.Rules...)
+				}
+			}
+
+			By(fmt.Sprintf("验证 Operator 在 %s 上持有其下放的每一项权限", version))
+			for _, delegated := range delegatedRules {
 				for _, apiGroup := range delegated.APIGroups {
 					for _, resource := range delegated.Resources {
 						for _, verb := range delegated.Verbs {

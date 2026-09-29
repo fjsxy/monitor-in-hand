@@ -49,7 +49,8 @@ type KubeStateMetricsReconciler struct {
 // +kubebuilder:rbac:groups=monitoring.fjsxy.github.io,resources=kubestatemetrics/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps;secrets;nodes;pods;resourcequotas;replicationcontrollers;limitranges;persistentvolumeclaims;persistentvolumes;endpoints,verbs=list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps;secrets;nodes;resourcequotas;replicationcontrollers;limitranges;persistentvolumeclaims;persistentvolumes;endpoints,verbs=list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=list;watch
 // +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=list;watch
