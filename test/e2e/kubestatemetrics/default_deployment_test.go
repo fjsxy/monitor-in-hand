@@ -71,6 +71,9 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	clusterName = fmt.Sprintf("mih-e2e-%s-%s", strings.ReplaceAll(active.kubernetes, ".", ""), runID)
 	kubeContext = "kind-" + clusterName
 
+	By("在本 Operator 启动前快照 Agent、runtime RBAC、采集配置与外部生成资源")
+	gh60PreInstallSnapshots = captureGH60PreInstallSnapshots(ctx)
+
 	By("构建并导入 Operator 镜像，让测试只依赖当前工作树代码")
 	run(ctx, repoRoot, []string{"BUILDKIT_PROGRESS=plain"}, "docker", "build", "--tag", operatorImage, repoRoot)
 	run(ctx, repoRoot, nil, kindBin, "load", "docker-image", "--name", clusterName, operatorImage)

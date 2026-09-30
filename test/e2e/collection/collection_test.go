@@ -27,6 +27,7 @@ const testNamespace = "monitor-in-hand-test"
 type e2eConfig struct {
 	kubernetesMinor string
 	kubeContext     string
+	testRunID       string
 }
 
 type prometheusConfig struct {
@@ -76,6 +77,7 @@ var _ = BeforeSuite(func() {
 	config = e2eConfig{
 		kubernetesMinor: minor,
 		kubeContext:     "kind-mih-e2e-" + strings.ReplaceAll(minor, ".", "") + "-" + runID,
+		testRunID:       runID,
 	}
 })
 
@@ -479,9 +481,14 @@ func waitForAgentAPIs(ctx context.Context, requiredJobs []string) agentAPIResult
 
 func startPortForward(ctx context.Context) (int, func()) {
 	GinkgoHelper()
+	return startPortForwardTarget(ctx, testNamespace, "pod/prom-agent-fixture-0", 9090)
+}
+
+func startPortForwardTarget(ctx context.Context, namespace, target string, remotePort int) (int, func()) {
+	GinkgoHelper()
 	// 启动 kubectl 子进程并同时接收 stdout/stderr，因为不同 kubectl 版本的监听提示流不同。
-	command := exec.CommandContext(ctx, "kubectl", "--context", config.kubeContext, "--namespace", testNamespace,
-		"port-forward", "pod/prom-agent-fixture-0", "0:9090")
+	command := exec.CommandContext(ctx, "kubectl", "--context", config.kubeContext, "--namespace", namespace,
+		"port-forward", target, fmt.Sprintf("0:%d", remotePort))
 	stdout, err := command.StdoutPipe()
 	Expect(err).NotTo(HaveOccurred())
 	stderr, err := command.StderrPipe()

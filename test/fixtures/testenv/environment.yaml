@@ -475,6 +475,13 @@ spec:
   serviceAccountName: prometheus-agent
   replicas: 1
   shards: 1
+  storage:
+    volumeClaimTemplate:
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 64Mi
   serviceDiscoveryRole: __SERVICE_DISCOVERY_ROLE__
   serviceMonitorSelector:
     matchLabels:

@@ -153,6 +153,96 @@ var _ = Describe("真实集群部署预检", Serial, func() {
 			WithTransform(func(item diagnostic) string { return item.Reason }, Equal("EmptyObjectSelectorUnsupported")),
 		)))
 	}, SpecTimeout(2*time.Minute))
+
+	It(fmt.Sprintf("[%s] 通过两分片计划与已有多 owner governing Service 身份检查", stableScenarioID("GH60-001")), func(ctx SpecContext) {
+		scenarioID := stableScenarioID("GH60-001")
+		By(scenarioID + " 准备与既有 fixture Agent 同 namespace 的两分片计划")
+		manifestPath := filepath.Join(GinkgoT().TempDir(), "agent.yaml")
+		Expect(os.WriteFile(manifestPath, []byte(plannedGH60AgentManifest), 0o600)).To(Succeed())
+
+		By(scenarioID + " 通过公开 Make 入口执行资源身份与最小 reconcile 预检")
+		output, err := runPreflight(ctx, "prometheus-agent", "AGENT_MANIFEST="+manifestPath)
+		AddReportEntry("gh60-identity-preflight-output", output, ReportEntryVisibilityFailureOrVerbose)
+		Expect(err).NotTo(HaveOccurred(), output)
+
+		By(scenarioID + " 验证保留名、共享 Service 和最终成功诊断")
+		diagnostics := parseDiagnostics(output)
+		for _, reason := range []string{"ReservedResourceNamesAvailable", "SharedGoverningServiceCompatible", "PreflightPassed"} {
+			Expect(diagnostics).To(ContainElement(WithTransform(func(item diagnostic) string { return item.Reason }, Equal(reason))))
+		}
+	}, SpecTimeout(10*time.Minute))
+
+	It(fmt.Sprintf("[%s] 无关对象占用保留名、共享 Service 或 PVC 时非零退出且不修改对象", stableScenarioID("GH60-002")), func(ctx SpecContext) {
+		scenarioID := stableScenarioID("GH60-002")
+		By(scenarioID + " 准备覆盖保留资源、共享 Service 与 retained PVC 的冲突计划")
+		manifestDir := GinkgoT().TempDir()
+		agentPath := filepath.Join(manifestDir, "agent.yaml")
+		Expect(os.WriteFile(agentPath, []byte(conflictingGH60AgentManifest), 0o600)).To(Succeed())
+
+		reservedConflicts := []struct {
+			name, resource, objectName, manifest string
+		}{
+			{name: "StatefulSet", resource: "statefulset", objectName: "prom-agent-gh60-conflict", manifest: gh60ConflictStatefulSet},
+			{name: "Pod", resource: "pod", objectName: "prom-agent-gh60-conflict-0", manifest: gh60ConflictPod},
+			{name: "config Secret", resource: "secret", objectName: "prom-agent-gh60-conflict", manifest: gh60ConflictConfigSecret},
+			{name: "TLS Secret", resource: "secret", objectName: "prom-agent-gh60-conflict-tls-assets-1", manifest: gh60ConflictTLSSecret},
+			{name: "web Secret", resource: "secret", objectName: "prom-agent-gh60-conflict-web-config", manifest: gh60ConflictWebSecret},
+		}
+		for _, conflict := range reservedConflicts {
+			By(fmt.Sprintf("%s 创建占用 %s 保留身份的无关对象", scenarioID, conflict.name))
+			applyPreflightManifest(ctx, conflict.manifest)
+			objectContent := resourceContent(ctx, conflict.resource, conflict.objectName, "monitor-in-hand-test")
+			DeferCleanup(func(cleanupCtx SpecContext) {
+				deletePreflightResource(cleanupCtx, conflict.resource, conflict.objectName, "monitor-in-hand-test")
+			})
+
+			By(fmt.Sprintf("%s 对 %s 冲突执行公开预检入口", scenarioID, conflict.name))
+			output, err := runPreflight(ctx, "prometheus-agent", "AGENT_MANIFEST="+agentPath)
+			AddReportEntry("gh60-"+strings.ReplaceAll(conflict.name, " ", "-")+"-output", output, ReportEntryVisibilityFailureOrVerbose)
+			By(fmt.Sprintf("%s 验证 %s 冲突非零退出且原对象身份与内容快照不变", scenarioID, conflict.name))
+			Expect(err).To(HaveOccurred(), output)
+			Expect(parseDiagnostics(output)).To(ContainElement(WithTransform(func(item diagnostic) string { return item.Reason }, Equal("ReservedResourceConflict"))))
+			Expect(resourceContent(ctx, conflict.resource, conflict.objectName, "monitor-in-hand-test")).To(Equal(objectContent))
+
+			By(fmt.Sprintf("%s 清理 %s 冲突对象，隔离下一组保留名验证", scenarioID, conflict.name))
+			deletePreflightResource(ctx, conflict.resource, conflict.objectName, "monitor-in-hand-test")
+		}
+
+		By(scenarioID + " 在独立 namespace 创建结构冲突的 prometheus-agent-operated Service")
+		applyPreflightManifest(ctx, gh60ConflictServiceResources)
+		DeferCleanup(func(cleanupCtx SpecContext) {
+			deletePreflightResource(cleanupCtx, "namespace", "gh60-preflight-conflict", "")
+		})
+		serviceAgentPath := filepath.Join(manifestDir, "service-agent.yaml")
+		Expect(os.WriteFile(serviceAgentPath, []byte(conflictingGH60ServiceAgentManifest), 0o600)).To(Succeed())
+		serviceContent := resourceContent(ctx, "service", "prometheus-agent-operated", "gh60-preflight-conflict")
+		By(scenarioID + " 对共享 Service 结构冲突执行公开预检入口")
+		serviceOutput, serviceErr := runPreflight(ctx, "gh60-agent",
+			"AGENT_NAMESPACE=gh60-preflight-conflict", "CONFIG_NAMESPACES=gh60-preflight-conflict",
+			"DISCOVERY_NAMESPACES=gh60-preflight-conflict", "AGENT_MANIFEST="+serviceAgentPath)
+		By(scenarioID + " 验证共享 Service 冲突非零退出且原对象身份与内容快照不变")
+		Expect(serviceErr).To(HaveOccurred(), serviceOutput)
+		Expect(parseDiagnostics(serviceOutput)).To(ContainElement(WithTransform(func(item diagnostic) string { return item.Reason }, Equal("GoverningServiceConflict"))))
+		Expect(resourceContent(ctx, "service", "prometheus-agent-operated", "gh60-preflight-conflict")).To(Equal(serviceContent))
+
+		By(scenarioID + " 等待成功预检创建的临时 Agent ownerReference 从共享 Service 完成 GC")
+		waitForPreflightServiceOwnerGC(ctx, "monitor-in-hand-test")
+
+		By(scenarioID + " 创建存储属性与 Agent 计划不匹配的同名 retained PVC")
+		applyPreflightManifest(ctx, gh60ConflictPVC)
+		DeferCleanup(func(cleanupCtx SpecContext) {
+			deletePreflightResource(cleanupCtx, "persistentvolumeclaim", "prom-agent-gh60-pvc-db-prom-agent-gh60-pvc-0", "monitor-in-hand-test")
+		})
+		pvcAgentPath := filepath.Join(manifestDir, "pvc-agent.yaml")
+		Expect(os.WriteFile(pvcAgentPath, []byte(conflictingGH60PVCAgentManifest), 0o600)).To(Succeed())
+		pvcContent := resourceContent(ctx, "persistentvolumeclaim", "prom-agent-gh60-pvc-db-prom-agent-gh60-pvc-0", "monitor-in-hand-test")
+		By(scenarioID + " 对 retained PVC 属性冲突执行公开预检入口")
+		pvcOutput, pvcErr := runPreflight(ctx, "prometheus-agent", "AGENT_MANIFEST="+pvcAgentPath)
+		By(scenarioID + " 验证 retained PVC 冲突非零退出且原对象身份与内容快照不变")
+		Expect(pvcErr).To(HaveOccurred(), pvcOutput)
+		Expect(parseDiagnostics(pvcOutput)).To(ContainElement(WithTransform(func(item diagnostic) string { return item.Reason }, Equal("RetainedPVCConflict"))))
+		Expect(resourceContent(ctx, "persistentvolumeclaim", "prom-agent-gh60-pvc-db-prom-agent-gh60-pvc-0", "monitor-in-hand-test")).To(Equal(pvcContent))
+	}, SpecTimeout(8*time.Minute))
 })
 
 func stableScenarioID(sequence string) string {
@@ -162,12 +252,16 @@ func stableScenarioID(sequence string) string {
 			"002":      "E2E-119-PREFLIGHT-002",
 			"GH59-001": "E2E-119-PREFLIGHT-GH59-001",
 			"GH59-002": "E2E-119-PREFLIGHT-GH59-002",
+			"GH60-001": "E2E-119-PREFLIGHT-GH60-001",
+			"GH60-002": "E2E-119-PREFLIGHT-GH60-002",
 		},
 		"1.28": {
 			"001":      "E2E-128-PREFLIGHT-001",
 			"002":      "E2E-128-PREFLIGHT-002",
 			"GH59-001": "E2E-128-PREFLIGHT-GH59-001",
 			"GH59-002": "E2E-128-PREFLIGHT-GH59-002",
+			"GH60-001": "E2E-128-PREFLIGHT-GH60-001",
+			"GH60-002": "E2E-128-PREFLIGHT-GH60-002",
 		},
 	}
 	if versionIDs, supported := ids[os.Getenv("KUBERNETES_VERSION")]; supported {
@@ -245,6 +339,216 @@ spec:
   serviceAccountName: prometheus-agent
   serviceMonitorSelector: {}
 `
+
+const plannedGH60AgentManifest = `
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata: {name: gh60-planned, namespace: monitor-in-hand-test}
+spec:
+  version: v2.55.1
+  image: quay.io/prometheus/prometheus:v2.55.1
+  serviceAccountName: prometheus-agent
+  replicas: 1
+  shards: 2
+  replicaExternalLabelName: ""
+  externalLabels: {mih_cluster_id: gh60-preflight}
+  remoteWrite: [{name: fixture-vm, url: "http://vminsert.monitor-in-hand-test.svc:8480/insert/0/prometheus/api/v1/write"}]
+`
+
+const conflictingGH60AgentManifest = `
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata: {name: gh60-conflict, namespace: monitor-in-hand-test}
+spec:
+  serviceAccountName: prometheus-agent
+  replicas: 1
+  shards: 1
+`
+
+const gh60ConflictStatefulSet = `
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: prom-agent-gh60-conflict, namespace: monitor-in-hand-test}
+spec:
+  serviceName: unrelated
+  replicas: 0
+  selector: {matchLabels: {app: unrelated}}
+  template:
+    metadata: {labels: {app: unrelated}}
+    spec:
+      containers:
+        - {name: unrelated, image: "quay.io/prometheus/prometheus:v2.55.1"}
+`
+
+const gh60ConflictPod = `
+apiVersion: v1
+kind: Pod
+metadata: {name: prom-agent-gh60-conflict-0, namespace: monitor-in-hand-test}
+spec:
+  containers:
+    - {name: unrelated, image: "quay.io/prometheus/prometheus:v2.55.1", args: ["--version"]}
+`
+
+const gh60ConflictConfigSecret = `
+apiVersion: v1
+kind: Secret
+metadata: {name: prom-agent-gh60-conflict, namespace: monitor-in-hand-test}
+stringData: {sentinel: config}
+`
+
+const gh60ConflictTLSSecret = `
+apiVersion: v1
+kind: Secret
+metadata: {name: prom-agent-gh60-conflict-tls-assets-1, namespace: monitor-in-hand-test}
+stringData: {sentinel: tls}
+`
+
+const gh60ConflictWebSecret = `
+apiVersion: v1
+kind: Secret
+metadata: {name: prom-agent-gh60-conflict-web-config, namespace: monitor-in-hand-test}
+stringData: {sentinel: web}
+`
+
+const gh60ConflictServiceResources = `
+apiVersion: v1
+kind: Namespace
+metadata: {name: gh60-preflight-conflict}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: gh60-agent, namespace: gh60-preflight-conflict}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: prometheus-agent-operated, namespace: gh60-preflight-conflict}
+spec:
+  clusterIP: None
+  selector: {app: unrelated}
+  ports: [{name: web, port: 9090, targetPort: web}]
+`
+
+const conflictingGH60ServiceAgentManifest = `
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata: {name: gh60-service, namespace: gh60-preflight-conflict}
+spec: {serviceAccountName: gh60-agent, replicas: 1, shards: 1}
+`
+
+const gh60ConflictPVC = `
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prom-agent-gh60-pvc-db-prom-agent-gh60-pvc-0
+  namespace: monitor-in-hand-test
+  labels:
+    app.kubernetes.io/name: prometheus-agent
+    app.kubernetes.io/managed-by: prometheus-operator
+    app.kubernetes.io/instance: gh60-pvc
+    operator.prometheus.io/name: gh60-pvc
+    operator.prometheus.io/shard: "0"
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  storageClassName: unrelated
+  resources: {requests: {storage: 1Gi}}
+`
+
+const conflictingGH60PVCAgentManifest = `
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata: {name: gh60-pvc, namespace: monitor-in-hand-test}
+spec:
+  serviceAccountName: prometheus-agent
+  replicas: 0
+  shards: 1
+  storage:
+    volumeClaimTemplate:
+      spec:
+        accessModes: [ReadWriteOnce]
+        volumeMode: Filesystem
+        storageClassName: expected
+        resources: {requests: {storage: 1Gi}}
+`
+
+func applyPreflightManifest(ctx context.Context, manifest string) {
+	GinkgoHelper()
+	command := exec.CommandContext(ctx, "kubectl", "--context", config.kubeContext, "apply", "--filename", "-")
+	command.Stdin = strings.NewReader(manifest)
+	output, err := command.CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), string(output))
+}
+
+func resourceContent(ctx context.Context, resource, name, namespace string) string {
+	GinkgoHelper()
+	args := []string{"--context", config.kubeContext}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+	args = append(args, "get", resource, name, "--output", "json")
+	output, err := exec.CommandContext(ctx, "kubectl", args...).CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), string(output))
+	var object map[string]any
+	Expect(json.Unmarshal(output, &object)).To(Succeed())
+	metadata := object["metadata"].(map[string]any)
+	fingerprint := map[string]any{
+		"uid":             metadata["uid"],
+		"labels":          metadata["labels"],
+		"annotations":     metadata["annotations"],
+		"ownerReferences": metadata["ownerReferences"],
+		"finalizers":      metadata["finalizers"],
+	}
+	for _, field := range []string{"spec", "data", "roleRef", "subjects", "rules", "secrets"} {
+		if value, found := object[field]; found {
+			fingerprint[field] = value
+		}
+	}
+	encoded, err := json.Marshal(fingerprint)
+	Expect(err).NotTo(HaveOccurred())
+	return string(encoded)
+}
+
+func deletePreflightResource(ctx context.Context, resource, name, namespace string) {
+	GinkgoHelper()
+	args := []string{"--context", config.kubeContext}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+	args = append(args, "delete", resource, name, "--ignore-not-found", "--wait=true", "--timeout=2m")
+	output, err := exec.CommandContext(ctx, "kubectl", args...).CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), string(output))
+}
+
+func waitForPreflightServiceOwnerGC(ctx context.Context, namespace string) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		serviceArgs := []string{"--context", config.kubeContext, "--namespace", namespace, "get", "service", "prometheus-agent-operated", "--output", "json"}
+		serviceOutput, err := exec.CommandContext(ctx, "kubectl", serviceArgs...).CombinedOutput()
+		g.Expect(err).NotTo(HaveOccurred(), string(serviceOutput))
+		agentArgs := []string{"--context", config.kubeContext, "--namespace", namespace, "get", "prometheusagents", "--output", "json"}
+		agentOutput, err := exec.CommandContext(ctx, "kubectl", agentArgs...).CombinedOutput()
+		g.Expect(err).NotTo(HaveOccurred(), string(agentOutput))
+		var service struct {
+			Metadata struct {
+				OwnerReferences []struct {
+					Name, UID string
+				} `json:"ownerReferences"`
+			} `json:"metadata"`
+		}
+		var agents struct {
+			Items []struct {
+				Metadata struct{ Name, UID string } `json:"metadata"`
+			} `json:"items"`
+		}
+		g.Expect(json.Unmarshal(serviceOutput, &service)).To(Succeed())
+		g.Expect(json.Unmarshal(agentOutput, &agents)).To(Succeed())
+		for _, owner := range service.Metadata.OwnerReferences {
+			g.Expect(agents.Items).To(ContainElement(HaveField("Metadata", SatisfyAll(
+				HaveField("Name", owner.Name), HaveField("UID", owner.UID),
+			))))
+		}
+	}, 2*time.Minute, time.Second).Should(Succeed())
+}
 
 func parseDiagnostics(output string) []diagnostic {
 	// Make 会回显 recipe；只将可解析的 NDJSON 行作为预检诊断记录。

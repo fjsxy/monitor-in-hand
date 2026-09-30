@@ -121,10 +121,10 @@ e2e-preflight: ## Verify strict deployment preflight against the current pinned 
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/preflight" \
 		./test/e2e/preflight
 
-e2e-collection: ## Verify native PrometheusAgent collection selection and targets.
+e2e-collection: ## Verify native PrometheusAgent collection and boundaries after e2e-default-deployment.
 	mkdir -p "$(E2E_REPORT_DIR)/collection"
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" \
-		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=25m \
+		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=35m \
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/collection" \
 		./test/e2e/collection
 

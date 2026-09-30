@@ -182,7 +182,7 @@ render_manifest_documents() {
 }
 
 validate_collection_plan() {
-  local rendered agent_count invalid_identity empty_selectors unsupported manifest
+  local rendered agent_count invalid_identity replicas shards empty_selectors unsupported manifest
   [[ -n "${agent_manifest}" ]] || return 0
 
   # 先把单个 Agent manifest 规范化为 JSON，并确认它与命令行声明的运行身份一致。
@@ -206,6 +206,34 @@ validate_collection_plan() {
     record_failure collection-configuration fail AgentIdentityMismatch "Agent manifest 的 namespace 或 runtime ServiceAccount 与预检输入不一致" \
       "$(jq --null-input --arg namespace "${agent_namespace}" --arg serviceAccount "${agent_service_account}" --argjson actual "${invalid_identity}" '{expected: {namespace: $namespace, serviceAccount: $serviceAccount}, actual: $actual}')"
   fi
+
+  # replicas 表达同一 shard 的重复采集；一期只允许单副本运行或缩零挂起。
+  if ! jq --exit-status '(.spec.replicas // 1) as $value | ($value | type) == "number" and ($value | floor) == $value and $value >= 0' <<<"${agent_json}" >/dev/null; then
+    record_failure agent-topology fail InvalidAgentReplicas "replicas 必须是非负整数"
+    return
+  fi
+  replicas=$(jq --raw-output '.spec.replicas // 1' <<<"${agent_json}")
+  case "${replicas}" in
+    0)
+      record_pass agent-topology pass SuspendedAgentTopology "replicas=0 表示挂起，所有 shard 的 StatefulSet 将缩零" \
+        "$(jq --null-input --argjson replicas "${replicas}" '{replicas: $replicas}')"
+      ;;
+    1)
+      record_pass agent-topology pass SupportedAgentReplicas "replicas 省略或为 1，符合一期单副本运行语义" \
+        "$(jq --null-input --argjson replicas "${replicas}" '{replicas: $replicas}')"
+      ;;
+    *)
+      record_failure agent-topology fail UnsupportedAgentReplicas "replicas=${replicas} 是上游能力，但一期只支持省略、0 或 1" \
+        "$(jq --null-input --argjson replicas "${replicas}" '{replicas: $replicas, supported: [0, 1]}')"
+      ;;
+  esac
+  if ! jq --exit-status '(.spec.shards // 1) as $value | ($value | type) == "number" and ($value | floor) == $value and $value >= 1' <<<"${agent_json}" >/dev/null; then
+    record_failure agent-topology fail InvalidAgentShards "shards 必须是至少为 1 的整数"
+    return
+  fi
+  shards=$(jq --raw-output '.spec.shards // 1' <<<"${agent_json}")
+  record_pass agent-topology pass SupportedAgentShards "shards=${shards} 通过一期分片拓扑检查" \
+    "$(jq --null-input --argjson shards "${shards}" '{shards: $shards}')"
 
   # 分别检查四类 object selector；nil 是合法关闭状态，显式空对象不属于一期支持子集。
   empty_selectors=$(jq --compact-output '
@@ -335,6 +363,233 @@ else
   record_failure runtime-service-account fail RuntimeServiceAccountNotFound "Agent runtime ServiceAccount ${agent_namespace}/${agent_service_account} 不存在或不可读" \
     "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${agent_service_account}" --arg error "${service_account_error}" '{namespace: $namespace, name: $name, error: $error}')"
 fi
+
+validate_agent_resource_identities() {
+  local agent_name current_agent current_agent_uid shards shard statefulset_name statefulset_uid pod_name tls_index
+  [[ -n "${agent_manifest}" ]] || return
+  agent_name=$(jq --raw-output '.metadata.name' <<<"${agent_json}")
+  shards=$(jq --raw-output '.spec.shards // 1' <<<"${agent_json}")
+
+  # 先读取同 namespace/name 的原生 Agent，便于区分已有实例的合法外部生成资源与无关占用。
+  if ! current_agent=$(kubectl_call --namespace "${agent_namespace}" get prometheusagent "${agent_name}" --ignore-not-found --output json 2>&1); then
+    record_failure agent-resource-identity fail ReservedResourceLookupFailed "无法读取计划 Agent ${agent_namespace}/${agent_name} 的当前身份" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${agent_name}" --arg error "${current_agent}" '{namespace: $namespace, name: $name, error: $error}')"
+    return
+  fi
+  current_agent_uid=
+  if [[ -n "${current_agent}" ]]; then
+    if ! current_agent_uid=$(jq --raw-output --exit-status '
+        select(type == "object" and .metadata.name != null and .metadata.uid != null) | .metadata.uid
+      ' <<<"${current_agent}" 2>/dev/null); then
+      record_failure agent-resource-identity fail InvalidReservedResourceResponse "已有 PrometheusAgent 响应缺少 name 或 UID" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${agent_name}" '{namespace: $namespace, name: $name, kind: "PrometheusAgent"}')"
+      return
+    fi
+  fi
+
+  check_agent_owned_resource() {
+    local kind=$1 name=$2 expected_api=$3 expected_owner_kind=$4 expected_owner_name=${5:-${agent_name}} expected_owner_uid=${6:-} display_kind output owned
+    case "${kind}" in
+      statefulset) display_kind=StatefulSet ;;
+      pod) display_kind=Pod ;;
+      secret) display_kind=Secret ;;
+      *) display_kind=${kind} ;;
+    esac
+    RESOURCE_PRESENT=false
+    RESOURCE_UID=
+    if ! output=$(kubectl_call --namespace "${agent_namespace}" get "${kind}" "${name}" --ignore-not-found --output json 2>&1); then
+      record_failure agent-resource-identity fail ReservedResourceLookupFailed "无法读取保留资源 ${display_kind} ${agent_namespace}/${name}" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg kind "${display_kind}" --arg name "${name}" --arg error "${output}" '{namespace: $namespace, kind: $kind, name: $name, error: $error}')"
+      return
+    fi
+    if [[ -z "${output}" ]]; then return; fi
+    RESOURCE_PRESENT=true
+    RESOURCE_UID=$(jq --raw-output '.metadata.uid // ""' <<<"${output}" 2>/dev/null || true)
+    owned=false
+    if [[ -n "${current_agent_uid}" ]]; then
+      # Pod 必须引用本次读到的 StatefulSet UID；只比较同名 owner 会把删除重建前遗留的 Pod 误认为当前实例资源。
+      if [[ "${expected_owner_kind}" != StatefulSet ]]; then expected_owner_uid=${current_agent_uid}; fi
+      owned=$(jq --raw-output --arg apiVersion "${expected_api}" --arg ownerKind "${expected_owner_kind}" \
+        --arg ownerName "${expected_owner_name}" --arg uid "${expected_owner_uid}" '
+          any(.metadata.ownerReferences[]?;
+            .apiVersion == $apiVersion and .kind == $ownerKind and .name == $ownerName and
+            $uid != "" and .uid == $uid and .controller == true)
+        ' <<<"${output}" 2>/dev/null || printf false)
+    fi
+    if [[ "${owned}" != true ]]; then
+      record_failure agent-resource-identity fail ReservedResourceConflict "保留资源 ${display_kind} ${agent_namespace}/${name} 已被无关对象占用，拒绝交给 Prometheus Operator 接管" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg kind "${display_kind}" --arg name "${name}" '{namespace: $namespace, kind: $kind, name: $name}')"
+    fi
+  }
+
+  # v0.83.0 为 shard 0 使用无后缀名，其余 shard 使用 -shard-N；一期最多一个 ordinal Pod。
+  for ((shard = 0; shard < shards; shard++)); do
+    statefulset_name="prom-agent-${agent_name}"
+    if ((shard > 0)); then statefulset_name+="-shard-${shard}"; fi
+    check_agent_owned_resource statefulset "${statefulset_name}" monitoring.coreos.com/v1alpha1 PrometheusAgent
+    statefulset_uid=${RESOURCE_UID}
+    pod_name="${statefulset_name}-0"
+    check_agent_owned_resource pod "${pod_name}" apps/v1 StatefulSet "${statefulset_name}" "${statefulset_uid}"
+  done
+  check_agent_owned_resource secret "prom-agent-${agent_name}" monitoring.coreos.com/v1alpha1 PrometheusAgent
+  check_agent_owned_resource secret "prom-agent-${agent_name}-tls-assets-0" monitoring.coreos.com/v1alpha1 PrometheusAgent
+  # v0.83.0 会从当前需要的 TLS shard 末尾连续删除多余 Secret，因此同样必须保护连续的 -1、-2... 名称。
+  tls_index=1
+  while :; do
+    check_agent_owned_resource secret "prom-agent-${agent_name}-tls-assets-${tls_index}" monitoring.coreos.com/v1alpha1 PrometheusAgent
+    [[ "${RESOURCE_PRESENT}" == true ]] || break
+    tls_index=$((tls_index + 1))
+  done
+  check_agent_owned_resource secret "prom-agent-${agent_name}-web-config" monitoring.coreos.com/v1alpha1 PrometheusAgent
+
+  if ((failures == 0)); then
+    record_pass agent-resource-identity pass ReservedResourceNamesAvailable "Prometheus Operator v0.83.0 的 StatefulSet、Pod 与 Secret 保留身份可用" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${agent_name}" --argjson shards "${shards}" '{namespace: $namespace, agent: $name, shards: $shards}')"
+  fi
+}
+
+validate_governing_service() {
+  local service agents compatible facts port_name custom_service
+  [[ -n "${agent_manifest}" ]] || return
+  custom_service=$(jq --raw-output '.spec.serviceName // ""' <<<"${agent_json}")
+  if jq --exit-status '.spec.serviceName != null' <<<"${agent_json}" >/dev/null; then
+    record_pass governing-service pass CustomGoverningServiceConfigured "Agent 使用自定义 governing Service，不会调谐默认 prometheus-agent-operated" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${custom_service}" '{namespace: $namespace, name: $name}')"
+    return
+  fi
+  port_name=$(jq --raw-output 'if (.spec.portName // "") == "" then "web" else .spec.portName end' <<<"${agent_json}")
+  if ! service=$(kubectl_call --namespace "${agent_namespace}" get service prometheus-agent-operated --ignore-not-found --output json 2>&1); then
+    record_failure governing-service fail GoverningServiceLookupFailed "无法读取默认 governing Service ${agent_namespace}/prometheus-agent-operated" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --arg error "${service}" '{namespace: $namespace, name: "prometheus-agent-operated", error: $error}')"
+    return
+  fi
+  if [[ -z "${service}" ]]; then
+    record_pass governing-service pass GoverningServiceNameAvailable "默认 governing Service 名称未被占用" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" '{namespace: $namespace, name: "prometheus-agent-operated"}')"
+    return
+  fi
+  if ! agents=$(kubectl_call --namespace "${agent_namespace}" get prometheusagents --output json 2>&1); then
+    record_failure governing-service fail GoverningServiceOwnersUnavailable "无法核对共享 governing Service 的 Agent ownerReferences" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --arg error "${agents}" '{namespace: $namespace, name: "prometheus-agent-operated", error: $error}')"
+    return
+  fi
+
+  # 默认 Service 是 namespace 内所有 Agent StatefulSet 的共享 headless governing Service，owner 只能是已存在 Agent 的普通引用。
+  if ! facts=$(jq --compact-output --exit-status --argjson agents "${agents}" --arg portName "${port_name}" '
+      (.metadata.ownerReferences // []) as $owners |
+      {structure:
+        (.spec.clusterIP == "None" and (.spec.type // "ClusterIP") == "ClusterIP" and
+         .spec.selector == {"app.kubernetes.io/name": "prometheus-agent"} and
+         (.spec.ports | type) == "array" and (.spec.ports | length) == 1 and
+         .spec.ports[0].name == $portName and .spec.ports[0].port == 9090 and
+         .spec.ports[0].targetPort == $portName and (.spec.ports[0].protocol // "TCP") == "TCP" and
+         .metadata.labels["managed-by"] == "prometheus-operator" and
+         .metadata.labels["operated-prometheus"] == "true"),
+       owners:
+        (($owners | length) > 0 and all($owners[];
+          .apiVersion == "monitoring.coreos.com/v1alpha1" and .kind == "PrometheusAgent" and
+          (.controller // false) == false and (.blockOwnerDeletion // false) == false and
+          . as $owner | any($agents.items[]?;
+            .metadata.name == $owner.name and .metadata.uid == $owner.uid))),
+       ownerCount: ($owners | length)}
+    ' <<<"${service}" 2>/dev/null); then
+    record_failure governing-service fail GoverningServiceConflict "prometheus-agent-operated 不是 Prometheus Operator v0.83.0 的合法共享 Service，拒绝接管" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" '{namespace: $namespace, name: "prometheus-agent-operated"}')"
+    return
+  fi
+  compatible=$(jq --raw-output '.structure and .owners' <<<"${facts}")
+  if [[ "${compatible}" != true ]]; then
+    record_failure governing-service fail GoverningServiceConflict "prometheus-agent-operated 的 headless 结构或普通 Agent ownerReferences 不合法，拒绝接管" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --argjson facts "${facts}" '{namespace: $namespace, name: "prometheus-agent-operated", facts: $facts}')"
+    return
+  fi
+  record_pass governing-service pass SharedGoverningServiceCompatible "prometheus-agent-operated 是可由同 namespace 多个 Agent 共享的合法 governing Service" \
+    "$(jq --null-input --arg namespace "${agent_namespace}" --argjson facts "${facts}" '{namespace: $namespace, name: "prometheus-agent-operated", ownerCount: $facts.ownerCount}')"
+}
+
+validate_retained_pvcs() {
+  local agent_name shards claim_template desired_access_modes desired_volume_mode desired_storage_class_set desired_storage_class desired_storage desired_storage_normalized shard statefulset_name pvc_name pvc pvc_storage pvc_storage_normalized compatible expected_names='[]'
+  [[ -n "${agent_manifest}" ]] || return
+  if ! jq --exit-status '.spec.storage.volumeClaimTemplate != null' <<<"${agent_json}" >/dev/null; then return; fi
+  agent_name=$(jq --raw-output '.metadata.name' <<<"${agent_json}")
+  shards=$(jq --raw-output '.spec.shards // 1' <<<"${agent_json}")
+  claim_template=$(jq --raw-output --arg default "prom-agent-${agent_name}-db" '.spec.storage.volumeClaimTemplate.metadata.name // $default' <<<"${agent_json}")
+  desired_access_modes=$(jq --compact-output '.spec.storage.volumeClaimTemplate.spec.accessModes // ["ReadWriteOnce"]' <<<"${agent_json}")
+  desired_volume_mode=$(jq --raw-output '.spec.storage.volumeClaimTemplate.spec.volumeMode // "Filesystem"' <<<"${agent_json}")
+  desired_storage_class_set=$(jq --raw-output '.spec.storage.volumeClaimTemplate.spec | has("storageClassName")' <<<"${agent_json}")
+  desired_storage_class=$(jq --raw-output '.spec.storage.volumeClaimTemplate.spec.storageClassName // ""' <<<"${agent_json}")
+  desired_storage=$(jq --raw-output '.spec.storage.volumeClaimTemplate.spec.resources.requests.storage // ""' <<<"${agent_json}")
+
+  normalize_storage_quantity() {
+    local quantity=$1 quota
+    [[ -n "${quantity}" ]] || return
+    if ! quota=$(kubectl_call create quota mih-preflight-storage-quantity \
+        --hard="requests.storage=${quantity}" --dry-run=client --output json 2>&1); then
+      return 1
+    fi
+    jq --raw-output --exit-status '.spec.hard["requests.storage"]' <<<"${quota}" 2>/dev/null
+  }
+
+  desired_storage_normalized=
+  if [[ -n "${desired_storage}" ]] && ! desired_storage_normalized=$(normalize_storage_quantity "${desired_storage}"); then
+    record_failure retained-pvc fail InvalidRetainedPVCQuantity "无法按 Kubernetes Quantity 语义解析 Agent 的 storage request" \
+      "$(jq --null-input --arg storage "${desired_storage}" '{storage: $storage}')"
+    return
+  fi
+
+  # StatefulSet 缩零或 Agent 重建时 ordinal 0 的 claim 仍是一期恢复身份，不由本项目修改或删除。
+  for ((shard = 0; shard < shards; shard++)); do
+    statefulset_name="prom-agent-${agent_name}"
+    if ((shard > 0)); then statefulset_name+="-shard-${shard}"; fi
+    pvc_name="${claim_template}-${statefulset_name}-0"
+    expected_names=$(jq --compact-output --arg name "${pvc_name}" '. + [$name]' <<<"${expected_names}")
+    if ! pvc=$(kubectl_call --namespace "${agent_namespace}" get persistentvolumeclaim "${pvc_name}" --ignore-not-found --output json 2>&1); then
+      record_failure retained-pvc fail RetainedPVCLookupFailed "无法读取预期 retained PVC ${agent_namespace}/${pvc_name}" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${pvc_name}" --arg error "${pvc}" '{namespace: $namespace, name: $name, error: $error}')"
+      continue
+    fi
+    [[ -n "${pvc}" ]] || continue
+    pvc_storage=$(jq --raw-output '.spec.resources.requests.storage // ""' <<<"${pvc}")
+    pvc_storage_normalized=
+    if [[ -n "${pvc_storage}" ]] && ! pvc_storage_normalized=$(normalize_storage_quantity "${pvc_storage}"); then
+      record_failure retained-pvc fail RetainedPVCConflict "retained PVC ${agent_namespace}/${pvc_name} 的 storage request 无法按 Kubernetes Quantity 语义解析" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${pvc_name}" --arg storage "${pvc_storage}" '{namespace: $namespace, name: $name, storage: $storage}')"
+      continue
+    fi
+    compatible=$(jq --raw-output --arg agent "${agent_name}" --arg shard "${shard}" \
+      --argjson accessModes "${desired_access_modes}" --arg volumeMode "${desired_volume_mode}" \
+      --argjson storageClassSet "${desired_storage_class_set}" --arg storageClass "${desired_storage_class}" \
+      --arg storage "${desired_storage_normalized}" --arg pvcStorage "${pvc_storage_normalized}" '
+        (.metadata.deletionTimestamp == null) and
+        ((.metadata.ownerReferences // []) | length == 0) and
+        (.metadata.labels["app.kubernetes.io/name"] == "prometheus-agent") and
+        (.metadata.labels["app.kubernetes.io/managed-by"] == "prometheus-operator") and
+        (.metadata.labels["app.kubernetes.io/instance"] == $agent) and
+        (.metadata.labels["operator.prometheus.io/name"] == $agent) and
+        (.metadata.labels["operator.prometheus.io/shard"] == $shard) and
+        ((.spec.accessModes // []) == $accessModes) and
+        ((.spec.volumeMode // "Filesystem") == $volumeMode) and
+        (($storageClassSet | not) or
+          ((.spec | has("storageClassName")) and .spec.storageClassName == $storageClass)) and
+        ($pvcStorage == $storage)
+      ' <<<"${pvc}" 2>/dev/null || printf false)
+    if [[ "${compatible}" != true ]]; then
+      record_failure retained-pvc fail RetainedPVCConflict "retained PVC ${agent_namespace}/${pvc_name} 的来源身份或存储属性与 Agent 计划不匹配" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${pvc_name}" '{namespace: $namespace, name: $name}')"
+      continue
+    fi
+    record_pass retained-pvc pass RetainedPVCCompatible "retained PVC ${agent_namespace}/${pvc_name} 符合同 namespace/name Agent 恢复条件" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${pvc_name}" '{namespace: $namespace, name: $name}')"
+  done
+  if ((failures == 0)); then
+    record_pass retained-pvc pass RetainedPVCIdentitiesChecked "已检查每个 shard/ordinal 的预期 retained PVC 身份" \
+      "$(jq --null-input --arg namespace "${agent_namespace}" --argjson names "${expected_names}" '{namespace: $namespace, names: $names}')"
+  fi
+}
+
+if ((failures == 0)); then validate_agent_resource_identities; fi
+if ((failures == 0)); then validate_governing_service; fi
+if ((failures == 0)); then validate_retained_pvcs; fi
 if ((failures > 0)); then finish_failed; fi
 
 validate_collection_selection() {

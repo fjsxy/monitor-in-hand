@@ -16,6 +16,25 @@ hack/preflight.sh \
 kubectl apply -f agent.yaml
 ```
 
+`prometheus-agent-runtime` ClusterRole 是一期 Agent 共享的 discovery 权限集。
+每个 Agent 仍要在自己 namespace 中使用独立 ServiceAccount，并用同时包含
+namespace/name 身份的独立 ClusterRoleBinding 绑定该共享角色。这些管理员资源
+不设置指向 Agent 的 ownerReference，也不随 Agent 删除而清理。
+
+预检以 `namespace/name` 作为 Agent 身份，按 Prometheus Operator v0.83.0 的精确规则
+检查每个 shard 的 `prom-agent-*` StatefulSet/Pod、配置/TLS/web Secrets 和可选
+retained PVC。无关对象占用任一保留名时必须先由管理员处理，预检不会修改、
+删除或接管它。默认 `prometheus-agent-operated` 是例外：它是 namespace 内所有
+Agent 的共享 headless governing Service，只要结构和普通 Agent ownerReferences 合法
+就可复用；结构中的端口名取自 Agent 的 `portName`。显式 `serviceName` 使用上游自定义
+governing Service 路径，不检查默认名称。已有 retained PVC 会按计划中的 accessModes、
+volumeMode、容量和显式 StorageClass 核对；名称尚未存在时，预检不会额外收窄上游
+storage 能力。预检是创建前的时点检查，不代替 GitOps 变更控制。
+
+一期正常运行仅支持省略 `replicas` 或设为 `1`；`replicas: 0` 挂起所有 shards；
+`replicas > 1` 仍是上游能力，但不能通过一期预检。扩展吞吐时使用至少为 `1`
+的 `shards`，每个 shard 会获得独立 StatefulSet、Pod 和 WAL。
+
 示例中的四类 object selector 都是明确的非空 `LabelSelector`。上游允许 `{}` 选择
 可见范围内的全部对象，但一期预检会拒绝这种开放选择；省略某类 object selector
 则表示不选择该类，四类都省略也是合法零配置。

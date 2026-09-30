@@ -7,7 +7,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: prometheus-agent-example
+  name: prometheus-agent-runtime
 rules:
   - apiGroups: [""]
     resources: ["services", "endpoints", "pods"]
@@ -27,11 +27,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: prometheus-agent-example
+  name: prometheus-agent-monitoring-example
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: prometheus-agent-example
+  name: prometheus-agent-runtime
 subjects:
   - kind: ServiceAccount
     name: prometheus-agent-example
