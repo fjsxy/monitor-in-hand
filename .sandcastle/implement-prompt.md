@@ -21,7 +21,7 @@
 - 一次完成一个可验证的 red-green slice。
 - 新增稳定测试场景时使用包含 `GH{{TASK_ID}}` 的 Issue-scoped ID；不得扫描现有最大编号后分配全局递增 ID，也不得重命名已有 ID。完整格式遵循 `docs/agents/development-standards.md`。
 - 经常运行聚焦测试；提交前至少运行 `make typecheck` 和 `make test HELM=helm`。
-- sandbox 不挂载宿主 Docker socket。需要 kind/Docker 的验收必须落实为 PR 中的 blocking CI job；本地明确记录未运行，不能伪报通过。
+- sandbox 不提供 Docker daemon，也不挂载宿主 Docker socket。需要 Docker/kind 的验收由调度器在 review 后通过宿主机 Kubernetes 1.28 E2E gate 执行；sandbox 内只运行不依赖 Docker 的验证，不能伪报 E2E 通过。GitHub CI 的双版本 gate 仍是最终权威验证。
 - 不得通过删除、skip、放宽断言或吞掉错误让测试变绿。
 - 不修改 Issue assignee/labels，不关闭 Issue，不 push，不创建或合并 PR；这些由宿主调度器负责。
 

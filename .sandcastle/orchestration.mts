@@ -94,3 +94,18 @@ export function ciRepairPromptArgs(
     REPAIR_ATTEMPT: String(repairAttempt),
   };
 }
+
+export function localE2ERepairPromptArgs(
+  issue: Pick<IssueRecord, "number" | "title">,
+  branch: string,
+  testRunId: string,
+  logPath: string,
+  repairAttempt: number,
+): Record<string, string> {
+  return {
+    ...promptArgsForIssue(issue, branch),
+    TEST_RUN_ID: testRunId,
+    LOCAL_E2E_LOG_PATH: logPath,
+    REPAIR_ATTEMPT: String(repairAttempt),
+  };
+}

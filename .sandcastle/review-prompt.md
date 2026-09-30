@@ -18,6 +18,6 @@
 
 阅读长文件时逐个、分段读取；搜索先限定目录和模式，再按需展开。不要在一次命令中串联多个长文件或回传大范围无界输出。
 
-发现问题时直接在当前分支修复、运行聚焦测试，并至少运行 `make typecheck` 与 `make test HELM=helm`，然后提交修复。sandbox 不挂载宿主 Docker socket；需要 kind/Docker 的验收必须检查其是否被接入 PR 的 blocking CI，不能伪报本地通过。不要改变需求范围，不要修改或关闭 Issue，不要 push/创建 PR。
+发现问题时直接在当前分支修复、运行聚焦测试，并至少运行 `make typecheck` 与 `make test HELM=helm`，然后提交修复。sandbox 不提供 Docker daemon，也不挂载宿主 Docker socket；调度器会在 review 完成后由宿主机运行 Kubernetes 1.28 E2E gate。必须明确记录未运行的 Docker/kind 验证，不能伪报通过。不要改变需求范围，不要修改或关闭 Issue，不要 push/创建 PR。
 
 只有实现已达到可提 PR、本地可执行验证通过、CI-only 验收已接入 blocking CI，且没有未解决的阻断问题时，输出 `<promise>COMPLETE</promise>`。

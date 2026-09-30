@@ -17,7 +17,7 @@
 
 1. 先确认 `git rev-parse HEAD` 等于 `{{FAILED_HEAD_OID}}`，否则停止，避免覆盖并发更新。
 2. 使用 `gh pr view {{PR_NUMBER}}`、`gh pr checks {{PR_NUMBER}}` 和 `gh run view <run-id> --log-failed` 获取失败证据；需要时用 `gh run download <run-id> --dir /tmp/<isolated-dir>` 把 artifacts 下载到仓库外的临时目录。
-3. 建立能捕获同一失败的最小反馈回路，追到根因；若 sandbox 无法运行 kind/Docker，使用 CI logs、JUnit、evidence artifacts 和不依赖 Docker 的最小测试复现，不伪报 E2E 通过。
+3. 建立能捕获同一失败的最小反馈回路，追到根因；sandbox 不提供 Docker daemon，使用 CI logs、JUnit、evidence artifacts 和不依赖 Docker 的最小测试复现，不寻找或挂载宿主 Docker socket，也不伪报 E2E 通过。
 4. 按 red → green 修复并运行聚焦测试；提交前至少运行 `make typecheck` 和 `make test HELM=helm`。
 5. 将修复和回归测试提交到当前分支，commit message 说明根因并引用 `#{{TASK_ID}}`。
 

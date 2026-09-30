@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   resolveAgentIdleTimeoutSeconds,
   resolveMaxCIRepairAttempts,
+  resolveMaxLocalE2ERepairAttempts,
   withAgentIdleTimeout,
 } from "./runtime-config.mts";
 
@@ -56,5 +57,23 @@ test("CI 自动修复默认最多两次，并支持进程环境覆盖", () => {
       {},
     ),
     0,
+  );
+});
+
+test("本地 E2E 自动修复默认最多两次，并支持独立关闭", () => {
+  assert.equal(resolveMaxLocalE2ERepairAttempts({}, {}), 2);
+  assert.equal(
+    resolveMaxLocalE2ERepairAttempts(
+      { SANDCASTLE_MAX_LOCAL_E2E_REPAIR_ATTEMPTS: "0" },
+      { SANDCASTLE_MAX_LOCAL_E2E_REPAIR_ATTEMPTS: "3" },
+    ),
+    0,
+  );
+  assert.equal(
+    resolveMaxLocalE2ERepairAttempts(
+      { SANDCASTLE_MAX_LOCAL_E2E_REPAIR_ATTEMPTS: "invalid" },
+      {},
+    ),
+    2,
   );
 });

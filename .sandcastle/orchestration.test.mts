@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   branchForIssue,
   ciRepairPromptArgs,
+  localE2ERepairPromptArgs,
   parseBlockerNumbers,
   promptArgsForIssue,
   selectFrontier,
@@ -155,4 +156,35 @@ test("CI repair prompt 获得 PR、失败 head、checks 与重试次数", () => 
 test("promptArgs 不覆盖 Sandcastle 内置的 TARGET_BRANCH", () => {
   const args = promptArgsForIssue(issue(51), "codex/issue-51");
   assert.equal("TARGET_BRANCH" in args, false);
+});
+
+test("本地 E2E repair prompt 获得失败日志、test-run 与重试次数", () => {
+  const args = localE2ERepairPromptArgs(
+    issue(51),
+    "codex/issue-51",
+    "sc-51-abc12345",
+    ".sandcastle/logs/local-e2e-sc-51-abc12345.log",
+    2,
+  );
+  assert.deepEqual(args, {
+    TASK_ID: "51",
+    ISSUE_TITLE: "Ticket 51",
+    BRANCH: "codex/issue-51",
+    TEST_RUN_ID: "sc-51-abc12345",
+    LOCAL_E2E_LOG_PATH: ".sandcastle/logs/local-e2e-sc-51-abc12345.log",
+    REPAIR_ATTEMPT: "2",
+  });
+
+  const template = readFileSync(".sandcastle/local-e2e-repair-prompt.md", "utf8");
+  const variables = [
+    ...new Set(
+      [...template.matchAll(/\{\{([A-Z0-9_]+)\}\}/g)].map(
+        (match) => match[1]!,
+      ),
+    ),
+  ];
+  assert.deepEqual(
+    variables.filter((variable) => !(variable in args)),
+    [],
+  );
 });

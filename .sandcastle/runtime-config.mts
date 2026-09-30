@@ -1,5 +1,6 @@
 export const DEFAULT_AGENT_IDLE_TIMEOUT_SECONDS = 30 * 60;
 export const DEFAULT_MAX_CI_REPAIR_ATTEMPTS = 2;
+export const DEFAULT_MAX_LOCAL_E2E_REPAIR_ATTEMPTS = 2;
 
 type Environment = Record<string, string | undefined>;
 
@@ -35,6 +36,17 @@ export function resolveMaxCIRepairAttempts(
     processEnvironment.SANDCASTLE_MAX_CI_REPAIR_ATTEMPTS ||
       localEnvironment.SANDCASTLE_MAX_CI_REPAIR_ATTEMPTS,
     DEFAULT_MAX_CI_REPAIR_ATTEMPTS,
+  );
+}
+
+export function resolveMaxLocalE2ERepairAttempts(
+  processEnvironment: Environment,
+  localEnvironment: Environment,
+): number {
+  return nonNegativeInteger(
+    processEnvironment.SANDCASTLE_MAX_LOCAL_E2E_REPAIR_ATTEMPTS ||
+      localEnvironment.SANDCASTLE_MAX_LOCAL_E2E_REPAIR_ATTEMPTS,
+    DEFAULT_MAX_LOCAL_E2E_REPAIR_ATTEMPTS,
   );
 }
 

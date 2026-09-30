@@ -1,10 +1,12 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
 import {
   branchForIssue,
+  localE2ERepairPromptArgs,
   isAgentTicket,
   promptArgsForIssue,
   selectFrontier,
@@ -19,8 +21,15 @@ import {
 import { createGitHubMergeOperations } from "./github-merge.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
 import {
+  createSerialE2EGate,
+  ensureLocalE2E,
+  runLocalE2EGate,
+  type SerialE2EGate,
+} from "./e2e-gate.mts";
+import {
   resolveAgentIdleTimeoutSeconds,
   resolveMaxCIRepairAttempts,
+  resolveMaxLocalE2ERepairAttempts,
   withAgentIdleTimeout,
 } from "./runtime-config.mts";
 
@@ -263,6 +272,8 @@ async function executeIssue(
   agent: ReturnType<typeof sandcastle.codex>,
   maxIterations: number,
   idleTimeoutSeconds: number,
+  localE2EGate: SerialE2EGate,
+  maxLocalE2ERepairAttempts: number,
 ): Promise<{
   issue: number;
   status: string;
@@ -274,6 +285,7 @@ async function executeIssue(
   const stagedAuth = stageCodexAuth(codexAuthFile);
 
   try {
+    const testRunId = `sc-${issue.number}-${randomUUID().slice(0, 8)}`;
     const sandbox = await sandcastle.createSandbox({
       branch,
       sandbox: createIssueSandboxProvider(ghToken, stagedAuth.mount),
@@ -335,6 +347,65 @@ async function executeIssue(
           detail: "reviewer 未发出完成信号，分支保留但不会创建 PR",
         };
       }
+
+      // agent 只在 sandbox 内实现和评审；宿主串行运行 Docker/kind E2E，避免向 sandbox 暴露容器控制面。
+      await localE2EGate.run(() =>
+        ensureLocalE2E(
+          {
+            runGate: () =>
+              runLocalE2EGate(sandbox.worktreePath, testRunId, (line) => {
+                console.log(`#${issue.number} [本地 E2E] ${line}`);
+              }),
+            repairFailure: async (failure, attempt) => {
+              console.warn(
+                `#${issue.number} 本地 E2E 失败，启动第 ${attempt}/${maxLocalE2ERepairAttempts} 次修复；worktree 日志：${failure.logPath}；宿主归档：${failure.archivePath}`,
+              );
+              const repair = await sandbox.run(
+                withAgentIdleTimeout(idleTimeoutSeconds, {
+                  name: `issue-${issue.number}-local-e2e-repair-${attempt}`,
+                  agent,
+                  maxIterations,
+                  promptFile: "./.sandcastle/local-e2e-repair-prompt.md",
+                  promptArgs: localE2ERepairPromptArgs(
+                    issue,
+                    branch,
+                    testRunId,
+                    failure.logPath,
+                    attempt,
+                  ),
+                }),
+              );
+              if (!repair.completionSignal) {
+                throw new Error(
+                  `#${issue.number} 本地 E2E repair agent 未发出完成信号。`,
+                );
+              }
+              if (repair.commits.length === 0) {
+                throw new Error(
+                  `#${issue.number} 本地 E2E repair agent 没有产生 commit。`,
+                );
+              }
+            },
+            reviewRepair: async (attempt) => {
+              const repairedReview = await sandbox.run(
+                withAgentIdleTimeout(idleTimeoutSeconds, {
+                  name: `issue-${issue.number}-local-e2e-review-${attempt}`,
+                  agent,
+                  maxIterations: 1,
+                  promptFile: "./.sandcastle/review-prompt.md",
+                  promptArgs,
+                }),
+              );
+              if (!repairedReview.completionSignal) {
+                throw new Error(
+                  `#${issue.number} 本地 E2E 修复后的 code review 未通过。`,
+                );
+              }
+            },
+          },
+          maxLocalE2ERepairAttempts,
+        ),
+      );
     } finally {
       const closeResult = await sandbox.close();
       if (closeResult.preservedWorktreePath) {
@@ -388,6 +459,10 @@ async function main(): Promise<void> {
     process.env,
     localEnv,
   );
+  const maxLocalE2ERepairAttempts = resolveMaxLocalE2ERepairAttempts(
+    process.env,
+    localEnv,
+  );
 
   const issues = fetchIssues();
   const resumablePullRequests = fetchResumablePullRequests(
@@ -435,6 +510,7 @@ async function main(): Promise<void> {
   }
 
   const agent = sandcastle.codex(model, { effort: "high" });
+  const localE2EGate = createSerialE2EGate();
 
   const settled = await Promise.allSettled(
     claimed.map((issue) =>
@@ -446,6 +522,8 @@ async function main(): Promise<void> {
         agent,
         maxIterations,
         idleTimeoutSeconds,
+        localE2EGate,
+        maxLocalE2ERepairAttempts,
       ),
     ),
   );

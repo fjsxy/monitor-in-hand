@@ -4,6 +4,7 @@ import type { AgentProvider } from "@ai-hero/sandcastle";
 import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
 import { ciRepairPromptArgs, promptArgsForIssue } from "./orchestration.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
+import { runLocalE2EGate } from "./e2e-gate.mts";
 
 const branch = `codex/sandcastle-smoke-${process.pid}`;
 const targetBranch = execFileSync("git", ["branch", "--show-current"], {
@@ -59,7 +60,7 @@ try {
         onSandboxReady: [
           {
             command:
-              "codex login status && gh auth status && gh auth setup-git && git ls-remote --exit-code origin HEAD >/dev/null && go version && helm version --short && codex --version",
+              "codex login status && gh auth status && gh auth setup-git && git ls-remote --exit-code origin HEAD >/dev/null && test ! -S /var/run/docker.sock && test -z \"${DOCKER_HOST:-}\" && go version && helm version --short && codex --version",
           },
         ],
       },
@@ -118,6 +119,19 @@ try {
   });
   if (!ciRepairRun.completionSignal) {
     throw new Error("Sandcastle CI repair prompt smoke did not complete");
+  }
+
+  const localE2EGate = await runLocalE2EGate(
+    sandbox.worktreePath,
+    `sc-smoke-${process.pid}`,
+    (line) => console.log(`[本地 E2E] ${line}`),
+  );
+  if (localE2EGate.exitCode !== 0) {
+    const detail =
+      localE2EGate.stderr ||
+      localE2EGate.stdout ||
+      `本地 E2E smoke failed: ${localE2EGate.logPath}`;
+    throw new Error(`${detail}\n证据已归档：${localE2EGate.archivePath}`);
   }
 
   process.stdout.write(result.stdout);
