@@ -462,10 +462,11 @@ func stableInstanceID(name string) string {
 }
 
 func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string) ([]client.Object, *appsv1.Deployment) {
-	return deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, containerArgs, EndpointGroupDefault)
+	nonWorkloads, deployment, _ := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, containerArgs, EndpointGroupDefault)
+	return nonWorkloads, deployment
 }
 
-func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string, endpointGroup string) ([]client.Object, *appsv1.Deployment) {
+func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string, endpointGroup string) ([]client.Object, *appsv1.Deployment, *corev1.Service) {
 	labels := managedLabels(instanceID, profile.Version, endpointGroup)
 	podResources := corev1.ResourceRequirements{}
 	if instance.Spec.PodResources != nil {
@@ -548,13 +549,13 @@ func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateM
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: name},
 		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: namespace}},
 	}
-	return []client.Object{serviceAccount, clusterRole, clusterRoleBinding, service}, deployment
+	return []client.Object{serviceAccount, clusterRole, clusterRoleBinding, service}, deployment, service
 }
 
 func statefulSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string, shards int32) ([]client.Object, client.Object) {
 	// 先复用与 Deployment 一致的 Pod、ServiceAccount、Cluster RBAC 和 headless Service 契约，仅切换 endpoint-group。
 	shardingArgs := append(append([]string(nil), containerArgs...), "--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)")
-	nonWorkloads, deployment := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, shardingArgs, EndpointGroupSharded)
+	nonWorkloads, deployment, _ := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, shardingArgs, EndpointGroupSharded)
 	// 通过 Downward API 把每个 Pod 的唯一身份交给上游 automated sharding。
 	container := &deployment.Spec.Template.Spec.Containers[0]
 	container.Env = []corev1.EnvVar{
@@ -590,13 +591,13 @@ func statefulSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, 
 }
 
 func daemonSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, collectors, sharedFilterArgs []string) ([]client.Object, []client.Object) {
-	branch := instance.Spec.Deployment.DaemonSetSharded
+	daemonSpec := instance.Spec.Deployment.DaemonSetSharded
 	// node 角色只负责已调度 Pod；Downward API 将所在节点交给上游 field selector 分片。
 	nodeArgs := append([]string{"--resources=pods"}, sharedFilterArgs...)
 	nodeArgs = append(nodeArgs, "--node=$(NODE_NAME)")
-	nonWorkloads, nodeTemplate := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, nodeArgs, EndpointGroupNode)
+	nonWorkloads, nodeTemplate, nodeService := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, nodeArgs, EndpointGroupNode)
 	setDeploymentRole(nodeTemplate, WorkloadRoleNode)
-	setContainerResources(&nodeTemplate.Spec.Template.Spec.Containers[0], branch.NodePodResources, instance.Spec.PodResources)
+	setContainerResources(&nodeTemplate.Spec.Template.Spec.Containers[0], daemonSpec.NodePodResources, instance.Spec.PodResources)
 	nodeTemplate.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{{
 		Name: "NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}},
 	}}
@@ -616,21 +617,20 @@ func daemonSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, pr
 		}
 	}
 	clusterArgs := append([]string{"--resources=" + strings.Join(clusterCollectors, ",")}, sharedFilterArgs...)
-	_, cluster := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name+"-cluster", clusterArgs, EndpointGroupControl)
+	_, cluster, _ := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name+"-cluster", clusterArgs, EndpointGroupControl)
 	cluster.Spec.Template.Spec.ServiceAccountName = name
 	setDeploymentRole(cluster, WorkloadRoleCluster)
-	setContainerResources(&cluster.Spec.Template.Spec.Containers[0], branch.ClusterPodResources, instance.Spec.PodResources)
+	setContainerResources(&cluster.Spec.Template.Spec.Containers[0], daemonSpec.ClusterPodResources, instance.Spec.PodResources)
 
 	// unscheduled 角色使用 v2.11 官方的空 node 参数，只读取尚未绑定节点的 Pod。
 	unscheduledArgs := append([]string{"--resources=pods"}, sharedFilterArgs...)
 	unscheduledArgs = append(unscheduledArgs, `--node=""`)
-	_, unscheduled := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name+"-unscheduled", unscheduledArgs, EndpointGroupControl)
+	_, unscheduled, _ := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name+"-unscheduled", unscheduledArgs, EndpointGroupControl)
 	unscheduled.Spec.Template.Spec.ServiceAccountName = name
 	setDeploymentRole(unscheduled, WorkloadRoleUnscheduled)
-	setContainerResources(&unscheduled.Spec.Template.Spec.Containers[0], branch.UnscheduledPodResources, instance.Spec.PodResources)
+	setContainerResources(&unscheduled.Spec.Template.Spec.Containers[0], daemonSpec.UnscheduledPodResources, instance.Spec.PodResources)
 
 	// 两个 Service 只按 endpoint-group 选择：node 单独暴露 DaemonSet，control 合并两个不同指标族的 companion。
-	nodeService := nonWorkloads[len(nonWorkloads)-1].(*corev1.Service)
 	nodeService.Labels[LabelRole] = WorkloadRoleNode
 	controlLabels := managedLabels(instanceID, profile.Version, EndpointGroupControl)
 	controlLabels[LabelRole] = EndpointGroupControl
