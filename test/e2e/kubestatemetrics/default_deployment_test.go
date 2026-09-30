@@ -27,7 +27,6 @@ import (
 )
 
 const (
-	operatorImage     = "docker.io/fjsxy/monitor-in-hand:0.1.0"
 	operatorNamespace = "monitor-in-hand-system"
 	targetNamespace   = "monitor-in-hand-test"
 	instanceName      = "default-deployment"
@@ -49,7 +48,6 @@ var (
 	repoRoot    string
 	kubectlBin  string
 	helmBin     string
-	kindBin     string
 	clusterName string
 	kubeContext string
 	active      scenario
@@ -67,16 +65,11 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	Expect(err).NotTo(HaveOccurred())
 	kubectlBin = envOrDefault("KUBECTL", "kubectl")
 	helmBin = envOrDefault("HELM_BIN", "helm")
-	kindBin = envOrDefault("KIND", "kind")
 	clusterName = fmt.Sprintf("mih-e2e-%s-%s", strings.ReplaceAll(active.kubernetes, ".", ""), runID)
 	kubeContext = "kind-" + clusterName
 
 	By("在本 Operator 启动前快照 Agent、runtime RBAC、采集配置与外部生成资源")
 	gh60PreInstallSnapshots = captureGH60PreInstallSnapshots(ctx)
-
-	By("构建并导入 Operator 镜像，让测试只依赖当前工作树代码")
-	run(ctx, repoRoot, []string{"BUILDKIT_PROGRESS=plain"}, "docker", "build", "--tag", operatorImage, repoRoot)
-	run(ctx, repoRoot, nil, kindBin, "load", "docker-image", "--name", clusterName, operatorImage)
 
 	By("通过 Helm 安装 Operator，环境编排不承担业务断言")
 	run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "create", "namespace", operatorNamespace)
