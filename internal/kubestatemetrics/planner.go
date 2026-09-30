@@ -29,13 +29,32 @@ const (
 	ReasonNoNamespaceMatched           = "NoNamespaceMatched"
 	ReasonSwitchingDeploymentMode      = "SwitchingDeploymentMode"
 	ReasonObservationFailed            = "ObservationFailed"
+	ReasonUnsupportedMode              = "UnsupportedMode"
 
-	labelName          = "app.kubernetes.io/name"
-	labelInstance      = "app.kubernetes.io/instance"
-	labelManagedBy     = "app.kubernetes.io/managed-by"
-	labelVersion       = "app.kubernetes.io/version"
-	labelRole          = "monitor-in-hand/role"
-	labelEndpointGroup = "monitor-in-hand/endpoint-group"
+	labelName      = "app.kubernetes.io/name"
+	labelInstance  = "app.kubernetes.io/instance"
+	labelManagedBy = "app.kubernetes.io/managed-by"
+	labelVersion   = "app.kubernetes.io/version"
+
+	// LabelRole separates workload responsibility without narrowing Service endpoint selection.
+	LabelRole = "monitor-in-hand/role"
+	// LabelEndpointGroup groups distinct workload roles behind one metrics Service.
+	LabelEndpointGroup = "monitor-in-hand/endpoint-group"
+
+	// EndpointGroupDefault identifies the single Deployment endpoints.
+	EndpointGroupDefault = "default"
+	// EndpointGroupSharded identifies the automated StatefulSet shard endpoints.
+	EndpointGroupSharded = "sharded"
+	// EndpointGroupNode identifies per-node Pod metric endpoints.
+	EndpointGroupNode = "node"
+	// EndpointGroupControl identifies both DaemonSetSharded companion endpoints.
+	EndpointGroupControl = "control"
+	// WorkloadRoleNode owns scheduled Pod metrics for one node.
+	WorkloadRoleNode = "node"
+	// WorkloadRoleCluster owns all selected non-Pod collectors.
+	WorkloadRoleCluster = "cluster"
+	// WorkloadRoleUnscheduled owns metrics for Pods without a node assignment.
+	WorkloadRoleUnscheduled = "unscheduled"
 )
 
 // ClusterFacts are read-only observations needed by pure planning.
@@ -59,6 +78,7 @@ type Profile struct {
 	ServiceAccountAutomountToken *bool
 	PodAutomountToken            *bool
 	ContainerSecurityContext     *corev1.SecurityContext
+	DaemonSetSharded             bool
 }
 
 // ResourcePlan contains the complete desired state for one reconcile.
@@ -103,12 +123,25 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 		if instance.Spec.Deployment.StatefulSetSharded != nil {
 			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.statefulSetSharded 仅能在 mode 为 StatefulSetSharded 时声明"}
 		}
+		if instance.Spec.Deployment.DaemonSetSharded != nil {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.daemonSetSharded 仅能在 mode 为 DaemonSetSharded 时声明"}
+		}
 	case monitoringv1alpha1.DeploymentModeStatefulSetSharded:
+		if instance.Spec.Deployment.DaemonSetSharded != nil {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.daemonSetSharded 仅能在 mode 为 DaemonSetSharded 时声明"}
+		}
 		if instance.Spec.Deployment.StatefulSetSharded == nil {
 			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.mode 为 StatefulSetSharded 时必须声明 statefulSetSharded 分支"}
 		}
 		if instance.Spec.Deployment.StatefulSetSharded.Shards < 2 {
 			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.statefulSetSharded.shards 必须至少为 2"}
+		}
+	case monitoringv1alpha1.DeploymentModeDaemonSetSharded:
+		if instance.Spec.Deployment.StatefulSetSharded != nil {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.statefulSetSharded 仅能在 mode 为 StatefulSetSharded 时声明"}
+		}
+		if instance.Spec.Deployment.DaemonSetSharded == nil {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.deployment.mode 为 DaemonSetSharded 时必须声明 daemonSetSharded 分支"}
 		}
 	default:
 		return nil, &Problem{Reason: ReasonInvalidSpec, Message: fmt.Sprintf("spec.deployment.mode %q 不受支持", mode)}
@@ -119,10 +152,33 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 			Message: "spec.podResources.claims 不受支持；受管 Pod 不开放 resourceClaims 声明",
 		}
 	}
+	if instance.Spec.Deployment.DaemonSetSharded != nil {
+		roleResources := []struct {
+			field     string
+			resources *corev1.ResourceRequirements
+		}{
+			{field: "nodePodResources", resources: instance.Spec.Deployment.DaemonSetSharded.NodePodResources},
+			{field: "clusterPodResources", resources: instance.Spec.Deployment.DaemonSetSharded.ClusterPodResources},
+			{field: "unscheduledPodResources", resources: instance.Spec.Deployment.DaemonSetSharded.UnscheduledPodResources},
+		}
+		for _, role := range roleResources {
+			if role.resources != nil && len(role.resources.Claims) != 0 {
+				return nil, &Problem{
+					Reason:  ReasonInvalidSpec,
+					Message: fmt.Sprintf("spec.deployment.daemonSetSharded.%s.claims 不受支持；受管 Pod 不开放 resourceClaims 声明", role.field),
+				}
+			}
+		}
+	}
 
 	effectiveCollectors, problem := resolveCollectors(instance.Spec.Collectors)
 	if problem != nil {
 		return nil, problem
+	}
+	if mode == monitoringv1alpha1.DeploymentModeDaemonSetSharded {
+		if !containsString(effectiveCollectors, "pods") || len(effectiveCollectors) < 2 {
+			return nil, &Problem{Reason: ReasonInvalidSpec, Message: "DaemonSetSharded collectors 必须包含 pods 且至少包含一个非 Pod collector"}
+		}
 	}
 	metricFilterArgs, problem := resolveMetricFilter(instance.Spec.MetricFilter)
 	if problem != nil {
@@ -138,6 +194,9 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 	if problem != nil {
 		return nil, problem
 	}
+	if mode == monitoringv1alpha1.DeploymentModeDaemonSetSharded && !profile.DaemonSetSharded {
+		return nil, &Problem{Reason: ReasonUnsupportedMode, Message: fmt.Sprintf("Kubernetes %s profile 不支持 experimental DaemonSetSharded", facts.KubernetesVersion)}
+	}
 	if !facts.TargetNamespaceExists {
 		return nil, &Problem{
 			Reason:  ReasonDependencyMissing,
@@ -148,22 +207,29 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 	// 最后把同一份解析结果同时用于 workload 参数和 status 所需的资源计划。
 	instanceID := stableInstanceID(instance.Name)
 	name := ManagedResourceName(instance.Name)
-	containerArgs := []string{"--resources=" + strings.Join(effectiveCollectors, ",")}
-	containerArgs = append(containerArgs, metricFilterArgs...)
-	containerArgs = append(containerArgs, "--namespaces="+strings.Join(effectiveNamespaces, ","))
+	sharedFilterArgs := append([]string(nil), metricFilterArgs...)
+	sharedFilterArgs = append(sharedFilterArgs, "--namespaces="+strings.Join(effectiveNamespaces, ","))
+	containerArgs := append([]string{"--resources=" + strings.Join(effectiveCollectors, ",")}, sharedFilterArgs...)
 	var nonWorkloads []client.Object
-	var workload client.Object
+	var workloads []client.Object
 	desiredPods := int32(1)
-	if mode == monitoringv1alpha1.DeploymentModeStatefulSetSharded {
+	if mode == monitoringv1alpha1.DeploymentModeDaemonSetSharded {
+		desiredPods = 2
+		nonWorkloads, workloads = daemonSetShardedResources(instance, profile, instanceID, name, effectiveCollectors, sharedFilterArgs)
+	} else if mode == monitoringv1alpha1.DeploymentModeStatefulSetSharded {
 		desiredPods = instance.Spec.Deployment.StatefulSetSharded.Shards
+		var workload client.Object
 		nonWorkloads, workload = statefulSetShardedResources(instance, profile, instanceID, name, containerArgs, desiredPods)
+		workloads = []client.Object{workload}
 	} else {
+		var workload client.Object
 		nonWorkloads, workload = deploymentResources(instance, profile, instanceID, name, containerArgs)
+		workloads = []client.Object{workload}
 	}
-	// 当前模式只规划一个 workload；零匹配时从期望资源中分离，但保留其身份供 controller 安全删除。
+	// 零匹配时从期望资源中分离全部 workload，但保留其身份供 controller 安全删除。
 	resources := append([]client.Object(nil), nonWorkloads...)
 	if len(effectiveNamespaces) > 0 {
-		resources = append(resources, workload)
+		resources = append(resources, workloads...)
 	} else {
 		desiredPods = 0
 	}
@@ -176,7 +242,7 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 		EffectiveCollectors: effectiveCollectors,
 		EffectiveNamespaces: effectiveNamespaces,
 		Resources:           resources,
-		Workloads:           []client.Object{workload},
+		Workloads:           workloads,
 	}, nil
 }
 
@@ -319,6 +385,15 @@ func isKnownCollector(name string) bool {
 	return false
 }
 
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 // ManagedResourceName returns the stable shared name of an instance's directly managed resources.
 func ManagedResourceName(instanceName string) string {
 	return "ksm-" + stableInstanceID(instanceName)
@@ -344,6 +419,7 @@ func profileFor(gitVersion string) (Profile, *Problem) {
 			Rules:                        rulesForKubernetes128(),
 			ServiceAccountAutomountToken: boolPointer(false),
 			PodAutomountToken:            boolPointer(true),
+			DaemonSetSharded:             true,
 			ContainerSecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: boolPointer(false),
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -386,7 +462,7 @@ func stableInstanceID(name string) string {
 }
 
 func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string) ([]client.Object, *appsv1.Deployment) {
-	return deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, containerArgs, "default")
+	return deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, containerArgs, EndpointGroupDefault)
 }
 
 func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string, endpointGroup string) ([]client.Object, *appsv1.Deployment) {
@@ -398,7 +474,7 @@ func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateM
 	selector := map[string]string{
 		labelName:          "kube-state-metrics",
 		labelInstance:      instanceID,
-		labelEndpointGroup: endpointGroup,
+		LabelEndpointGroup: endpointGroup,
 	}
 	owner := managingOwner(instance)
 	namespace := instance.Spec.TargetNamespace
@@ -410,7 +486,7 @@ func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateM
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: copyLabels(labels), OwnerReferences: []metav1.OwnerReference{owner}},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: int32Pointer(1),
-			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Selector: &metav1.LabelSelector{MatchLabels: copyLabels(selector)},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: copyLabels(labels)},
 				Spec: corev1.PodSpec{
@@ -452,7 +528,7 @@ func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateM
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: copyLabels(labels), OwnerReferences: []metav1.OwnerReference{owner}},
 		Spec: corev1.ServiceSpec{
 			ClusterIP: corev1.ClusterIPNone,
-			Selector:  selector,
+			Selector:  copyLabels(selector),
 			Ports: []corev1.ServicePort{
 				{Name: "http-metrics", Port: 8080, TargetPort: intstr.FromString("http-metrics"), Protocol: corev1.ProtocolTCP},
 				{Name: "telemetry", Port: 8081, TargetPort: intstr.FromString("telemetry"), Protocol: corev1.ProtocolTCP},
@@ -478,7 +554,7 @@ func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateM
 func statefulSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string, shards int32) ([]client.Object, client.Object) {
 	// 先复用与 Deployment 一致的 Pod、ServiceAccount、Cluster RBAC 和 headless Service 契约，仅切换 endpoint-group。
 	shardingArgs := append(append([]string(nil), containerArgs...), "--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)")
-	nonWorkloads, deployment := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, shardingArgs, "sharded")
+	nonWorkloads, deployment := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, shardingArgs, EndpointGroupSharded)
 	// 通过 Downward API 把每个 Pod 的唯一身份交给上游 automated sharding。
 	container := &deployment.Spec.Template.Spec.Containers[0]
 	container.Env = []corev1.EnvVar{
@@ -495,7 +571,7 @@ func statefulSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, 
 			Template:    *deployment.Spec.Template.DeepCopy(),
 		},
 	}
-	labels := managedLabels(instanceID, profile.Version, "sharded")
+	labels := managedLabels(instanceID, profile.Version, EndpointGroupSharded)
 	owner := managingOwner(instance)
 	// 最后添加仅分片模式需要的 namespaced RBAC，限定只读自身 Pod 和对应 StatefulSet。
 	role := &rbacv1.Role{
@@ -513,14 +589,92 @@ func statefulSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, 
 	return append(nonWorkloads, role, roleBinding), statefulSet
 }
 
+func daemonSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, collectors, sharedFilterArgs []string) ([]client.Object, []client.Object) {
+	branch := instance.Spec.Deployment.DaemonSetSharded
+	// node 角色只负责已调度 Pod；Downward API 将所在节点交给上游 field selector 分片。
+	nodeArgs := append([]string{"--resources=pods"}, sharedFilterArgs...)
+	nodeArgs = append(nodeArgs, "--node=$(NODE_NAME)")
+	nonWorkloads, nodeTemplate := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, nodeArgs, EndpointGroupNode)
+	setDeploymentRole(nodeTemplate, WorkloadRoleNode)
+	setContainerResources(&nodeTemplate.Spec.Template.Spec.Containers[0], branch.NodePodResources, instance.Spec.PodResources)
+	nodeTemplate.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{{
+		Name: "NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}},
+	}}
+	node := &appsv1.DaemonSet{
+		ObjectMeta: *nodeTemplate.ObjectMeta.DeepCopy(),
+		Spec: appsv1.DaemonSetSpec{
+			Selector: nodeTemplate.Spec.Selector.DeepCopy(),
+			Template: *nodeTemplate.Spec.Template.DeepCopy(),
+		},
+	}
+
+	// cluster 角色继承同一 collector 解析结果，但移除 pods，避免与两个 Pod 角色重复暴露指标。
+	clusterCollectors := make([]string, 0, len(collectors)-1)
+	for _, collector := range collectors {
+		if collector != "pods" {
+			clusterCollectors = append(clusterCollectors, collector)
+		}
+	}
+	clusterArgs := append([]string{"--resources=" + strings.Join(clusterCollectors, ",")}, sharedFilterArgs...)
+	_, cluster := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name+"-cluster", clusterArgs, EndpointGroupControl)
+	cluster.Spec.Template.Spec.ServiceAccountName = name
+	setDeploymentRole(cluster, WorkloadRoleCluster)
+	setContainerResources(&cluster.Spec.Template.Spec.Containers[0], branch.ClusterPodResources, instance.Spec.PodResources)
+
+	// unscheduled 角色使用 v2.11 官方的空 node 参数，只读取尚未绑定节点的 Pod。
+	unscheduledArgs := append([]string{"--resources=pods"}, sharedFilterArgs...)
+	unscheduledArgs = append(unscheduledArgs, `--node=""`)
+	_, unscheduled := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name+"-unscheduled", unscheduledArgs, EndpointGroupControl)
+	unscheduled.Spec.Template.Spec.ServiceAccountName = name
+	setDeploymentRole(unscheduled, WorkloadRoleUnscheduled)
+	setContainerResources(&unscheduled.Spec.Template.Spec.Containers[0], branch.UnscheduledPodResources, instance.Spec.PodResources)
+
+	// 两个 Service 只按 endpoint-group 选择：node 单独暴露 DaemonSet，control 合并两个不同指标族的 companion。
+	nodeService := nonWorkloads[len(nonWorkloads)-1].(*corev1.Service)
+	nodeService.Labels[LabelRole] = WorkloadRoleNode
+	controlLabels := managedLabels(instanceID, profile.Version, EndpointGroupControl)
+	controlLabels[LabelRole] = EndpointGroupControl
+	controlService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name + "-control", Namespace: instance.Spec.TargetNamespace, Labels: controlLabels,
+			OwnerReferences: []metav1.OwnerReference{managingOwner(instance)},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: corev1.ClusterIPNone,
+			Selector: map[string]string{
+				labelName: "kube-state-metrics", labelInstance: instanceID, LabelEndpointGroup: EndpointGroupControl,
+			},
+			Ports: append([]corev1.ServicePort(nil), nodeService.Spec.Ports...),
+		},
+	}
+	return append(nonWorkloads, controlService), []client.Object{node, cluster, unscheduled}
+}
+
+func setDeploymentRole(deployment *appsv1.Deployment, role string) {
+	deployment.Labels[LabelRole] = role
+	deployment.Spec.Selector.MatchLabels[LabelRole] = role
+	deployment.Spec.Template.Labels[LabelRole] = role
+}
+
+func setContainerResources(container *corev1.Container, override, inherited *corev1.ResourceRequirements) {
+	selected := inherited
+	if override != nil {
+		selected = override
+	}
+	container.Resources = corev1.ResourceRequirements{}
+	if selected != nil {
+		container.Resources = *selected.DeepCopy()
+	}
+}
+
 func managedLabels(instanceID, version, endpointGroup string) map[string]string {
 	return map[string]string{
 		labelName:          "kube-state-metrics",
 		labelInstance:      instanceID,
 		labelManagedBy:     "monitor-in-hand",
 		labelVersion:       version,
-		labelRole:          "collector",
-		labelEndpointGroup: endpointGroup,
+		LabelRole:          "collector",
+		LabelEndpointGroup: endpointGroup,
 	}
 }
 
@@ -581,6 +735,7 @@ func commonRules(includeServiceAccountsAndIngressClasses bool) []rbacv1.PolicyRu
 // Ensure every desired resource can be handled through the controller-runtime client.
 var _ runtime.Object = &appsv1.Deployment{}
 var _ runtime.Object = &appsv1.StatefulSet{}
+var _ runtime.Object = &appsv1.DaemonSet{}
 
 func boolPointer(value bool) *bool    { return &value }
 func int32Pointer(value int32) *int32 { return &value }

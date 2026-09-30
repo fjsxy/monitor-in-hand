@@ -572,6 +572,177 @@ var _ = Describe("StatefulSetSharded 判别 union", func() {
 	)
 })
 
+var _ = Describe("DaemonSetSharded 版本能力", func() {
+	It("UT-KSM-GH57-001 Kubernetes 1.19 拒绝 DaemonSetSharded 且不生成资源", func() {
+		By("准备一份 collectors 同时覆盖 Pod 与非 Pod 的合法 DaemonSetSharded 声明")
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "daemon-sharded", UID: types.UID("uid-57-unsupported")},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode:             monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+					DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+				},
+				Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{
+					Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods", "deployments"},
+				},
+			},
+		}
+
+		By("在 Kubernetes 1.19 profile 下执行纯规划")
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
+			KubernetesVersion:     "v1.19.16",
+			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
+		})
+
+		By("验证 UnsupportedMode 且零资源计划")
+		Expect(plan).To(BeNil())
+		Expect(problem).To(SatisfyAll(
+			HaveField("Reason", ksm.ReasonUnsupportedMode),
+			HaveField("Message", ContainSubstring("DaemonSetSharded")),
+		))
+	})
+
+	It("UT-KSM-GH57-002 Kubernetes 1.28 规划三个职责和两组 endpoints", func() {
+		By("准备公共资源配置和两个显式角色整体覆盖")
+		commonResources := &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m")},
+		}
+		nodeResources := &corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("64Mi")},
+		}
+		clusterResources := &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("25m")},
+		}
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "daemon-sharded", UID: types.UID("uid-57-supported")},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+					DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{
+						NodePodResources:    nodeResources,
+						ClusterPodResources: clusterResources,
+					},
+				},
+				Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{
+					Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods", "deployments"},
+				},
+				MetricFilter: monitoringv1alpha1.KubeStateMetricsMetricFilter{
+					Mode: monitoringv1alpha1.MetricFilterModeAllow, Patterns: []string{"kube_.+_info"},
+				},
+				NamespaceFilter: monitoringv1alpha1.NamespaceFilter{
+					Mode: monitoringv1alpha1.NamespaceFilterModeInclude, Names: []string{"team-a"},
+				},
+				PodResources: commonResources,
+			},
+		}
+
+		By("在 Kubernetes 1.28 profile 下执行纯规划")
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
+			KubernetesVersion:     "v1.28.15",
+			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring", "team-a"},
+		})
+
+		By("验证三个 workload 具有独立职责、共同过滤结果和整体 resources 覆盖")
+		Expect(problem).To(BeNil())
+		Expect(plan.Mode).To(Equal(monitoringv1alpha1.DeploymentModeDaemonSetSharded))
+		Expect(plan.Resources).To(HaveLen(8))
+		Expect(plan.Workloads).To(HaveLen(3))
+		node := resourceOfType[*appsv1.DaemonSet](plan)
+		cluster := plannedDeploymentNamed(plan, "ksm-daemon-sharded-cluster")
+		unscheduled := plannedDeploymentNamed(plan, "ksm-daemon-sharded-unscheduled")
+		Expect(node.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
+			HaveField("Args", []string{"--resources=pods", "--metric-allowlist=kube_.+_info", "--namespaces=team-a", "--node=$(NODE_NAME)"}),
+			HaveField("Resources", *nodeResources),
+		))
+		Expect(node.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(corev1.EnvVar{
+			Name: "NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}},
+		}))
+		Expect(cluster.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
+			HaveField("Args", []string{"--resources=deployments", "--metric-allowlist=kube_.+_info", "--namespaces=team-a"}),
+			HaveField("Resources", *clusterResources),
+		))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
+			HaveField("Args", []string{"--resources=pods", "--metric-allowlist=kube_.+_info", "--namespaces=team-a", `--node=""`}),
+			HaveField("Resources", *commonResources),
+		))
+
+		By("验证 node Service 只选 DaemonSet，control Service 同时选择两个指标族不同的 companion Deployments")
+		nodeService := plannedServiceNamed(plan, "ksm-daemon-sharded")
+		controlService := plannedServiceNamed(plan, "ksm-daemon-sharded-control")
+		Expect(nodeService.Spec.Selector).To(SatisfyAll(
+			HaveKeyWithValue("app.kubernetes.io/instance", "daemon-sharded"),
+			HaveKeyWithValue("monitor-in-hand/endpoint-group", "node"),
+			Not(HaveKey("monitor-in-hand/role")),
+			Not(HaveKey("app.kubernetes.io/version")),
+		))
+		Expect(controlService.Spec.Selector).To(SatisfyAll(
+			HaveKeyWithValue("app.kubernetes.io/instance", "daemon-sharded"),
+			HaveKeyWithValue("monitor-in-hand/endpoint-group", "control"),
+			Not(HaveKey("monitor-in-hand/role")),
+			Not(HaveKey("app.kubernetes.io/version")),
+		))
+		Expect(cluster.Spec.Template.Labels).To(HaveKeyWithValue("monitor-in-hand/role", "cluster"))
+		Expect(unscheduled.Spec.Template.Labels).To(HaveKeyWithValue("monitor-in-hand/role", "unscheduled"))
+		Expect(node.Spec.Selector.MatchLabels).To(HaveKeyWithValue("monitor-in-hand/role", "node"))
+		Expect(cluster.Spec.Selector.MatchLabels).To(HaveKeyWithValue("monitor-in-hand/role", "cluster"))
+		Expect(unscheduled.Spec.Selector.MatchLabels).To(HaveKeyWithValue("monitor-in-hand/role", "unscheduled"))
+	})
+
+	DescribeTable("UT-KSM-GH57-003 DaemonSetSharded 静态错误在版本能力检查前返回 InvalidSpec",
+		func(deployment monitoringv1alpha1.KubeStateMetricsDeploymentSpec, collectors []string, wantMessage string) {
+			By("准备包含静态错误的 DaemonSetSharded 声明")
+			instance := &monitoringv1alpha1.KubeStateMetrics{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-daemon-sharded", UID: types.UID("uid-57-invalid")},
+				Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+					TargetNamespace: "monitoring",
+					Deployment:      deployment,
+					Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{
+						Mode: monitoringv1alpha1.CollectorModeInclude, Names: collectors,
+					},
+				},
+			}
+
+			expectInvalidSpecAcrossProfiles(instance, wantMessage)
+		},
+		Entry("缺少对应分支", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+		}, []string{"pods", "deployments"}, "daemonSetSharded"),
+		Entry("与 StatefulSet 分支同时出现", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode:               monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+			StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{Shards: 2},
+			DaemonSetSharded:   &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+		}, []string{"pods", "deployments"}, "statefulSetSharded"),
+		Entry("collector 缺少 pods", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded, DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+		}, []string{"deployments"}, "必须包含 pods"),
+		Entry("collector 只有 pods", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded, DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+		}, []string{"pods"}, "非 Pod collector"),
+		Entry("node resources 包含 claims", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+			DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{
+				NodePodResources: &corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "node-claim"}}},
+			},
+		}, []string{"pods", "deployments"}, "nodePodResources.claims"),
+		Entry("cluster resources 包含 claims", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+			DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{
+				ClusterPodResources: &corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "cluster-claim"}}},
+			},
+		}, []string{"pods", "deployments"}, "clusterPodResources.claims"),
+		Entry("unscheduled resources 包含 claims", monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+			DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{
+				UnscheduledPodResources: &corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "unscheduled-claim"}}},
+			},
+		}, []string{"pods", "deployments"}, "unscheduledPodResources.claims"),
+	)
+})
+
 var _ = Describe("受管实例 phase 推导", func() {
 	disabled := false
 	condition := func(conditionType string, status metav1.ConditionStatus, reasons ...string) metav1.Condition {
@@ -776,6 +947,26 @@ func serviceFrom(plan *ksm.ResourcePlan) *corev1.Service {
 
 func statefulSetFrom(plan *ksm.ResourcePlan) *appsv1.StatefulSet {
 	return resourceOfType[*appsv1.StatefulSet](plan)
+}
+
+func plannedDeploymentNamed(plan *ksm.ResourcePlan, name string) *appsv1.Deployment {
+	for _, planned := range plan.Resources {
+		if deployment, ok := planned.(*appsv1.Deployment); ok && deployment.Name == name {
+			return deployment
+		}
+	}
+	Fail(fmt.Sprintf("deployment %q not found in resource plan", name))
+	return nil
+}
+
+func plannedServiceNamed(plan *ksm.ResourcePlan, name string) *corev1.Service {
+	for _, planned := range plan.Resources {
+		if service, ok := planned.(*corev1.Service); ok && service.Name == name {
+			return service
+		}
+	}
+	Fail(fmt.Sprintf("service %q not found in resource plan", name))
+	return nil
 }
 
 func resourceOfType[T client.Object](plan *ksm.ResourcePlan) T {
