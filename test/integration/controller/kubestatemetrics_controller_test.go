@@ -916,6 +916,190 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(foreignBinding.Labels).To(HaveKeyWithValue("preserve", "true"))
 	})
 
+	It("IT-KSM-GH57-001 Kubernetes 1.28 写入三个职责并聚合真实 workload 可用性", func() {
+		By("准备包含 Pod 与非 Pod collector 的 experimental DaemonSetSharded 受管实例")
+		namespace := "it-ksm-daemon-sharded-" + suffix
+		name := "daemon-sharded-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode:             monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+					DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+				},
+				Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{
+					Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods", "deployments"},
+				},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("执行调谐并验证三个 workload 和两组 Service 身份")
+		reconcile(name, "v1.28.15")
+		node := &appsv1.DaemonSet{}
+		cluster := &appsv1.Deployment{}
+		unscheduled := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, node)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, cluster)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-unscheduled"}, unscheduled)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &corev1.Service{})).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-control"}, &corev1.Service{})).To(Succeed())
+
+		By("模拟两个 node Pod 与两个 companion Pod 可用，再从 status 观察四个实际 Pod")
+		node.Status.DesiredNumberScheduled = 2
+		node.Status.NumberAvailable = 2
+		Expect(testClient.Status().Update(ctx, node)).To(Succeed())
+		cluster.Status.Replicas = 1
+		cluster.Status.ReadyReplicas = 1
+		cluster.Status.AvailableReplicas = 1
+		Expect(testClient.Status().Update(ctx, cluster)).To(Succeed())
+		unscheduled.Status.Replicas = 1
+		unscheduled.Status.ReadyReplicas = 1
+		unscheduled.Status.AvailableReplicas = 1
+		Expect(testClient.Status().Update(ctx, unscheduled)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status).To(SatisfyAll(
+			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDaemonSetSharded),
+			HaveField("DesiredPods", int32(4)),
+			HaveField("AvailablePods", int32(4)),
+			HaveField("Phase", monitoringv1alpha1.KubeStateMetricsPhaseReady),
+			HaveField("ManagedResources", HaveLen(8)),
+		))
+	})
+
+	It("IT-KSM-GH57-002 Kubernetes 1.19 报告 UnsupportedMode 且不触碰受管身份", func() {
+		By("用哨兵 Service 占据预期身份，再提交合法 DaemonSetSharded 声明")
+		namespace := "it-ksm-daemon-unsupported-" + suffix
+		name := "daemon-unsupported-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		sentinel := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace, Annotations: map[string]string{"preserve": "true"}},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "sentinel", Port: 9090}}},
+		}
+		Expect(testClient.Create(ctx, sentinel)).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode:             monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+					DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+				},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("在 Kubernetes 1.19 profile 下调谐并验证只有 status 改变")
+		reconcile(name, "v1.19.16")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Degraded")).To(SatisfyAll(
+			HaveField("Status", metav1.ConditionTrue),
+			HaveField("Reason", ksm.ReasonUnsupportedMode),
+		))
+		Expect(actual.Status.ManagedResources).To(BeEmpty())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, sentinel)).To(Succeed())
+		Expect(sentinel.Annotations).To(HaveKeyWithValue("preserve", "true"))
+		Expect(sentinel.Spec.Ports).To(ConsistOf(SatisfyAll(HaveField("Name", "sentinel"), HaveField("Port", int32(9090)))))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.DaemonSet{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-control"}, &corev1.Service{})).To(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("IT-KSM-GH57-003 DaemonSetSharded 与 Deployment 往返切换保持 delete-before-create", func() {
+		By("准备带 finalizer 的默认 Deployment，并切换到 DaemonSetSharded")
+		namespace := "it-ksm-daemon-switch-" + suffix
+		name := "daemon-switch-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace}}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		deployment.Finalizers = []string{"test.monitor-in-hand/daemon-switch"}
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded, DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+		}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+
+		By("验证旧 Deployment 未消失前不创建三个新 workload，也不提前改写 endpoints")
+		result := reconcile(name, "v1.28.15")
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		Expect(deployment.DeletionTimestamp.IsZero()).To(BeFalse())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.DaemonSet{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+		service := &corev1.Service{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.Spec.Selector).To(HaveKeyWithValue("monitor-in-hand/endpoint-group", "default"))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-control"}, &corev1.Service{})).To(Satisfy(apierrors.IsNotFound))
+
+		By("释放旧 Deployment 后创建三个职责，并给它们都加 finalizer")
+		deployment.Finalizers = nil
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+		Eventually(func() error {
+			return testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})
+		}).Should(Satisfy(apierrors.IsNotFound))
+		reconcile(name, "v1.28.15")
+		node := &appsv1.DaemonSet{}
+		cluster := &appsv1.Deployment{}
+		unscheduled := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, node)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, cluster)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-unscheduled"}, unscheduled)).To(Succeed())
+		for _, workload := range []client.Object{node, cluster, unscheduled} {
+			workload.SetFinalizers([]string{"test.monitor-in-hand/daemon-switch"})
+			Expect(testClient.Update(ctx, workload)).To(Succeed())
+		}
+
+		By("切回 Deployment，验证三个旧 workload 同轮发出删除且 Service 仍保持 daemon 拓扑")
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{Mode: monitoringv1alpha1.DeploymentModeDeployment}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		result = reconcile(name, "v1.28.15")
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		for _, workload := range []client.Object{node, cluster, unscheduled} {
+			Expect(testClient.Get(ctx, client.ObjectKeyFromObject(workload), workload)).To(Succeed())
+			Expect(workload.GetDeletionTimestamp().IsZero()).To(BeFalse())
+		}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.Spec.Selector).To(HaveKeyWithValue("monitor-in-hand/endpoint-group", "node"))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-control"}, &corev1.Service{})).To(Succeed())
+
+		By("确认三个旧 workload 消失后清理 control Service 并创建默认 Deployment")
+		for _, workload := range []client.Object{node, cluster, unscheduled} {
+			workload.SetFinalizers(nil)
+			Expect(testClient.Update(ctx, workload)).To(Succeed())
+		}
+		Eventually(func() error {
+			for _, identity := range []client.Object{
+				&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace}},
+				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: resourceName + "-cluster", Namespace: namespace}},
+				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: resourceName + "-unscheduled", Namespace: namespace}},
+			} {
+				if err := testClient.Get(ctx, client.ObjectKeyFromObject(identity), identity); !apierrors.IsNotFound(err) {
+					return fmt.Errorf("旧 workload %T 尚未消失: %v", identity, err)
+				}
+			}
+			return nil
+		}).Should(Succeed())
+		reconcile(name, "v1.28.15")
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-control"}, &corev1.Service{})).To(Satisfy(apierrors.IsNotFound))
+	})
+
 	It("IT-KSM-006 停用优先于无效声明并在 Disabled 后按最新声明恢复", func() {
 		By("准备一个已创建完整资源的受管实例")
 		namespace := "it-ksm-disable-" + suffix

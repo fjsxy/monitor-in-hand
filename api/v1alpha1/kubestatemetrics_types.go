@@ -54,6 +54,7 @@ type DeploymentMode string
 const (
 	DeploymentModeDeployment         DeploymentMode = "Deployment"
 	DeploymentModeStatefulSetSharded DeploymentMode = "StatefulSetSharded"
+	DeploymentModeDaemonSetSharded   DeploymentMode = "DaemonSetSharded"
 )
 
 // NamespaceFilterMode identifies how an instance selects namespaces to collect.
@@ -99,11 +100,26 @@ type KubeStateMetricsStatefulSetShardedSpec struct {
 	Shards int32 `json:"shards"`
 }
 
+// KubeStateMetricsDaemonSetShardedSpec configures the experimental per-node Pod sharding topology.
+type KubeStateMetricsDaemonSetShardedSpec struct {
+	// NodePodResources replaces spec.podResources for the node DaemonSet when present.
+	// +optional
+	NodePodResources *corev1.ResourceRequirements `json:"nodePodResources,omitempty"`
+
+	// ClusterPodResources replaces spec.podResources for the cluster collectors Deployment when present.
+	// +optional
+	ClusterPodResources *corev1.ResourceRequirements `json:"clusterPodResources,omitempty"`
+
+	// UnscheduledPodResources replaces spec.podResources for the unscheduled Pods Deployment when present.
+	// +optional
+	UnscheduledPodResources *corev1.ResourceRequirements `json:"unscheduledPodResources,omitempty"`
+}
+
 // KubeStateMetricsDeploymentSpec is a discriminated union selected by Mode.
 type KubeStateMetricsDeploymentSpec struct {
 	// Mode is the selected workload topology.
 	// +kubebuilder:default=Deployment
-	// +kubebuilder:validation:Enum=Deployment;StatefulSetSharded
+	// +kubebuilder:validation:Enum=Deployment;StatefulSetSharded;DaemonSetSharded
 	// +optional
 	Mode DeploymentMode `json:"mode,omitempty"`
 
@@ -111,6 +127,11 @@ type KubeStateMetricsDeploymentSpec struct {
 	// It must be present only when mode is StatefulSetSharded.
 	// +optional
 	StatefulSetSharded *KubeStateMetricsStatefulSetShardedSpec `json:"statefulSetSharded,omitempty"`
+
+	// DaemonSetSharded configures the experimental DaemonSetSharded mode.
+	// It must be present only when mode is DaemonSetSharded.
+	// +optional
+	DaemonSetSharded *KubeStateMetricsDaemonSetShardedSpec `json:"daemonSetSharded,omitempty"`
 }
 
 // KubeStateMetricsSpec declares one managed kube-state-metrics instance.

@@ -39,6 +39,9 @@
 | `UT-KSM-GH56-007` | #56 | controller 边界 | 通用 | topology 所有权预检的 API 读取失败时，status 仍报告当前 generation 的 `SwitchingDeploymentMode` 和 `ObservationFailed` | Go test failure、status | `go test ./internal/controller` |
 | `UT-KSM-GH56-008` | #56 | controller 边界 | 通用 | 检查终止中受管资源的 API 读取失败时，status 仍报告当前 generation 的 `SwitchingDeploymentMode` 和 `ObservationFailed` | Go test failure、status | `go test ./internal/controller` |
 | `UT-KSM-GH56-009` | #56 | controller 边界 | 通用 | 资源问题已识别但回写 status 前的实际 topology 观测又失败时，以 `ObservationFailed` 落盘切换阶段 | Go test failure、status | `go test ./internal/controller` |
+| `UT-KSM-GH57-001` | #57 | 纯规划 | Kubernetes 1.19 | 合法 DaemonSetSharded 返回 `UnsupportedMode` 且零资源计划 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-GH57-002` | #57 | 纯规划 | Kubernetes 1.28 | 规划 node DaemonSet、cluster/unscheduled companion Deployments、两组 Service，并统一过滤结果与整体 resources 覆盖 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-GH57-003` | #57 | 纯规划 | 1.19、1.28 | 判别 union、collector 组合与三角色 resourceClaims 静态错误优先返回 `InvalidSpec` | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-EXAMPLE-GH59-001` | #59 | 示例/RBAC | 通用 | 原生 Agent 示例为四类配置使用非空 object/namespace selector，ScrapeConfig 覆盖 static 与五种一期 Kubernetes discovery；统一 runtime ClusterRole 包含所需资源与 `/metrics` 且不含 nodes | Ginkgo failure、示例 manifest | `go test ./test/testenv` |
 | `UT-COLLECTION-GH59-001` | #59 | E2E 支撑 | 通用 | kubectl 将授权结果写入 stdout、将集群级资源 scope warning 写入 stderr 时，两条流保持分离且拒绝退出状态不丢失 | Go testing failure、stdout/stderr、退出码 | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |
 | `UT-COLLECTION-GH59-002` | #59 | E2E 支撑 | 通用 | 从格式化 EventList JSON 结构化读取 `InvalidConfiguration` reason，且畸形 JSON 显式报错 | Go testing failure、Event JSON | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |
@@ -74,8 +77,9 @@
 | `HELM-003` | #49 | Helm/健康端点 | Chart | health listener、container port、liveness 与 readiness 使用同一可配置端口 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
 | `HELM-004` | #49 | Helm/values schema | Chart | render 阶段拒绝特权或越界端口、不支持的日志级别、Windows selector 冲突与未声明 values | Ginkgo failure、Helm error | `make test-helm HELM=helm` |
 | `HELM-005` | #49 | Helm/配置面 | Chart | 仅开放约定的 scheduling、resources、health port 与 log level，且自定义值准确下发 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
-| `HELM-006` | #51、#52、#54、#56 | Helm/生成物 | Chart | Helm CRD 与 Kubebuilder 生成源逐字同步，并包含 lifecycle、deployment 判别 union、collectors、metricFilter、podResources 的 schema/defaults 且不暴露原始参数透传 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
-| `HELM-007` | #51、#52、#56 | Helm/RBAC | Chart | manager 具有 CR status/finalizer、Deployment/StatefulSet、cluster/namespaced RBAC 与生命周期清理所需权限，且不含 Prometheus Operator API 权限 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
+| `HELM-006` | #51、#52、#54、#56、#57 | Helm/生成物 | Chart | Helm CRD 与 Kubebuilder 生成源逐字同步，并包含 lifecycle、deployment 判别 union、collectors、metricFilter、podResources 的 schema/defaults 且不暴露原始参数透传 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
+| `HELM-007` | #51、#52、#56、#57 | Helm/RBAC | Chart | manager 具有 CR status/finalizer、Deployment/StatefulSet/DaemonSet、cluster/namespaced RBAC 与生命周期清理所需权限，且不含 Prometheus Operator API 权限 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
+| `HELM-GH57-001` | #57 | Helm/CRD | Chart | 发布 CRD 暴露 DaemonSetSharded 判别分支和三个角色级 resources 整体覆盖字段 | Ginkgo failure、rendered manifest | `make test-helm HELM=helm` |
 
 ## IT
 
@@ -108,6 +112,9 @@
 | `IT-KSM-GH56-003` | #56 | envtest | API Server 1.28 | `shards=1` 被 controller 报告为 `InvalidSpec`，不写入受管资源 | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-GH56-004` | #56 | envtest | API Server 1.28 | 切回 Deployment 时如果分片 Role 已不属于当前 UID，则预检报告 `ResourceConflict`、保留 RoleBinding 并不创建 workload | Ginkgo failure、API object | `make test-integration` |
 | `IT-KSM-GH56-005` | #56 | envtest | API Server 1.28 | 全新默认 Deployment 未应用分片拓扑时，无关的同名 Role/RoleBinding 不会触发分片清理或阻断 workload | Ginkgo failure、API object | `make test-integration` |
+| `IT-KSM-GH57-001` | #57 | envtest | API Server 1.28 | 实际写入三职责、两组 Service，并聚合 DaemonSet 与两个 companion Deployment 的真实 Pod 可用性 | Ginkgo failure、API object、status | `make test-integration` |
+| `IT-KSM-GH57-002` | #57 | envtest | 目标 profile 1.19 | 报告 `UnsupportedMode`，保留占据预期身份的哨兵对象且不创建其他受管资源 | Ginkgo failure、API object、status | `make test-integration` |
+| `IT-KSM-GH57-003` | #57 | envtest | API Server 1.28 | DaemonSetSharded 与 Deployment 往返切换先删除全部旧 workload，再清理模式 Service 并创建新拓扑 | Ginkgo failure、API object、status | `make test-integration` |
 
 ## E2E
 
@@ -124,6 +131,7 @@
 | `E2E-119-KSM-GH53-001` / `E2E-128-KSM-GH53-001` | #53 | kind E2E | Kubernetes 1.19.16、1.28.15 | 点号名称的稳定摘要身份；同/不同 Namespace 多实例的 workload、Service endpoints、Pod labels、RBAC 与生命周期隔离；已拥有资源修改/删除漂移自动修复；无 owner、错误 owner 与旧 UID 预占均报告 `ResourceConflict` 并恢复；finalizer 保留旧 UID 对象；真实 RBAC 失败下保留部分写入并继续收敛 | 完整集群对象、endpoints、Pods、conditions、Events 与 Operator logs | `make e2e-default-deployment KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-KSM-GH56-001` / `E2E-128-KSM-GH56-001` | #56 | kind E2E | Kubernetes 1.19.16、1.28.15 | 真实两分片 StatefulSet 暴露两个 endpoints，逐 Pod telemetry 报告唯一 ordinal/total-shards，每个 Pod 继承过滤/资源，RBAC/status 正确并完成模式往返 | 完整集群对象、conditions、Endpoints、telemetry 与 Operator logs | `make e2e-kubestatemetrics KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-KSM-GH56-002` / `E2E-128-KSM-GH56-002` | #56 | kind E2E | Kubernetes 1.19.16、1.28.15 | `shards=1` 在真实集群报告 `InvalidSpec` 且零受管资源 | 完整集群对象、conditions 与 Operator logs | `make e2e-kubestatemetrics KUBERNETES_VERSION=<minor> ...` |
+| `E2E-119-KSM-GH57-001` / `E2E-128-KSM-GH57-001` | #57 | kind E2E | Kubernetes 1.19.16、1.28.15 | 1.19 对 DaemonSetSharded 报告 `UnsupportedMode` 且零写入；1.28 验证两组 endpoints、三角色参数与资源覆盖、指标职责和模式往返切换 | 完整集群对象、endpoints、metrics、conditions 与 Operator logs | `make e2e-kubestatemetrics KUBERNETES_VERSION=<minor> ...` |
 | `E2E-119-PREFLIGHT-001` | #58 | kind E2E/预检 | Kubernetes 1.19.16 | 一期支持环境使用显式 runtime ServiceAccount 时预检成功，并报告 Kubernetes 版本事实与 `PreflightPassed` | NDJSON diagnostics、集群对象 | `make e2e-preflight KUBERNETES_VERSION=1.19 ...` |
 | `E2E-128-PREFLIGHT-001` | #58 | kind E2E/预检 | Kubernetes 1.28.15 | 一期支持环境使用显式 runtime ServiceAccount 时预检成功，并报告 Kubernetes 版本事实与 `PreflightPassed` | NDJSON diagnostics、集群对象 | `make e2e-preflight KUBERNETES_VERSION=1.28 ...` |
 | `E2E-119-PREFLIGHT-002` | #58 | kind E2E/预检 | Kubernetes 1.19.16 | runtime ServiceAccount 缺失时预检非零退出，并报告 `RuntimeServiceAccountNotFound` 与 `PreflightFailed` | NDJSON diagnostics、退出码 | `make e2e-preflight KUBERNETES_VERSION=1.19 ...` |

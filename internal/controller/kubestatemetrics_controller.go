@@ -51,8 +51,8 @@ type KubeStateMetricsReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets;nodes;resourcequotas;replicationcontrollers;limitranges;persistentvolumeclaims;persistentvolumes;endpoints,verbs=list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets;daemonsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=list;watch
 // +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=list;watch
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
@@ -304,21 +304,24 @@ func (r *KubeStateMetricsReconciler) reconcileDeletion(ctx context.Context, inst
 }
 
 func (r *KubeStateMetricsReconciler) reconcileDeploymentModeTransition(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan) (ctrl.Result, bool, error) {
-	// 先按稳定身份读取目标模式之外的 workload，它是本轮唯一允许先行删除的资源。
-	obsolete := obsoleteWorkload(instance, plan)
-	current, err := emptyObjectFor(obsolete)
-	if err != nil {
-		return ctrl.Result{}, true, err
-	}
-	key := client.ObjectKeyFromObject(obsolete)
-	if err := r.Get(ctx, key, current); err != nil && !apierrors.IsNotFound(err) {
-		readErr := fmt.Errorf("读取待切换旧 workload %T %q: %w", obsolete, key.String(), err)
-		if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, readErr); statusErr != nil {
-			return ctrl.Result{}, true, fmt.Errorf("%v；并且更新拓扑观测失败 status: %w", readErr, statusErr)
+	// 先完整读取目标模式之外的全部 workload；任一身份冲突或读取失败都发生在删除之前。
+	var obsolete []client.Object
+	for _, identity := range obsoleteWorkloads(instance, plan) {
+		current, err := emptyObjectFor(identity)
+		if err != nil {
+			return ctrl.Result{}, true, err
 		}
-		return ctrl.Result{}, true, readErr
-	} else if err == nil {
-		// 确认旧 workload 归属后用 UID 前置条件发出删除，避免误删同名重建对象。
+		key := client.ObjectKeyFromObject(identity)
+		if err := r.Get(ctx, key, current); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			readErr := fmt.Errorf("读取待切换旧 workload %T %q: %w", identity, key.String(), err)
+			if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, readErr); statusErr != nil {
+				return ctrl.Result{}, true, fmt.Errorf("%v；并且更新拓扑观测失败 status: %w", readErr, statusErr)
+			}
+			return ctrl.Result{}, true, readErr
+		}
 		if !managedByInstance(current, instance) {
 			problem := &ksm.Problem{Reason: ksm.ReasonResourceConflict, Message: fmt.Sprintf("模式切换的旧 %s %q 不由当前 KubeStateMetrics UID 管理", managedResourceReference(current).Kind, key.String())}
 			if statusErr := r.updateProblemStatus(ctx, instance, problem); statusErr != nil {
@@ -326,40 +329,66 @@ func (r *KubeStateMetricsReconciler) reconcileDeploymentModeTransition(ctx conte
 			}
 			return ctrl.Result{RequeueAfter: dependencyRetryInterval}, true, nil
 		}
-		if current.GetDeletionTimestamp().IsZero() {
+		obsolete = append(obsolete, current)
+	}
+	if len(obsolete) > 0 {
+		// 全部旧 workload 通过所有权预检后，在同一轮发出删除并等待 API 确认全部消失。
+		var deleteErrors []error
+		for _, current := range obsolete {
+			if !current.GetDeletionTimestamp().IsZero() {
+				continue
+			}
 			uid := current.GetUID()
-			if deleteErr := r.Delete(ctx, current, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
-				statusErr := r.updateModeTransitionStatus(ctx, instance, plan.Mode, "删除旧 workload 失败", deleteErr)
-				if statusErr != nil {
-					return ctrl.Result{}, true, fmt.Errorf("删除旧 workload 失败: %v；并且更新失败 status: %w", deleteErr, statusErr)
-				}
-				return ctrl.Result{}, true, deleteErr
+			if err := r.Delete(ctx, current, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil && !apierrors.IsNotFound(err) {
+				deleteErrors = append(deleteErrors, fmt.Errorf("删除旧 workload %T %q: %w", current, client.ObjectKeyFromObject(current).String(), err))
 			}
 		}
-		// 删除已发出但必须等待 API 确认消失，期间仅更新反映旧拓扑的过渡 status。
-		if err := r.updateModeTransitionStatus(ctx, instance, plan.Mode, "等待旧 workload 消失", nil); err != nil {
+		deleteErr := errors.Join(deleteErrors...)
+		stage := "等待旧 workload 消失"
+		if deleteErr != nil {
+			stage = "删除旧 workload 失败"
+		}
+		if err := r.updateModeTransitionStatus(ctx, instance, plan.Mode, stage, deleteErr); err != nil {
 			return ctrl.Result{}, true, err
+		}
+		if deleteErr != nil {
+			return ctrl.Result{}, true, deleteErr
 		}
 		return ctrl.Result{RequeueAfter: cleanupRetryInterval}, true, nil
 	}
 
-	// 切回 Deployment 时先清理仅服务于自动分片的 Role/RoleBinding，不把它们遗留为受管资源。
-	if plan.Mode == monitoringv1alpha1.DeploymentModeDeployment {
-		obsoleteRBAC := []client.Object{
+	// workload 全部消失后，完整预检并清理目标模式不再使用的 Service/RBAC，再允许写入新拓扑。
+	var obsoleteModeResources []client.Object
+	if plan.Mode != monitoringv1alpha1.DeploymentModeStatefulSetSharded {
+		shardedRBAC := []client.Object{
 			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: plan.Name, Namespace: instance.Spec.TargetNamespace}},
 			&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: plan.Name, Namespace: instance.Spec.TargetNamespace}},
 		}
-		applied, err := r.shardedTopologyWasApplied(ctx, instance, plan.Name, obsoleteRBAC)
+		applied, err := r.shardedTopologyWasApplied(ctx, instance, plan.Name, shardedRBAC)
 		if err != nil {
 			if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, err); statusErr != nil {
 				return ctrl.Result{}, true, fmt.Errorf("%v；并且更新拓扑观测失败 status: %w", err, statusErr)
 			}
 			return ctrl.Result{}, true, err
 		}
-		if !applied {
-			return ctrl.Result{}, false, nil
+		if applied {
+			obsoleteModeResources = append(obsoleteModeResources, shardedRBAC...)
 		}
-		found, conflict, cleanupErr := r.deleteModeSpecificResources(ctx, instance, obsoleteRBAC)
+	}
+	if plan.Mode != monitoringv1alpha1.DeploymentModeDaemonSetSharded {
+		applied, err := r.daemonTopologyWasApplied(ctx, instance, plan.Name)
+		if err != nil {
+			if statusErr := r.updateTopologyObservationFailureStatus(ctx, instance, plan.Mode, err); statusErr != nil {
+				return ctrl.Result{}, true, fmt.Errorf("%v；并且更新拓扑观测失败 status: %w", err, statusErr)
+			}
+			return ctrl.Result{}, true, err
+		}
+		if applied {
+			obsoleteModeResources = append(obsoleteModeResources, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: plan.Name + "-control", Namespace: instance.Spec.TargetNamespace}})
+		}
+	}
+	if len(obsoleteModeResources) > 0 {
+		found, conflict, cleanupErr := r.deleteModeSpecificResources(ctx, instance, obsoleteModeResources)
 		if conflict != nil {
 			if err := r.updateProblemStatus(ctx, instance, conflict); err != nil {
 				return ctrl.Result{}, true, err
@@ -367,7 +396,7 @@ func (r *KubeStateMetricsReconciler) reconcileDeploymentModeTransition(ctx conte
 			return ctrl.Result{RequeueAfter: dependencyRetryInterval}, true, nil
 		}
 		if cleanupErr != nil || len(found) > 0 {
-			if err := r.updateModeTransitionStatus(ctx, instance, plan.Mode, "正在清理分片模式 RBAC", cleanupErr); err != nil {
+			if err := r.updateModeTransitionStatus(ctx, instance, plan.Mode, "正在清理旧模式专属资源", cleanupErr); err != nil {
 				return ctrl.Result{}, true, err
 			}
 			if cleanupErr != nil {
@@ -379,12 +408,39 @@ func (r *KubeStateMetricsReconciler) reconcileDeploymentModeTransition(ctx conte
 	return ctrl.Result{}, false, nil
 }
 
-func obsoleteWorkload(instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan) client.Object {
+func obsoleteWorkloads(instance *monitoringv1alpha1.KubeStateMetrics, plan *ksm.ResourcePlan) []client.Object {
 	metadata := metav1.ObjectMeta{Name: plan.Name, Namespace: instance.Spec.TargetNamespace}
-	if plan.Mode == monitoringv1alpha1.DeploymentModeStatefulSetSharded {
-		return &appsv1.Deployment{ObjectMeta: metadata}
+	daemonWorkloads := []client.Object{
+		&appsv1.DaemonSet{ObjectMeta: metadata},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: plan.Name + "-cluster", Namespace: instance.Spec.TargetNamespace}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: plan.Name + "-unscheduled", Namespace: instance.Spec.TargetNamespace}},
 	}
-	return &appsv1.StatefulSet{ObjectMeta: metadata}
+	switch plan.Mode {
+	case monitoringv1alpha1.DeploymentModeDeployment:
+		return append([]client.Object{&appsv1.StatefulSet{ObjectMeta: metadata}}, daemonWorkloads...)
+	case monitoringv1alpha1.DeploymentModeStatefulSetSharded:
+		return append([]client.Object{&appsv1.Deployment{ObjectMeta: metadata}}, daemonWorkloads...)
+	case monitoringv1alpha1.DeploymentModeDaemonSetSharded:
+		return []client.Object{&appsv1.Deployment{ObjectMeta: metadata}, &appsv1.StatefulSet{ObjectMeta: metadata}}
+	default:
+		return nil
+	}
+}
+
+func (r *KubeStateMetricsReconciler) daemonTopologyWasApplied(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, name string) (bool, error) {
+	if instance.Status.DeploymentMode == monitoringv1alpha1.DeploymentModeDaemonSetSharded {
+		return true, nil
+	}
+	service := &corev1.Service{}
+	key := client.ObjectKey{Namespace: instance.Spec.TargetNamespace, Name: name}
+	if err := r.Get(ctx, key, service); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("检查已应用 DaemonSetSharded Service %q: %w", key.String(), err)
+		}
+	} else if managedByInstance(service, instance) && service.Spec.Selector[ksm.LabelEndpointGroup] == ksm.EndpointGroupNode {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (r *KubeStateMetricsReconciler) shardedTopologyWasApplied(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, name string, modeResources []client.Object) (bool, error) {
@@ -398,7 +454,7 @@ func (r *KubeStateMetricsReconciler) shardedTopologyWasApplied(ctx context.Conte
 		if !apierrors.IsNotFound(err) {
 			return false, fmt.Errorf("检查已应用分片 Service %q: %w", serviceKey.String(), err)
 		}
-	} else if managedByInstance(service, instance) && service.Spec.Selector["monitor-in-hand/endpoint-group"] == "sharded" {
+	} else if managedByInstance(service, instance) && service.Spec.Selector[ksm.LabelEndpointGroup] == ksm.EndpointGroupSharded {
 		return true, nil
 	}
 	for _, identity := range modeResources {
@@ -536,7 +592,11 @@ func directManagedResources(instance *monitoringv1alpha1.KubeStateMetrics) []cli
 	return []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
 		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name + "-cluster", Namespace: namespace}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name + "-unscheduled", Namespace: namespace}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name + "-control", Namespace: namespace}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
 		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
 		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
@@ -549,7 +609,7 @@ func nonWorkloadResources(resources []client.Object) []client.Object {
 	result := make([]client.Object, 0, len(resources))
 	for _, resource := range resources {
 		switch resource.(type) {
-		case *appsv1.Deployment, *appsv1.StatefulSet:
+		case *appsv1.Deployment, *appsv1.StatefulSet, *appsv1.DaemonSet:
 		default:
 			result = append(result, resource)
 		}
@@ -561,7 +621,7 @@ func workloadResources(resources []client.Object) []client.Object {
 	result := make([]client.Object, 0, 1)
 	for _, resource := range resources {
 		switch resource.(type) {
-		case *appsv1.Deployment, *appsv1.StatefulSet:
+		case *appsv1.Deployment, *appsv1.StatefulSet, *appsv1.DaemonSet:
 			result = append(result, resource)
 		}
 	}
@@ -705,6 +765,10 @@ func (r *KubeStateMetricsReconciler) apply(ctx context.Context, desired client.O
 			actual.Spec.Selector = wanted.Spec.Selector.DeepCopy()
 			actual.Spec.ServiceName = wanted.Spec.ServiceName
 			wanted.Spec.Template.DeepCopyInto(&actual.Spec.Template)
+		case *appsv1.DaemonSet:
+			wanted := desired.(*appsv1.DaemonSet)
+			actual.Spec.Selector = wanted.Spec.Selector.DeepCopy()
+			wanted.Spec.Template.DeepCopyInto(&actual.Spec.Template)
 		default:
 			return fmt.Errorf("不支持的受管资源类型 %T", current)
 		}
@@ -806,28 +870,38 @@ func (r *KubeStateMetricsReconciler) observeManagedState(ctx context.Context, in
 		resources = append(resources, managedResourceReference(current))
 		switch workload := current.(type) {
 		case *appsv1.Deployment:
-			mode = monitoringv1alpha1.DeploymentModeDeployment
-			if workload.Spec.Replicas != nil {
-				desiredPods = *workload.Spec.Replicas
+			if workload.Labels[ksm.LabelRole] == ksm.WorkloadRoleCluster || workload.Labels[ksm.LabelRole] == ksm.WorkloadRoleUnscheduled {
+				mode = monitoringv1alpha1.DeploymentModeDaemonSetSharded
+			} else {
+				mode = monitoringv1alpha1.DeploymentModeDeployment
 			}
-			availablePods = workload.Status.AvailableReplicas
+			if workload.Spec.Replicas != nil {
+				desiredPods += *workload.Spec.Replicas
+			}
+			availablePods += workload.Status.AvailableReplicas
 		case *appsv1.StatefulSet:
 			mode = monitoringv1alpha1.DeploymentModeStatefulSetSharded
 			if workload.Spec.Replicas != nil {
-				desiredPods = *workload.Spec.Replicas
+				desiredPods += *workload.Spec.Replicas
 			}
-			availablePods = workload.Status.ReadyReplicas
+			availablePods += workload.Status.ReadyReplicas
+		case *appsv1.DaemonSet:
+			mode = monitoringv1alpha1.DeploymentModeDaemonSetSharded
+			desiredPods += workload.Status.DesiredNumberScheduled
+			availablePods += workload.Status.NumberAvailable
 		case *corev1.Service:
-			endpointGroup = workload.Spec.Selector["monitor-in-hand/endpoint-group"]
+			endpointGroup = workload.Spec.Selector[ksm.LabelEndpointGroup]
 		}
 	}
 	// workload 短暂不存在时，用尚未调整的 Service endpoint-group 表示当前真实拓扑。
 	if mode == "" {
 		switch endpointGroup {
-		case "default":
+		case ksm.EndpointGroupDefault:
 			mode = monitoringv1alpha1.DeploymentModeDeployment
-		case "sharded":
+		case ksm.EndpointGroupSharded:
 			mode = monitoringv1alpha1.DeploymentModeStatefulSetSharded
+		case ksm.EndpointGroupNode, ksm.EndpointGroupControl:
+			mode = monitoringv1alpha1.DeploymentModeDaemonSetSharded
 		}
 	}
 	return resources, mode, desiredPods, availablePods, nil
@@ -972,6 +1046,22 @@ func (r *KubeStateMetricsReconciler) workloadPodCounts(ctx context.Context, name
 			return 0, 0, fmt.Errorf("读取已应用 StatefulSet: %w", err)
 		}
 		return pointerValue(statefulSet.Spec.Replicas), statefulSet.Status.ReadyReplicas, nil
+	case monitoringv1alpha1.DeploymentModeDaemonSetSharded:
+		daemonSet := &appsv1.DaemonSet{}
+		if err := r.Get(ctx, key, daemonSet); err != nil {
+			return 0, 0, fmt.Errorf("读取已应用 DaemonSet: %w", err)
+		}
+		desiredPods := daemonSet.Status.DesiredNumberScheduled
+		availablePods := daemonSet.Status.NumberAvailable
+		for _, suffix := range []string{"-cluster", "-unscheduled"} {
+			deployment := &appsv1.Deployment{}
+			if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: plan.Name + suffix}, deployment); err != nil {
+				return 0, 0, fmt.Errorf("读取已应用 DaemonSetSharded companion Deployment %q: %w", plan.Name+suffix, err)
+			}
+			desiredPods += pointerValue(deployment.Spec.Replicas)
+			availablePods += deployment.Status.AvailableReplicas
+		}
+		return desiredPods, availablePods, nil
 	default:
 		return 0, 0, fmt.Errorf("不支持的已规划部署模式 %q", plan.Mode)
 	}
@@ -1131,6 +1221,8 @@ func managedResourceReference(resource client.Object) monitoringv1alpha1.Managed
 		reference.APIVersion, reference.Kind = appsv1.SchemeGroupVersion.String(), "Deployment"
 	case *appsv1.StatefulSet:
 		reference.APIVersion, reference.Kind = appsv1.SchemeGroupVersion.String(), "StatefulSet"
+	case *appsv1.DaemonSet:
+		reference.APIVersion, reference.Kind = appsv1.SchemeGroupVersion.String(), "DaemonSet"
 	}
 	return reference
 }
@@ -1156,6 +1248,7 @@ func (r *KubeStateMetricsReconciler) SetupWithManager(manager ctrl.Manager) erro
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.requestsForNamespace)).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&appsv1.DaemonSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.ClusterRole{}).
