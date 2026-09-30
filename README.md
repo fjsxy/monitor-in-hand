@@ -61,7 +61,9 @@ make test-env-down KUBERNETES_VERSION=1.19 TEST_RUN_ID=local-119
 
 所有容器使用 multi-arch digest；Prometheus Operator 使用官方完整 `bundle.yaml`，下载后必须匹配仓库记录的 SHA-256。固定版本、digest 与 node image 位于 `test/fixtures/testenv/versions.env`。
 
-`test-env-verify` 从 Kubernetes 公共接口验证精确 server patch、Linux 节点架构与 Ready、API ready、Operator watch scope/RBAC、五类 CRD 的 served version 和所需 schema、Agent runtime RBAC、最小 `PrometheusAgent` 的 `Reconciled`/`Available` conditions、生成 StatefulSet 的固定镜像，以及 VictoriaMetrics、target 和 prober endpoints。
+`test-env-verify` 从 Kubernetes 公共接口验证精确 server patch、Linux 节点架构与 Ready、API ready、Operator watch scope/RBAC、五类 CRD 的 served version 和所需 schema、Agent runtime RBAC、最小持久化 `PrometheusAgent` 的 `Reconciled`/`Available` conditions、生成 StatefulSet 的固定镜像，以及 VictoriaMetrics、target 和 prober endpoints。
+
+完整双版本验收按 `e2e-preflight`、`e2e-default-deployment`、`e2e-collection` 的顺序运行；先安装当前工作树构建的本 Operator，随后 collection 场景才能对 Agent、runtime RBAC、采集配置和外部生成资源执行真实的反向边界快照断言。
 
 清理前会核对 `kube-system/monitor-in-hand-test-run` 中的 test-run 身份和 Kubernetes minor；不匹配时拒绝删除。失败后先运行以下命令保存诊断，再清理：
 
