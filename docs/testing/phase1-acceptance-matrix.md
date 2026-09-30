@@ -42,6 +42,7 @@
 | `UT-KSM-GH57-001` | #57 | 纯规划 | Kubernetes 1.19 | 合法 DaemonSetSharded 返回 `UnsupportedMode` 且零资源计划 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-KSM-GH57-002` | #57 | 纯规划 | Kubernetes 1.28 | 规划 node DaemonSet、cluster/unscheduled companion Deployments、两组 Service，并统一过滤结果与整体 resources 覆盖 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-KSM-GH57-003` | #57 | 纯规划 | 1.19、1.28 | 判别 union、collector 组合与三角色 resourceClaims 静态错误优先返回 `InvalidSpec` | Ginkgo failure | `go test ./internal/kubestatemetrics` |
+| `UT-KSM-GH57-004` | #57 | E2E 编排 | 本地 gate | Operator 镜像构建与 kind 导入在 Ginkgo 进程前完成，冷构建不占用 suite/node timeout | Make dry-run 命令顺序 | `go test ./test/e2e/kubestatemetrics -run '^TestKubeStateMetricsE2EOrchestration$'` |
 | `UT-EXAMPLE-GH59-001` | #59 | 示例/RBAC | 通用 | 原生 Agent 示例为四类配置使用非空 object/namespace selector，ScrapeConfig 覆盖 static 与五种一期 Kubernetes discovery；统一 runtime ClusterRole 包含所需资源与 `/metrics` 且不含 nodes | Ginkgo failure、示例 manifest | `go test ./test/testenv` |
 | `UT-COLLECTION-GH59-001` | #59 | E2E 支撑 | 通用 | kubectl 将授权结果写入 stdout、将集群级资源 scope warning 写入 stderr 时，两条流保持分离且拒绝退出状态不丢失 | Go testing failure、stdout/stderr、退出码 | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |
 | `UT-COLLECTION-GH59-002` | #59 | E2E 支撑 | 通用 | 从格式化 EventList JSON 结构化读取 `InvalidConfiguration` reason，且畸形 JSON 显式报错 | Go testing failure、Event JSON | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |

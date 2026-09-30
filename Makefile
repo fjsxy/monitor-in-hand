@@ -3,6 +3,7 @@
 IMG ?= docker.io/fjsxy/monitor-in-hand:0.1.0
 HELM ?= $(shell command -v helm 2>/dev/null || printf '%s/.tools/bin/helm' '$(CURDIR)')
 GINKGO ?= go run github.com/onsi/ginkgo/v2/ginkgo
+KIND ?= kind
 RELEASE ?= monitor-in-hand
 NAMESPACE ?= monitor-in-hand-system
 E2E_REPORT_DIR ?= artifacts/e2e/$(TEST_RUN_ID)-$(KUBERNETES_VERSION)
@@ -129,6 +130,8 @@ e2e-collection: ## Verify native PrometheusAgent collection and boundaries after
 		./test/e2e/collection
 
 e2e-kubestatemetrics: ## Verify KubeStateMetrics deployment modes against real managed workloads.
+	BUILDKIT_PROGRESS=plain $(CONTAINER_TOOL) build --tag "$(IMG)" .
+	$(KIND) load docker-image --name "mih-e2e-$(subst .,,$(KUBERNETES_VERSION))-$(TEST_RUN_ID)" "$(IMG)"
 	mkdir -p "$(E2E_REPORT_DIR)/kubestatemetrics"
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
 		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=20m \
