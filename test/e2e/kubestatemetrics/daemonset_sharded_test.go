@@ -153,14 +153,11 @@ spec:
 		}))
 
 		By("验证 node 与 control 两组 Endpoints，且 control 明确包含两个不同职责的 companion Pod")
-		nodePodNames := endpointPodNames(ctx, daemonShardedManagedName)
-		controlPodNames := endpointPodNames(ctx, daemonShardedManagedName+"-control")
-		Expect(nodePodNames).To(HaveLen(int(desiredNodes)))
-		Expect(controlPodNames).To(HaveLen(2))
-		Expect(controlPodNames[0] + " " + controlPodNames[1]).To(SatisfyAll(
-			ContainSubstring(daemonShardedManagedName+"-cluster-"),
-			ContainSubstring(daemonShardedManagedName+"-unscheduled-"),
-		))
+		endpointPodNames(ctx, daemonShardedManagedName, int(desiredNodes))
+		controlPodNames := endpointPodNames(ctx, daemonShardedManagedName+"-control", 2,
+			daemonShardedManagedName+"-cluster-",
+			daemonShardedManagedName+"-unscheduled-",
+		)
 
 		By("直接读取两个 companion Pod，确认 control endpoints 暴露不同指标族")
 		for _, podName := range controlPodNames {
@@ -227,7 +224,7 @@ func daemonShardedScenarioID(sequence string) string {
 	return "E2E-UNSUPPORTED-KSM-GH57-" + sequence
 }
 
-func endpointPodNames(ctx SpecContext, serviceName string) []string {
+func endpointPodNames(ctx SpecContext, serviceName string, expectedCount int, expectedPrefixes ...string) []string {
 	var podNames []string
 	Eventually(func() error {
 		endpoints, err := getObject[corev1.Endpoints](ctx, targetNamespace, "endpoints", serviceName)
@@ -242,8 +239,20 @@ func endpointPodNames(ctx SpecContext, serviceName string) []string {
 				}
 			}
 		}
-		if len(podNames) == 0 {
-			return fmt.Errorf("Service %s 尚无 ready Pod endpoints", serviceName)
+		if len(podNames) != expectedCount {
+			return fmt.Errorf("Service %s ready Pod endpoints=%v，期望数量 %d", serviceName, podNames, expectedCount)
+		}
+		for _, prefix := range expectedPrefixes {
+			found := false
+			for _, podName := range podNames {
+				if strings.HasPrefix(podName, prefix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("Service %s ready Pod endpoints=%v，缺少前缀 %q", serviceName, podNames, prefix)
+			}
 		}
 		return nil
 	}, 2*time.Minute, 2*time.Second).Should(Succeed())
