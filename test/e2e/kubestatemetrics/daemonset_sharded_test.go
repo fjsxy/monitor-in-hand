@@ -44,7 +44,7 @@ spec:
     names: [pods, deployments]
   metricFilter:
     mode: Allow
-    patterns: ['kube_(pod|deployment)_info']
+    patterns: ['kube_(pod_info|deployment_created)']
   namespaceFilter:
     mode: Include
     names: [%s]
@@ -138,7 +138,7 @@ spec:
 		Expect(err).NotTo(HaveOccurred())
 		unscheduled, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", daemonShardedManagedName+"-unscheduled")
 		Expect(err).NotTo(HaveOccurred())
-		sharedArgs := []string{"--metric-allowlist=kube_(pod|deployment)_info", "--namespaces=" + targetNamespace}
+		sharedArgs := []string{"--metric-allowlist=kube_(pod_info|deployment_created)", "--namespaces=" + targetNamespace}
 		Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal(append([]string{"--resources=pods"}, append(sharedArgs, "--node=$(NODE_NAME)")...)))
 		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal(append([]string{"--resources=deployments"}, sharedArgs...)))
 		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(append([]string{"--resources=pods"}, append(sharedArgs, `--node=""`)...)))
@@ -163,14 +163,14 @@ spec:
 		for _, podName := range controlPodNames {
 			if strings.HasPrefix(podName, daemonShardedManagedName+"-cluster-") {
 				assertTargetMetricsBody(ctx, "pod/"+podName, 8080, func(body []byte) error {
-					if !strings.Contains(string(body), "kube_deployment_info") || strings.Contains(string(body), "kube_pod_info") {
+					if !strings.Contains(string(body), "kube_deployment_created") || strings.Contains(string(body), "kube_pod_info") {
 						return fmt.Errorf("cluster companion 指标族不符合预期")
 					}
 					return nil
 				})
 			} else {
 				assertTargetMetricsBody(ctx, "pod/"+podName, 8080, func(body []byte) error {
-					if !strings.Contains(string(body), `pod="`+unscheduledProbeName+`"`) || strings.Contains(string(body), "kube_deployment_info") {
+					if !strings.Contains(string(body), `pod="`+unscheduledProbeName+`"`) || strings.Contains(string(body), "kube_deployment_created") {
 						return fmt.Errorf("unscheduled companion 未仅暴露未调度 Pod 指标")
 					}
 					return nil
