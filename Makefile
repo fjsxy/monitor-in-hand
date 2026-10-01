@@ -7,6 +7,8 @@ KIND ?= kind
 RELEASE ?= monitor-in-hand
 NAMESPACE ?= monitor-in-hand-system
 E2E_REPORT_DIR ?= artifacts/e2e/$(TEST_RUN_ID)-$(KUBERNETES_VERSION)
+E2E_CLUSTER_NAME = mih-e2e-$(subst .,,$(KUBERNETES_VERSION))-$(TEST_RUN_ID)
+E2E_KUBE_CONTEXT = kind-$(E2E_CLUSTER_NAME)
 # Kubebuilder v3.13.0 generated this project and matches the controller-runtime v0.16 line.
 KUBEBUILDER_VERSION ?= v3.13.0
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
@@ -73,7 +75,7 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-collection e2e-kubestatemetrics e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
+.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-agent e2e-image e2e-operator-install e2e-collection e2e-kubestatemetrics e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
 test: manifests verify-generated generate fmt typecheck test-unit test-integration test-helm test-testenv ## Run all tests.
 
 test-unit: ## Run control-plane unit tests.
@@ -122,18 +124,28 @@ e2e-preflight: ## Verify strict deployment preflight against the current pinned 
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/preflight" \
 		./test/e2e/preflight
 
-e2e-collection: ## Verify native PrometheusAgent collection and boundaries after e2e-default-deployment.
+e2e-agent: e2e-preflight e2e-collection ## Verify preflight and native PrometheusAgent boundaries in an independent lane.
+
+e2e-image: ## Build and load the current worktree Operator image into the active E2E cluster.
+	mkdir -p bin/e2e-kubestatemetrics
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o bin/e2e-kubestatemetrics/manager ./cmd
+	BUILDKIT_PROGRESS=plain $(CONTAINER_TOOL) build --file test/e2e/kubestatemetrics/Dockerfile --tag "$(IMG)" bin/e2e-kubestatemetrics
+	$(KIND) load docker-image --name "$(E2E_CLUSTER_NAME)" "$(IMG)"
+
+e2e-operator-install: e2e-image ## Install the current worktree Operator for standalone Agent boundary E2E.
+	$(KUBECTL) --context "$(E2E_KUBE_CONTEXT)" create namespace "$(NAMESPACE)" --dry-run=client --output yaml | \
+		$(KUBECTL) --context "$(E2E_KUBE_CONTEXT)" apply --filename -
+	$(HELM) upgrade --install "$(RELEASE)" charts/monitor-in-hand \
+		--kube-context "$(E2E_KUBE_CONTEXT)" --namespace "$(NAMESPACE)" --wait --timeout 180s
+
+e2e-collection: e2e-operator-install ## Verify native PrometheusAgent collection and boundaries independently.
 	mkdir -p "$(E2E_REPORT_DIR)/collection"
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" \
 		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=35m \
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/collection" \
 		./test/e2e/collection
 
-e2e-kubestatemetrics: ## Verify KubeStateMetrics deployment modes against real managed workloads.
-	mkdir -p bin/e2e-kubestatemetrics
-	CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o bin/e2e-kubestatemetrics/manager ./cmd
-	BUILDKIT_PROGRESS=plain $(CONTAINER_TOOL) build --file test/e2e/kubestatemetrics/Dockerfile --tag "$(IMG)" bin/e2e-kubestatemetrics
-	$(KIND) load docker-image --name "mih-e2e-$(subst .,,$(KUBERNETES_VERSION))-$(TEST_RUN_ID)" "$(IMG)"
+e2e-kubestatemetrics: e2e-image ## Verify KubeStateMetrics deployment modes against real managed workloads.
 	mkdir -p "$(E2E_REPORT_DIR)/kubestatemetrics"
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
 		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=20m \

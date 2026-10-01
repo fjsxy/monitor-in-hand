@@ -626,21 +626,33 @@ esac
 	})
 
 	It("[UT-BOUNDARY-GH60-002] 双版本门禁在 Agent 反向边界前运行当前工作树 Operator", func() {
-		By("读取 blocking 双版本 CI workflow")
+		By("通过公开 Make 入口读取独立 Agent lane 的实际编排")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
-		workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
-		Expect(err).NotTo(HaveOccurred())
+		command := exec.Command("make", "--dry-run", "e2e-agent",
+			"KUBERNETES_VERSION=1.28",
+			"TEST_RUN_ID=agent-lane-contract",
+			"HELM=helm",
+			"GINKGO=ginkgo",
+			"CONTAINER_TOOL=docker",
+			"KIND=kind",
+			"KUBECTL=kubectl",
+		)
+		command.Dir = root
+		output, err := command.CombinedOutput()
+		Expect(err).NotTo(HaveOccurred(), string(output))
 
-		By("定位预检、本 Operator 安装验收与 Agent collection 三个有状态阶段")
-		preflightIndex := bytes.Index(workflow, []byte("run: make e2e-preflight"))
-		operatorIndex := bytes.Index(workflow, []byte("run: make e2e-default-deployment HELM=helm"))
-		collectionIndex := bytes.Index(workflow, []byte("run: make e2e-collection"))
+		By("定位预检、本 Operator 安装与 Agent collection 三个有状态阶段")
+		plan := string(output)
+		preflightIndex := bytes.Index(output, []byte("./test/e2e/preflight"))
+		operatorIndex := bytes.Index(output, []byte("helm upgrade --install"))
+		collectionIndex := bytes.Index(output, []byte("./test/e2e/collection"))
 
-		By("验证先完成无副作用预检，再让运行中 Operator 接受 Agent 资源反向边界断言")
+		By("验证 lane 自给自足且不串行重跑 KubeStateMetrics suite")
 		Expect(preflightIndex).To(BeNumerically(">=", 0))
 		Expect(operatorIndex).To(BeNumerically(">", preflightIndex))
 		Expect(collectionIndex).To(BeNumerically(">", operatorIndex))
+		Expect(plan).NotTo(ContainSubstring("./test/e2e/kubestatemetrics"))
 	})
 
 	It("[UT-PREFLIGHT-GH59-001] 拒绝一期范围外的空 object selector", func() {

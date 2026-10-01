@@ -10,8 +10,8 @@ import (
 )
 
 var _ = Describe("双版本一期验收门禁", func() {
-	It("并行运行两个固定版本并在失败时先保存证据再清理", func() {
-		By("读取 CI workflow 并定位双版本验收 job")
+	It("按两个固定版本和两个 E2E lane 并行运行，并在失败时先保存证据再清理", func() {
+		By("读取 CI workflow 并定位双版本双 lane 验收 job")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		contents, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
@@ -22,24 +22,47 @@ var _ = Describe("双版本一期验收门禁", func() {
 		jobs := workflow["jobs"].(map[string]any)
 		job, found := jobs["test-environment"].(map[string]any)
 		Expect(found).To(BeTrue(), "缺少 test-environment blocking job")
+		Expect(job).To(HaveKeyWithValue("name", "e2e-${{ matrix.lane }} (Kubernetes ${{ matrix.kubernetes }})"))
 
-		By("验证 Kubernetes 1.19 和 1.28 使用独立矩阵入口")
+		By("验证 Kubernetes 1.19 和 1.28 的 KSM、Agent lane 使用四个独立矩阵入口")
 		strategy := job["strategy"].(map[string]any)
 		Expect(strategy["fail-fast"]).To(BeFalse())
 		matrix := strategy["matrix"].(map[string]any)
 		entries := matrix["include"].([]any)
-		Expect(entries).To(HaveLen(2))
+		Expect(entries).To(HaveLen(4))
 		Expect(entries).To(ConsistOf(
 			SatisfyAll(
 				HaveKeyWithValue("kubernetes", "1.19"),
 				HaveKeyWithValue("kubectl", "v1.19.16"),
 				HaveKeyWithValue("run_id_suffix", "119"),
+				HaveKeyWithValue("lane", "ksm"),
+				HaveKeyWithValue("target", "e2e-kubestatemetrics"),
+			),
+			SatisfyAll(
+				HaveKeyWithValue("kubernetes", "1.19"),
+				HaveKeyWithValue("kubectl", "v1.19.16"),
+				HaveKeyWithValue("run_id_suffix", "119"),
+				HaveKeyWithValue("lane", "agent"),
+				HaveKeyWithValue("target", "e2e-agent"),
 			),
 			SatisfyAll(
 				HaveKeyWithValue("kubernetes", "1.28"),
 				HaveKeyWithValue("kubectl", "v1.28.15"),
 				HaveKeyWithValue("run_id_suffix", "128"),
+				HaveKeyWithValue("lane", "ksm"),
+				HaveKeyWithValue("target", "e2e-kubestatemetrics"),
 			),
+			SatisfyAll(
+				HaveKeyWithValue("kubernetes", "1.28"),
+				HaveKeyWithValue("kubectl", "v1.28.15"),
+				HaveKeyWithValue("run_id_suffix", "128"),
+				HaveKeyWithValue("lane", "agent"),
+				HaveKeyWithValue("target", "e2e-agent"),
+			),
+		))
+		Expect(job["env"]).To(HaveKeyWithValue(
+			"TEST_RUN_ID",
+			"ci-${{ github.run_id }}-${{ matrix.run_id_suffix }}-${{ matrix.lane }}",
 		))
 
 		By("验证环境准备、Ginkgo E2E、报告上传和最终清理都是 blocking 步骤")
@@ -60,22 +83,17 @@ var _ = Describe("双版本一期验收门禁", func() {
 			)),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
-			HaveKeyWithValue("name", "E2E 严格部署预检"),
-			HaveKeyWithValue("run", ContainSubstring("make e2e-preflight")),
-		)))
-		Expect(steps).To(ContainElement(SatisfyAll(
-			HaveKeyWithValue("name", "E2E PrometheusAgent 采集配置"),
-			HaveKeyWithValue("run", ContainSubstring("make e2e-collection")),
-		)))
-		Expect(steps).To(ContainElement(SatisfyAll(
-			HaveKeyWithValue("name", "E2E 默认 KubeStateMetrics Deployment"),
-			HaveKeyWithValue("run", ContainSubstring("make e2e-default-deployment")),
+			HaveKeyWithValue("name", "E2E ${{ matrix.lane }}"),
+			HaveKeyWithValue("run", "make ${{ matrix.target }} HELM=helm"),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "上传 E2E 测试报告"),
 			HaveKeyWithValue("if", "${{ always() }}"),
 			HaveKeyWithValue("uses", "actions/upload-artifact@v4"),
-			HaveKeyWithValue("with", HaveKeyWithValue("path", "artifacts/e2e/")),
+			HaveKeyWithValue("with", SatisfyAll(
+				HaveKeyWithValue("name", "e2e-${{ matrix.run_id_suffix }}-${{ matrix.lane }}-${{ github.run_id }}"),
+				HaveKeyWithValue("path", "artifacts/e2e/"),
+			)),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "失败时保存测试环境证据"),
@@ -84,6 +102,10 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("uses", "actions/upload-artifact@v4"),
 			HaveKeyWithValue("if", "${{ failure() }}"),
+			HaveKeyWithValue("with", HaveKeyWithValue(
+				"name",
+				"test-environment-${{ matrix.run_id_suffix }}-${{ matrix.lane }}-${{ github.run_id }}",
+			)),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "清理本次测试环境"),
