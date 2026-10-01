@@ -144,9 +144,9 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 	if suspended {
 		resources = nonWorkloadResources(plan.Resources)
 	}
-	// 在任何写入前检查本轮所有目标身份；零匹配时也必须保护待删除 workload 的所有权。
+	// 在任何写入前检查本轮所有目标身份；零匹配或挂起时虽不写 workload，也要在改写拓扑前预检其稳定身份。
 	conflictCandidates := resources
-	if len(plan.EffectiveNamespaces) == 0 {
+	if len(plan.EffectiveNamespaces) == 0 || suspended {
 		conflictCandidates = append(append([]client.Object(nil), resources...), plan.Workloads...)
 	}
 	if conflict, err := r.findOwnershipConflict(ctx, conflictCandidates); err != nil {
