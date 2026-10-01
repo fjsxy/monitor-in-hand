@@ -1100,6 +1100,52 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-control"}, &corev1.Service{})).To(Satisfy(apierrors.IsNotFound))
 	})
 
+	It("IT-KSM-GH57-004 挂起中切换会在删除旧拓扑前预检全部新 workload 身份", func() {
+		By("准备已就绪的默认 Deployment，并用外部 DaemonSet 占用目标模式身份")
+		namespace := "it-ksm-daemon-suspended-conflict-" + suffix
+		name := "daemon-suspended-conflict-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: namespace}}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+
+		foreignLabels := map[string]string{"preserve": "true"}
+		foreign := &appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace, Labels: foreignLabels},
+			Spec: appsv1.DaemonSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: foreignLabels},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: foreignLabels},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "sentinel", Image: "example.invalid/sentinel:latest"}}},
+				},
+			},
+		}
+		Expect(testClient.Create(ctx, foreign)).To(Succeed())
+
+		By("同时挂起并切换模式，验证冲突在旧 workload 删除和 Service 改写前报告")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.Suspended = boolPointer(true)
+		actual.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeDaemonSetSharded, DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+		}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		reconcile(name, "v1.28.15")
+
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Degraded")).To(SatisfyAll(HaveField("Status", metav1.ConditionTrue), HaveField("Reason", ksm.ReasonResourceConflict)))
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		Expect(deployment.DeletionTimestamp.IsZero()).To(BeTrue())
+		service := &corev1.Service{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, service)).To(Succeed())
+		Expect(service.Spec.Selector).To(HaveKeyWithValue(ksm.LabelEndpointGroup, ksm.EndpointGroupDefault))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-control"}, &corev1.Service{})).To(Satisfy(apierrors.IsNotFound))
+		Expect(testClient.Get(ctx, client.ObjectKeyFromObject(foreign), foreign)).To(Succeed())
+		Expect(foreign.Labels).To(HaveKeyWithValue("preserve", "true"))
+	})
+
 	It("IT-KSM-006 停用优先于无效声明并在 Disabled 后按最新声明恢复", func() {
 		By("准备一个已创建完整资源的受管实例")
 		namespace := "it-ksm-disable-" + suffix

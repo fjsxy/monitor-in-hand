@@ -116,6 +116,7 @@
 | `IT-KSM-GH57-001` | #57 | envtest | API Server 1.28 | 实际写入三职责、两组 Service，并聚合 DaemonSet 与两个 companion Deployment 的真实 Pod 可用性 | Ginkgo failure、API object、status | `make test-integration` |
 | `IT-KSM-GH57-002` | #57 | envtest | 目标 profile 1.19 | 报告 `UnsupportedMode`，保留占据预期身份的哨兵对象且不创建其他受管资源 | Ginkgo failure、API object、status | `make test-integration` |
 | `IT-KSM-GH57-003` | #57 | envtest | API Server 1.28 | DaemonSetSharded 与 Deployment 往返切换先删除全部旧 workload，再清理模式 Service 并创建新拓扑 | Ginkgo failure、API object、status | `make test-integration` |
+| `IT-KSM-GH57-004` | #57 | envtest | API Server 1.28 | 挂起中切换模式仍在删除旧 workload 或改写 Service 前预检全部目标 workload 身份 | Ginkgo failure、API object、status | `make test-integration` |
 
 ## E2E
 
