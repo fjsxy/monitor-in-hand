@@ -130,7 +130,9 @@ e2e-collection: ## Verify native PrometheusAgent collection and boundaries after
 		./test/e2e/collection
 
 e2e-kubestatemetrics: ## Verify KubeStateMetrics deployment modes against real managed workloads.
-	BUILDKIT_PROGRESS=plain $(CONTAINER_TOOL) build --tag "$(IMG)" .
+	mkdir -p bin/e2e-kubestatemetrics
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o bin/e2e-kubestatemetrics/manager ./cmd
+	BUILDKIT_PROGRESS=plain $(CONTAINER_TOOL) build --file test/e2e/kubestatemetrics/Dockerfile --tag "$(IMG)" bin/e2e-kubestatemetrics
 	$(KIND) load docker-image --name "mih-e2e-$(subst .,,$(KUBERNETES_VERSION))-$(TEST_RUN_ID)" "$(IMG)"
 	mkdir -p "$(E2E_REPORT_DIR)/kubestatemetrics"
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
