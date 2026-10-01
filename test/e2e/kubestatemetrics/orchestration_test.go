@@ -30,16 +30,26 @@ func TestKubeStateMetricsE2EOrchestration(t *testing.T) {
 			t.Fatalf("dry-run public E2E target: %v\n%s", err, output)
 		}
 
-		// 镜像构建和导入必须先于 Ginkgo，冷构建才能脱离 suite/node timeout。
+		// 镜像准备必须先用宿主机工具链生成 Linux 二进制，避免冷 Docker 构建等待编译器镜像元数据。
 		plan := string(output)
-		buildAt := strings.Index(plan, `docker build --tag "docker.io/fjsxy/monitor-in-hand:0.1.0"`)
+		hostBuildAt := strings.Index(plan, "CGO_ENABLED=0 GOOS=linux go build")
+		buildAt := strings.Index(plan, `docker build --file test/e2e/kubestatemetrics/Dockerfile --tag "docker.io/fjsxy/monitor-in-hand:0.1.0" bin/e2e-kubestatemetrics`)
 		loadAt := strings.Index(plan, `kind load docker-image --name "mih-e2e-128-sc-57-contract" "docker.io/fjsxy/monitor-in-hand:0.1.0"`)
 		ginkgoAt := strings.Index(plan, "ginkgo -v")
-		if buildAt < 0 || loadAt < 0 || ginkgoAt < 0 {
+		if hostBuildAt < 0 || buildAt < 0 || loadAt < 0 || ginkgoAt < 0 {
 			t.Fatalf("E2E 编排缺少镜像准备或 Ginkgo 阶段:\n%s", plan)
 		}
-		if !(buildAt < loadAt && loadAt < ginkgoAt) {
-			t.Fatalf("E2E 编排顺序错误: build=%d load=%d ginkgo=%d\n%s", buildAt, loadAt, ginkgoAt, plan)
+		if !(hostBuildAt < buildAt && buildAt < loadAt && loadAt < ginkgoAt) {
+			t.Fatalf("E2E 编排顺序错误: host-build=%d image-build=%d load=%d ginkgo=%d\n%s", hostBuildAt, buildAt, loadAt, ginkgoAt, plan)
+		}
+
+		// 读取公开编排引用的镜像定义，锁定 Docker 阶段不再依赖远端 Go 编译器镜像。
+		dockerfile, err := os.ReadFile(filepath.Join(repoRoot, "test", "e2e", "kubestatemetrics", "Dockerfile"))
+		if err != nil {
+			t.Fatalf("read E2E runtime Dockerfile: %v", err)
+		}
+		if strings.Contains(string(dockerfile), "FROM golang:") || strings.Count(string(dockerfile), "FROM ") != 1 {
+			t.Fatalf("E2E 镜像必须仅包含 runtime stage:\n%s", dockerfile)
 		}
 	})
 }
