@@ -2,6 +2,9 @@ package helm_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -240,10 +243,51 @@ var _ = Describe("Operator Helm chart", func() {
 			Expect(nested(crd, append(branchPath, field, "type")...)).To(Equal("object"))
 		}
 	})
+
+	It("HELM-GH64-001 固定一期 CRD schema", func() {
+		By("读取发布 CRD 并对 OpenAPI schema 计算确定性摘要")
+		root := repositoryRoot()
+		crd := decodeYAMLFile(filepath.Join(root, "charts", "monitor-in-hand", "crds", "monitoring.fjsxy.github.io_kubestatemetrics.yaml"))
+		schema := nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema")
+		canonical, err := json.Marshal(schema)
+		Expect(err).NotTo(HaveOccurred())
+		digest := sha256.Sum256(canonical)
+		Expect(hex.EncodeToString(digest[:])).To(Equal("e3408bad55a60a70fa495d411bad3d9bc3a95f06cf7eb47ababaac4363f93e37"))
+	})
+
+	It("HELM-GH64-002 不提供删除 hook 或清理 Job", func() {
+		By("验证普通渲染没有 pre-delete hook、清理 Job 或 finalizer 操作入口")
+		objects := renderChart()
+		Expect(resourceKinds(objects)).NotTo(ContainElement("Job"))
+		for _, object := range objects {
+			Expect(object.GetAnnotations()).NotTo(HaveKeyWithValue("helm.sh/hook", ContainSubstring("pre-delete")))
+		}
+	})
+
+	It("HELM-GH64-003 不用 release name 派生集群级控制面身份", func() {
+		By("使用两个 release name 渲染 Chart")
+		first := renderChartRelease("first-release")
+		second := renderChartRelease("second-release")
+
+		By("验证两个 release 竞争同一 ClusterRole，而 namespace 级控制面身份保持隔离")
+		Expect(nested(objectByKind(first, "ClusterRole"), "metadata", "name")).To(Equal("monitor-in-hand-manager-role"))
+		Expect(nested(objectByKind(second, "ClusterRole"), "metadata", "name")).To(Equal("monitor-in-hand-manager-role"))
+		Expect(nested(objectByKind(first, "Deployment"), "metadata", "name")).To(Equal("first-release-monitor-in-hand"))
+		Expect(nested(objectByKind(second, "Deployment"), "metadata", "name")).To(Equal("second-release-monitor-in-hand"))
+	})
 })
 
 func renderChart(extraArgs ...string) []*unstructured.Unstructured {
-	output := mustRenderChart(extraArgs...)
+	return decodeRenderedChart(mustRenderChart(extraArgs...))
+}
+
+func renderChartRelease(release string) []*unstructured.Unstructured {
+	output, err := renderChartReleaseError(release)
+	Expect(err).NotTo(HaveOccurred(), output)
+	return decodeRenderedChart([]byte(output))
+}
+
+func decodeRenderedChart(output []byte) []*unstructured.Unstructured {
 
 	decoder := kyaml.NewYAMLOrJSONDecoder(bytes.NewReader(output), 4096)
 	var objects []*unstructured.Unstructured
@@ -268,6 +312,10 @@ func mustRenderChart(extraArgs ...string) []byte {
 }
 
 func renderChartError(extraArgs ...string) (string, error) {
+	return renderChartReleaseError("test-release", extraArgs...)
+}
+
+func renderChartReleaseError(release string, extraArgs ...string) (string, error) {
 	root := repositoryRoot()
 	helm := os.Getenv("HELM_BIN")
 	if helm == "" {
@@ -275,7 +323,7 @@ func renderChartError(extraArgs ...string) (string, error) {
 	} else if !filepath.IsAbs(helm) && filepath.Dir(helm) != "." {
 		helm = filepath.Join(root, helm)
 	}
-	args := []string{"template", "test-release", filepath.Join(root, "charts", "monitor-in-hand"), "--namespace", "monitor-system"}
+	args := []string{"template", release, filepath.Join(root, "charts", "monitor-in-hand"), "--namespace", "monitor-system"}
 	args = append(args, extraArgs...)
 	command := exec.Command(helm, args...)
 	output, err := command.CombinedOutput()
