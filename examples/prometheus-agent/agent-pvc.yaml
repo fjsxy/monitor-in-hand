@@ -1,0 +1,53 @@
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: PrometheusAgent
+metadata:
+  name: example
+  namespace: monitoring
+spec:
+  version: v2.55.1
+  image: quay.io/prometheus/prometheus:v2.55.1
+  serviceAccountName: prometheus-agent-example
+  replicas: 1
+  shards: 2
+  walCompression: true
+  replicaExternalLabelName: ""
+  externalLabels:
+    mih_cluster_id: replace-with-stable-cluster-id
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: replace-with-storage-class
+        accessModes:
+          - ReadWriteOnce
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: 10Gi
+  serviceMonitorSelector:
+    matchLabels:
+      monitoring.fjsxy.github.io/agent: example
+  serviceMonitorNamespaceSelector:
+    matchLabels:
+      monitoring.fjsxy.github.io/collection-scope: example
+  podMonitorSelector:
+    matchLabels:
+      monitoring.fjsxy.github.io/agent: example
+  podMonitorNamespaceSelector:
+    matchLabels:
+      monitoring.fjsxy.github.io/collection-scope: example
+  probeSelector:
+    matchLabels:
+      monitoring.fjsxy.github.io/agent: example
+  probeNamespaceSelector:
+    matchLabels:
+      monitoring.fjsxy.github.io/collection-scope: example
+  scrapeConfigSelector:
+    matchLabels:
+      monitoring.fjsxy.github.io/agent: example
+  scrapeConfigNamespaceSelector:
+    matchLabels:
+      monitoring.fjsxy.github.io/collection-scope: example
+  remoteWrite:
+    - name: victoriametrics-primary
+      url: http://vminsert.monitoring.svc:8480/insert/0/prometheus/api/v1/write
+      messageVersion: V1.0

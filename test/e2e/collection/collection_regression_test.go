@@ -3,10 +3,12 @@ package collection_test
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCollectionHelpers(t *testing.T) {
@@ -67,6 +69,40 @@ vm_http_requests_total{path="/insert/{}/prometheus/", protocol="promremotewrite"
 		}
 		if _, found := metricSample(metrics, "prometheus_remote_storage_samples_total", `remote_name="missing"`); found {
 			t.Fatal("unexpected sample for missing remote")
+		}
+	})
+
+	t.Run("[UT-COLLECTION-GH62-001] 从 Prometheus 2.55 指标读取 WAL backlog 与 lag", func(t *testing.T) {
+		// 重放两个失败 job 捕获到的 Prometheus 2.55 exposition，其中入队最高时间是无标签的全局指标。
+		metrics := `prometheus_remote_storage_highest_timestamp_in_seconds 1.790923396e+09
+prometheus_remote_storage_samples_pending{remote_name="gh62-victoriametrics-primary",url="http://unreachable"} 7198
+prometheus_remote_storage_queue_highest_sent_timestamp_seconds{remote_name="gh62-victoriametrics-primary",url="http://unreachable"} 0
+`
+		pending, lag, found := gh62BacklogMetrics(metrics)
+		if !found {
+			t.Fatal("expected Prometheus 2.55 backlog metrics to be recognized")
+		}
+		if pending != 7198 || lag != 1.790923396e+09 {
+			t.Fatalf("expected pending=7198 and lag=1.790923396e+09, got pending=%v lag=%v", pending, lag)
+		}
+	})
+
+	t.Run("[UT-COLLECTION-GH62-002] WAL 恢复轮询绕过固定历史查询缓存", func(t *testing.T) {
+		// 重放 CI 中恢复开始时先返回空结果、随后 WAL 才写入同一历史窗口的查询形态。
+		path := gh62OutageQueryPath(
+			"gh62-wal-ci-36976554544-128-agent",
+			"gh62-ci-36976554544-128-agent",
+			time.Unix(1790925182, 0),
+			time.Unix(1790925189, 0),
+		)
+		parsed, err := url.Parse(path)
+		if err != nil {
+			t.Fatalf("parse outage query path: %v", err)
+		}
+
+		// 固定的历史 query_range 每次必须重新读取存储，不能复用恢复前的空结果。
+		if parsed.Query().Get("nocache") != "1" {
+			t.Fatalf("expected WAL recovery query to disable cache, got %q", path)
 		}
 	})
 }
