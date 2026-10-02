@@ -482,6 +482,70 @@ esac
 		Expect(string(missingClassOutput)).To(ContainSubstring(`"reason":"RetainedPVCConflict"`))
 	})
 
+	It("[UT-PREFLIGHT-GH62-001] 在资源调谐前拒绝修改或移除已创建的 volumeClaimTemplate", func() {
+		By("准备容量与现存 Agent 不同的持久 WAL 计划")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fakeBin := GinkgoT().TempDir()
+		agentManifest := filepath.Join(fakeBin, "agent.yaml")
+		Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+
+		writeExecutable(filepath.Join(fakeBin, "kubectl"), `#!/usr/bin/env bash
+set -eu
+case "$*" in
+  *"create --dry-run=client --filename "*" --output json"*)
+    if [[ "${PREFLIGHT_STORAGE_CHANGE:-resize}" == remove ]]; then
+      printf '%s\n' '{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"wal","namespace":"monitoring"},"spec":{"serviceAccountName":"wal","replicas":0,"shards":1}}'
+    else
+      printf '%s\n' '{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"wal","namespace":"monitoring"},"spec":{"serviceAccountName":"wal","replicas":0,"shards":1,"storage":{"volumeClaimTemplate":{"spec":{"accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem","resources":{"requests":{"storage":"2Gi"}}}}}}}'
+    fi
+    ;;
+  "version --output json")
+    printf '%s\n' '{"serverVersion":{"major":"1","minor":"28","gitVersion":"v1.28.15"}}'
+    ;;
+  "get namespace "*" --output name")
+    printf '%s\n' "namespace/$3"
+    ;;
+  "--namespace monitoring get serviceaccount wal --output name")
+    printf '%s\n' 'serviceaccount/wal'
+    ;;
+  "--namespace monitoring get prometheusagent wal --ignore-not-found --output json")
+    printf '%s\n' '{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"wal","namespace":"monitoring","uid":"existing-agent"},"spec":{"serviceAccountName":"wal","replicas":0,"shards":1,"storage":{"volumeClaimTemplate":{"spec":{"accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem","resources":{"requests":{"storage":"1Gi"}}}}}}}'
+    ;;
+  *)
+    printf 'unexpected cluster access after immutable storage conflict: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+`)
+
+		runPreflight := func(storageChange string) ([]byte, error) {
+			command := exec.Command(
+				filepath.Join(root, "hack", "preflight.sh"),
+				"--agent-namespace", "monitoring",
+				"--agent-service-account", "wal",
+				"--config-namespaces", "monitoring",
+				"--discovery-namespaces", "monitoring",
+				"--agent-manifest", agentManifest,
+			)
+			command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"), "PREFLIGHT_STORAGE_CHANGE="+storageChange)
+			return command.CombinedOutput()
+		}
+
+		By("通过公开预检入口尝试扩容与移除 volumeClaimTemplate")
+		for _, storageChange := range []string{"resize", "remove"} {
+			output, commandErr := runPreflight(storageChange)
+			By("验证两种不可变更都以稳定诊断非零退出")
+			Expect(commandErr).To(HaveOccurred(), string(output))
+			Expect(commandErr.(*exec.ExitError).ExitCode()).To(Equal(1))
+			expectJSONDiagnostics(output)
+			Expect(string(output)).To(SatisfyAll(
+				ContainSubstring(`"check":"agent-storage"`),
+				ContainSubstring(`"reason":"ImmutableVolumeClaimTemplate"`),
+			))
+		}
+	})
+
 	It("[UT-EXAMPLE-GH59-001] 示例固定四类非空 selector、六种 discovery 与无 nodes runtime RBAC", func() {
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
@@ -647,6 +711,40 @@ esac
 		Expect(endpoint.User).To(BeNil())
 		Expect(endpoint.RawQuery).To(BeEmpty())
 		Expect(endpoint.Fragment).To(BeEmpty())
+	})
+
+	It("[UT-EXAMPLE-GH62-001] 管理员可在 EmptyDir 与持久 PVC WAL 之间显式选择", func() {
+		By("读取默认与持久 WAL 两份公开 Agent 示例")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		emptyDirAgent := readManifestObjects(filepath.Join(root, "examples", "prometheus-agent", "agent.yaml"))[0]
+		persistentAgent := readManifestObjects(filepath.Join(root, "examples", "prometheus-agent", "agent-pvc.yaml"))[0]
+
+		By("验证默认示例省略 storage，持久示例只显式声明兼容 1.19 的 PVC 模板")
+		emptyDirSpec := emptyDirAgent["spec"].(map[string]any)
+		Expect(emptyDirSpec).NotTo(HaveKey("storage"))
+		persistentSpec := persistentAgent["spec"].(map[string]any)
+		Expect(persistentSpec).To(SatisfyAll(
+			HaveKeyWithValue("replicas", BeNumerically("==", 1)),
+			HaveKeyWithValue("shards", BeNumerically("==", 2)),
+			Not(HaveKey("persistentVolumeClaimRetentionPolicy")),
+		))
+		claim, found, err := unstructured.NestedMap(persistentAgent, "spec", "storage", "volumeClaimTemplate", "spec")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(found).To(BeTrue())
+		Expect(claim).To(SatisfyAll(
+			HaveKeyWithValue("storageClassName", "replace-with-storage-class"),
+			HaveKeyWithValue("accessModes", ConsistOf("ReadWriteOnce")),
+			HaveKeyWithValue("volumeMode", "Filesystem"),
+			HaveKeyWithValue("resources", HaveKeyWithValue("requests", HaveKeyWithValue("storage", "10Gi"))),
+		))
+
+		By("验证两份可直接应用的示例除 storage 选择外保持同一 Agent 契约")
+		persistentWithoutStorage, found, err := unstructured.NestedMap(persistentAgent, "spec")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(found).To(BeTrue())
+		delete(persistentWithoutStorage, "storage")
+		Expect(persistentWithoutStorage).To(Equal(emptyDirSpec))
 	})
 
 	It("[UT-BOUNDARY-GH60-001] 本 Operator 安装身份无权读写 Agent 与采集配置 API", func() {

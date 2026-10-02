@@ -477,7 +477,7 @@ else
 fi
 
 validate_agent_resource_identities() {
-  local agent_name current_agent current_agent_uid shards shard statefulset_name statefulset_uid pod_name tls_index
+  local agent_name current_agent current_agent_uid planned_claim_template current_claim_template shards shard statefulset_name statefulset_uid pod_name tls_index
   [[ -n "${agent_manifest}" ]] || return
   agent_name=$(jq --raw-output '.metadata.name' <<<"${agent_json}")
   shards=$(jq --raw-output '.spec.shards // 1' <<<"${agent_json}")
@@ -495,6 +495,27 @@ validate_agent_resource_identities() {
       ' <<<"${current_agent}" 2>/dev/null); then
       record_failure agent-resource-identity fail InvalidReservedResourceResponse "已有 PrometheusAgent 响应缺少 name 或 UID" \
         "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${agent_name}" '{namespace: $namespace, name: $name, kind: "PrometheusAgent"}')"
+      return
+    fi
+
+    normalize_volume_claim_template() {
+      jq --sort-keys --compact-output '
+        if . == null then null
+        else
+          walk(if type == "object" then with_entries(select(.value != null)) else . end)
+          | .spec = (.spec // {})
+          | .spec.accessModes = (.spec.accessModes // ["ReadWriteOnce"])
+          | .spec.volumeMode = (.spec.volumeMode // "Filesystem")
+        end
+      '
+    }
+
+    # volumeClaimTemplate 会成为 StatefulSet 不可变字段；先按上游缺省值规范化，再拒绝对现存 Agent 的修改或移除。
+    planned_claim_template=$(jq '.spec.storage.volumeClaimTemplate // null' <<<"${agent_json}" | normalize_volume_claim_template)
+    current_claim_template=$(jq '.spec.storage.volumeClaimTemplate // null' <<<"${current_agent}" | normalize_volume_claim_template)
+    if [[ "${planned_claim_template}" != "${current_claim_template}" ]]; then
+      record_failure agent-storage fail ImmutableVolumeClaimTemplate "已有 Agent 的 volumeClaimTemplate 在首次创建后不可修改或移除" \
+        "$(jq --null-input --arg namespace "${agent_namespace}" --arg name "${agent_name}" '{namespace: $namespace, name: $name}')"
       return
     fi
   fi

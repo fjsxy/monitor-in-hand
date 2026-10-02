@@ -16,6 +16,44 @@ hack/preflight.sh \
 kubectl apply -f agent.yaml
 ```
 
+上述 `agent.yaml` 是 EmptyDir 路径：它故意省略 `spec.storage`，因此每个
+Agent Pod 的 WAL 使用 Pod 级 EmptyDir。Pod 被替换后会获得新卷，旧卷中尚未
+发送的 WAL 可能丢失；实际是否丢样本取决于故障前的 remote_write 进度，
+不应对单次 Pod 替换作“必然丢失”的时序敏感断言。
+
+需要跨 Pod 故障保留 WAL 时，把 `agent-pvc.yaml` 中的
+`replace-with-storage-class` 替换为集群的 StorageClass 后，改用：
+
+```bash
+hack/preflight.sh \
+  --agent-namespace monitoring \
+  --agent-service-account prometheus-agent-example \
+  --config-namespaces monitoring \
+  --discovery-namespaces applications \
+  --agent-manifest agent-pvc.yaml \
+  --collection-config-manifest collection-configs.yaml
+kubectl apply -f agent-pvc.yaml
+```
+
+PVC 示例固定 `ReadWriteOnce`、`Filesystem` 与 `requests.storage: 10Gi`。
+`storageClassName` 是可选字段：删除该字段表示使用创建 PVC 当时的默认
+StorageClass；显式空字符串则是 Kubernetes 的“不使用 StorageClass”语义，
+两者不等价。每个 shard 是独立 StatefulSet，每个 replica ordinal 都由
+`volumeClaimTemplate` 获得独立 PVC，不在 Pod 之间共享 WAL。一期预检的运行子集
+仍只接受 `replicas: 1` 或用 `replicas: 0` 挂起。
+
+PVC 的生命周期故意独立于 Agent workload：`replicas: 0`、缩减 shards、
+删除 StatefulSet 或删除 Agent 都不删除已有 PVC。这一边界依赖 StatefulSet
+volumeClaimTemplate 原有的保留语义，不配置 Kubernetes 1.19 不支持的
+PVC retention policy。在同一 Namespace 以同一 Agent name 重建时，相同
+shard/ordinal 会复用同名 PVC，这被定义为恢复操作。要创建全新实例，
+必须使用新 Agent name，或由管理员先明确删除旧 PVC 并确认底层 PV 的
+StorageClass reclaim policy。
+
+`volumeClaimTemplate` 首次创建后视为不可变；严格预检会在调谐前拒绝
+对现存 Agent 修改或移除模板。PVC 扩容、存储迁移、PVC 删除与底层
+PV 回收都属于集群管理员和 StorageClass policy 的责任，不由本项目自动执行。
+
 `prometheus-agent-runtime` ClusterRole 是一期 Agent 共享的 discovery 权限集。
 每个 Agent 仍要在自己 namespace 中使用独立 ServiceAccount，并用同时包含
 namespace/name 身份的独立 ClusterRoleBinding 绑定该共享角色。这些管理员资源
@@ -27,9 +65,12 @@ retained PVC。无关对象占用任一保留名时必须先由管理员处理�
 删除或接管它。默认 `prometheus-agent-operated` 是例外：它是 namespace 内所有
 Agent 的共享 headless governing Service，只要结构和普通 Agent ownerReferences 合法
 就可复用；结构中的端口名取自 Agent 的 `portName`。显式 `serviceName` 使用上游自定义
-governing Service 路径，不检查默认名称。已有 retained PVC 会按计划中的 accessModes、
-volumeMode、容量和显式 StorageClass 核对；名称尚未存在时，预检不会额外收窄上游
-storage 能力。预检是创建前的时点检查，不代替 GitOps 变更控制。
+governing Service 路径，不检查默认名称。已有 retained PVC 会按预期名称、
+项目/Agent/shard labels、删除状态、accessModes、volumeMode、Kubernetes Quantity
+等价容量和显式 StorageClass 核对；无法确认来源、正在删除或存储属性不匹配时
+都会非零退出。计划未显式声明 StorageClass 时，预检保留创建 PVC 时由默认
+StorageClass 决定的上游语义；名称尚未存在时，也不额外收窄上游 storage 能力。
+预检是创建前的时点检查，不代替 GitOps 变更控制。
 
 一期正常运行仅支持省略 `replicas` 或设为 `1`；`replicas: 0` 挂起所有 shards；
 `replicas > 1` 仍是上游能力，但不能通过一期预检。扩展吞吐时使用至少为 `1`
