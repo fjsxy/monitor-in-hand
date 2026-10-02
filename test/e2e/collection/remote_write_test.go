@@ -377,14 +377,23 @@ func waitForGH61HTTPBody(ctx context.Context, target string, remotePort int, pat
 
 func metricSample(contents, metricName, requiredLabel string) (float64, bool) {
 	for _, line := range strings.Split(contents, "\n") {
-		if !strings.HasPrefix(line, metricName+"{") || !strings.Contains(line, requiredLabel) {
+		valueText := ""
+		switch {
+		case strings.HasPrefix(line, metricName+"{"):
+			if requiredLabel != "" && !strings.Contains(line, requiredLabel) {
+				continue
+			}
+			closingBrace := strings.LastIndexByte(line, '}')
+			if closingBrace == -1 {
+				continue
+			}
+			valueText = line[closingBrace+1:]
+		case requiredLabel == "" && strings.HasPrefix(line, metricName+" "):
+			valueText = line[len(metricName):]
+		default:
 			continue
 		}
-		closingBrace := strings.LastIndexByte(line, '}')
-		if closingBrace == -1 {
-			continue
-		}
-		fields := strings.Fields(line[closingBrace+1:])
+		fields := strings.Fields(valueText)
 		if len(fields) == 0 {
 			continue
 		}

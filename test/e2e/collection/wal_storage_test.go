@@ -190,10 +190,13 @@ var _ = Describe("PrometheusAgent WAL 存储与恢复", Serial, func() {
 		waitForReadyAgentPods(ctx, testNamespace, agentName, oneReplicaPodNames)
 		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
 
-		By(scenarioID + " 删除 Agent，验证 StatefulSet 消失但 PVC 不依赖 retention policy 而保留")
+		By(scenarioID + " 删除 Agent，验证 workload 消失但 PVC 不依赖 retention policy 而保留")
 		deleteResource(ctx, "prometheusagent", agentName, testNamespace)
 		waitForGH62ResourceAbsent(ctx, "statefulset", "prom-agent-"+agentName)
 		waitForGH62ResourceAbsent(ctx, "statefulset", "prom-agent-"+agentName+"-shard-1")
+		for _, podName := range allPodNames {
+			waitForGH62ResourceAbsent(ctx, "pod", podName)
+		}
 		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
 
 		By(scenarioID + " 对同 namespace/name 恢复计划执行严格预检，再重建 Agent")
@@ -614,13 +617,8 @@ func waitForGH62BacklogGrowth(ctx context.Context, podName string) string {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(response.StatusCode).To(Equal(http.StatusOK), string(contents))
 		body = string(contents)
-		pending, found := metricSample(body, "prometheus_remote_storage_samples_pending", `remote_name="`+gh62RemoteWriteName+`"`)
+		pending, lag, found := gh62BacklogMetrics(body)
 		g.Expect(found).To(BeTrue(), body)
-		highest, found := metricSample(body, "prometheus_remote_storage_queue_highest_timestamp_seconds", `remote_name="`+gh62RemoteWriteName+`"`)
-		g.Expect(found).To(BeTrue(), body)
-		sent, found := metricSample(body, "prometheus_remote_storage_queue_highest_sent_timestamp_seconds", `remote_name="`+gh62RemoteWriteName+`"`)
-		g.Expect(found).To(BeTrue(), body)
-		lag := highest - sent
 		if !baselineCaptured && pending > 0 && lag > 0 {
 			baselinePending, baselineLag = pending, lag
 			baselineCaptured = true
@@ -630,6 +628,24 @@ func waitForGH62BacklogGrowth(ctx context.Context, podName string) string {
 		g.Expect(lag).To(BeNumerically(">", baselineLag))
 	}, 4*time.Minute, 2*time.Second).Should(Succeed())
 	return body
+}
+
+func gh62BacklogMetrics(contents string) (float64, float64, bool) {
+	requiredLabel := `remote_name="` + gh62RemoteWriteName + `"`
+	// Prometheus 2.55 以全局入队最高时间减去当前 remote queue 的已发送最高时间表示 WAL lag。
+	pending, found := metricSample(contents, "prometheus_remote_storage_samples_pending", requiredLabel)
+	if !found {
+		return 0, 0, false
+	}
+	highest, found := metricSample(contents, "prometheus_remote_storage_highest_timestamp_in_seconds", "")
+	if !found {
+		return 0, 0, false
+	}
+	sent, found := metricSample(contents, "prometheus_remote_storage_queue_highest_sent_timestamp_seconds", requiredLabel)
+	if !found {
+		return 0, 0, false
+	}
+	return pending, highest - sent, true
 }
 
 func waitForGH62OutageSamples(ctx context.Context, sampleID, clusterID string, start, end time.Time) string {

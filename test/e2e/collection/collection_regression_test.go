@@ -69,6 +69,21 @@ vm_http_requests_total{path="/insert/{}/prometheus/", protocol="promremotewrite"
 			t.Fatal("unexpected sample for missing remote")
 		}
 	})
+
+	t.Run("[UT-COLLECTION-GH62-001] 从 Prometheus 2.55 指标读取 WAL backlog 与 lag", func(t *testing.T) {
+		// 重放两个失败 job 捕获到的 Prometheus 2.55 exposition，其中入队最高时间是无标签的全局指标。
+		metrics := `prometheus_remote_storage_highest_timestamp_in_seconds 1.790923396e+09
+prometheus_remote_storage_samples_pending{remote_name="gh62-victoriametrics-primary",url="http://unreachable"} 7198
+prometheus_remote_storage_queue_highest_sent_timestamp_seconds{remote_name="gh62-victoriametrics-primary",url="http://unreachable"} 0
+`
+		pending, lag, found := gh62BacklogMetrics(metrics)
+		if !found {
+			t.Fatal("expected Prometheus 2.55 backlog metrics to be recognized")
+		}
+		if pending != 7198 || lag != 1.790923396e+09 {
+			t.Fatalf("expected pending=7198 and lag=1.790923396e+09, got pending=%v lag=%v", pending, lag)
+		}
+	})
 }
 
 func TestCollectionCommandFixture(t *testing.T) {
