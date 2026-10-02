@@ -49,6 +49,21 @@ func TestCollectionHelpers(t *testing.T) {
 			t.Fatal("expected malformed event JSON to return an error")
 		}
 	})
+
+	t.Run("[UT-COLLECTION-GH61-001] 按 metric family 和 remote name 读取数据面证据", func(t *testing.T) {
+		// 重放 Prometheus text exposition 中标签顺序可变且 sample 使用科学计数法的形态。
+		metrics := `# HELP prometheus_remote_storage_samples_total Total number of samples sent.
+prometheus_remote_storage_samples_total{remote_name="other",url="http://other"} 99
+prometheus_remote_storage_samples_total{url="http://vminsert",remote_name="gh61-victoriametrics-primary"} 1.25e+03
+`
+		value, found := metricSample(metrics, "prometheus_remote_storage_samples_total", `remote_name="gh61-victoriametrics-primary"`)
+		if !found || value != 1250 {
+			t.Fatalf("expected matching remote sample value 1250, got value=%v found=%v", value, found)
+		}
+		if _, found := metricSample(metrics, "prometheus_remote_storage_samples_total", `remote_name="missing"`); found {
+			t.Fatal("unexpected sample for missing remote")
+		}
+	})
 }
 
 func TestCollectionCommandFixture(t *testing.T) {

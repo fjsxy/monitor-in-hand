@@ -3,6 +3,7 @@ package testenv_test
 import (
 	"bytes"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -606,6 +607,48 @@ esac
 		Expect(serviceAccountName).To(Equal("prometheus-agent-example"))
 	})
 
+	It("[UT-EXAMPLE-GH61-001] 一期示例固定两分片身份与 V1 remote_write", func() {
+		By("读取管理员实际应用的 Agent 公开示例")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		agent := readManifestObjects(filepath.Join(root, "examples", "prometheus-agent", "agent.yaml"))[0]
+
+		By("验证 Prometheus 运行版本、两分片拓扑和稳定集群身份")
+		Expect(agent).To(HaveKeyWithValue("spec", SatisfyAll(
+			HaveKeyWithValue("version", "v2.55.1"),
+			HaveKeyWithValue("image", "quay.io/prometheus/prometheus:v2.55.1"),
+			HaveKeyWithValue("replicas", BeNumerically("==", 1)),
+			HaveKeyWithValue("shards", BeNumerically("==", 2)),
+			HaveKeyWithValue("walCompression", true),
+			HaveKeyWithValue("replicaExternalLabelName", ""),
+			HaveKeyWithValue("externalLabels", HaveKeyWithValue("mih_cluster_id", "replace-with-stable-cluster-id")),
+			Not(HaveKey("additionalArgs")),
+		)))
+
+		By("验证唯一 remote_write 目标使用无认证、无 TLS 的集群内 V1 URL")
+		remoteWrites, found, err := unstructured.NestedSlice(agent, "spec", "remoteWrite")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(found).To(BeTrue())
+		Expect(remoteWrites).To(HaveLen(1))
+		remoteWrite := remoteWrites[0].(map[string]any)
+		Expect(remoteWrite).To(SatisfyAll(
+			HaveKeyWithValue("name", "victoriametrics-primary"),
+			HaveKeyWithValue("messageVersion", "V1.0"),
+			Not(HaveKey("basicAuth")),
+			Not(HaveKey("authorization")),
+			Not(HaveKey("oauth2")),
+			Not(HaveKey("sigv4")),
+			Not(HaveKey("tlsConfig")),
+		))
+		endpoint, err := url.Parse(remoteWrite["url"].(string))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(endpoint.Scheme).To(Equal("http"))
+		Expect(endpoint.Host).To(Equal("vminsert.monitoring.svc:8480"))
+		Expect(endpoint.User).To(BeNil())
+		Expect(endpoint.RawQuery).To(BeEmpty())
+		Expect(endpoint.Fragment).To(BeEmpty())
+	})
+
 	It("[UT-BOUNDARY-GH60-001] 本 Operator 安装身份无权读写 Agent 与采集配置 API", func() {
 		By("读取会被 Helm 机械同步的 manager ClusterRole 生成源")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -1137,6 +1180,133 @@ esac
 				ContainSubstring(`"requiredDiscoveryNamespaces":["shared"]`),
 			))
 		}
+	})
+
+	It("[UT-PREFLIGHT-GH61-001] 拒绝产生或修改 mih_cluster_id 的一期采集配置", func() {
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fixtures := []struct {
+			name, objectField, config string
+		}{
+			{
+				name:        "ServiceMonitor relabeling",
+				objectField: "serviceMonitorSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1","kind":"ServiceMonitor","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"selector":{},"endpoints":[{"port":"metrics","relabelings":[{"targetLabel":"mih_cluster_id","replacement":"forged"}]}]}}`,
+			},
+			{
+				name:        "ServiceMonitor targetLabels",
+				objectField: "serviceMonitorSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1","kind":"ServiceMonitor","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"selector":{},"targetLabels":["mih_cluster_id"],"endpoints":[{"port":"metrics"}]}}`,
+			},
+			{
+				name:        "PodMonitor podTargetLabels",
+				objectField: "podMonitorSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1","kind":"PodMonitor","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"selector":{},"podTargetLabels":["mih_cluster_id"],"podMetricsEndpoints":[{"port":"metrics"}]}}`,
+			},
+			{
+				name:        "Probe static labels",
+				objectField: "probeSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1","kind":"Probe","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"prober":{"url":"blackbox:9115"},"targets":{"staticConfig":{"static":["https://example.invalid"],"labels":{"mih_cluster_id":"forged"}}}}}`,
+			},
+			{
+				name:        "ScrapeConfig metric relabeling",
+				objectField: "scrapeConfigSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"staticConfigs":[{"targets":["target:9090"]}],"metricRelabelings":[{"targetLabel":"mih_cluster_id","replacement":"forged"}]}}`,
+			},
+			{
+				name:        "ScrapeConfig explicit labelmap replacement",
+				objectField: "scrapeConfigSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"kubernetesSDConfigs":[{"role":"Pod","namespaces":{"names":["monitoring"]}}],"relabelings":[{"action":"labelmap","regex":"__meta_kubernetes_pod_label_(.+)","replacement":"mih_cluster_id"}]}}`,
+			},
+			{
+				name:        "ScrapeConfig explicit labelmap capture",
+				objectField: "scrapeConfigSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"kubernetesSDConfigs":[{"role":"Pod","namespaces":{"names":["monitoring"]}}],"relabelings":[{"action":"labelmap","regex":"__meta_kubernetes_pod_label_(mih_cluster_id)","replacement":"$1"}]}}`,
+			},
+			{
+				name:        "ScrapeConfig selected labelmap capture",
+				objectField: "scrapeConfigSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"kubernetesSDConfigs":[{"role":"Pod","namespaces":{"names":["monitoring"]}}],"relabelings":[{"action":"labelmap","regex":"(team)_(mih_cluster_id)","replacement":"$2"}]}}`,
+			},
+			{
+				name:        "ScrapeConfig nested labelmap capture",
+				objectField: "scrapeConfigSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"kubernetesSDConfigs":[{"role":"Pod","namespaces":{"names":["monitoring"]}}],"relabelings":[{"action":"labelmap","regex":"(prefix_(mih_cluster_id))","replacement":"$2"}]}}`,
+			},
+			{
+				name:        "ScrapeConfig case-insensitive labelmap capture",
+				objectField: "scrapeConfigSelector",
+				config:      `{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"kubernetesSDConfigs":[{"role":"Pod","namespaces":{"names":["monitoring"]}}],"relabelings":[{"action":"labelmap","regex":"(?i)(MIH_CLUSTER_ID)","replacement":"$1"}]}}`,
+			},
+		}
+
+		for _, fixture := range fixtures {
+			By("准备会产生或修改保护标签的 " + fixture.name)
+			fakeBin := GinkgoT().TempDir()
+			agentManifest := filepath.Join(fakeBin, "agent.yaml")
+			configManifest := filepath.Join(fakeBin, "config.yaml")
+			Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+			Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+			writeCollectionValidationKubectl(fakeBin,
+				`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","`+fixture.objectField+`":{"matchLabels":{"mih":"selected"}}}}`,
+				fixture.config,
+				false,
+			)
+
+			By("通过公开预检入口扫描 " + fixture.name)
+			command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+				"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+				"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
+				"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+			)
+			command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+			output, err := command.CombinedOutput()
+
+			By("验证保护标签冲突在任何集群访问前稳定失败")
+			Expect(err).To(HaveOccurred(), fixture.name+"\n"+string(output))
+			Expect(err.(*exec.ExitError).ExitCode()).To(Equal(1))
+			expectJSONDiagnostics(output)
+			Expect(string(output)).To(SatisfyAll(
+				ContainSubstring(`"check":"collection-configuration"`),
+				ContainSubstring(`"reason":"ProtectedExternalLabelMutation"`),
+				ContainSubstring(`"label":"mih_cluster_id"`),
+				Not(ContainSubstring(`"check":"kubernetes-version"`)),
+			))
+		}
+	})
+
+	It("[UT-PREFLIGHT-GH61-002] 保留只能产生非保护标签的 labelmap 配置", func() {
+		By("准备只能生成 team 或 team_ 前缀标签的 ScrapeConfig")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		fakeBin := GinkgoT().TempDir()
+		agentManifest := filepath.Join(fakeBin, "agent.yaml")
+		configManifest := filepath.Join(fakeBin, "config.yaml")
+		Expect(os.WriteFile(agentManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		Expect(os.WriteFile(configManifest, []byte("placeholder"), 0o600)).To(Succeed())
+		writeCollectionValidationKubectl(fakeBin,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"agent","namespace":"monitoring"},"spec":{"serviceAccountName":"agent","scrapeConfigSelector":{"matchLabels":{"mih":"selected"}}}}`,
+			`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"ScrapeConfig","metadata":{"name":"selected","namespace":"monitoring"},"spec":{"kubernetesSDConfigs":[{"role":"Pod","namespaces":{"names":["monitoring"]}}],"relabelings":[{"action":"labelmap","regex":"__meta_kubernetes_pod_label_team","replacement":"team"},{"action":"labelmap","regex":"__meta_kubernetes_pod_label_(.+)","replacement":"team_$1"},{"action":"labelmap","regex":"__meta_kubernetes_pod_label_(team)","replacement":"$1"},{"action":"labelmap","regex":"__meta_kubernetes_pod_label_(mih_cluster_id)","replacement":"team_$1"},{"action":"labelmap","regex":"mih_cluster_id_(team)","replacement":"$1"},{"action":"labelmap","regex":"(team)_(mih_cluster_id)","replacement":"$1"},{"action":"labelmap","regex":"(team)_(mih_cluster_id)","replacement":"${1}_${2}"},{"action":"labelmap","regex":"(prefix_(mih_cluster_id))","replacement":"$1"},{"action":"labelmap","regex":"(prefix_(mih_cluster_id))","replacement":"team_$2"},{"action":"labelmap","regex":"(?i)(TEAM)","replacement":"$1"}]}}`,
+			false,
+		)
+
+		By("通过公开预检入口扫描与保护标签无关的 labelmap")
+		command := exec.Command(filepath.Join(root, "hack", "preflight.sh"),
+			"--agent-namespace", "monitoring", "--agent-service-account", "agent",
+			"--config-namespaces", "monitoring", "--discovery-namespaces", "monitoring",
+			"--agent-manifest", agentManifest, "--collection-config-manifest", configManifest,
+		)
+		command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+		output, err := command.CombinedOutput()
+
+		By("验证 labelmap 通过保护标签检查，预检只因 fixture 未提供集群 API 而失败")
+		Expect(err).To(HaveOccurred(), string(output))
+		expectJSONDiagnostics(output)
+		Expect(string(output)).To(SatisfyAll(
+			ContainSubstring(`"reason":"ProtectedExternalLabelPreserved"`),
+			ContainSubstring(`"reason":"APIGroupVersionNotServed"`),
+			Not(ContainSubstring(`"reason":"ProtectedExternalLabelMutation"`)),
+		))
 	})
 })
 

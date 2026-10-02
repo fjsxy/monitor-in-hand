@@ -41,6 +41,7 @@ type objectIdentity struct {
 
 type targetSnapshot struct {
 	URLs []string
+	Body string
 }
 
 type resourceSnapshot struct {
@@ -547,12 +548,14 @@ func waitForPodTargets(ctx context.Context, namespace, pod string) targetSnapsho
 	DeferCleanup(stop)
 	client := &http.Client{Timeout: 5 * time.Second}
 	var urls []string
+	var body string
 	Eventually(func(g Gomega) {
 		response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/v1/targets", port))
 		g.Expect(err).NotTo(HaveOccurred())
 		defer response.Body.Close()
 		contents, err := io.ReadAll(response.Body)
 		g.Expect(err).NotTo(HaveOccurred())
+		body = string(contents)
 		var targets struct {
 			Status string `json:"status"`
 			Data   struct {
@@ -572,7 +575,7 @@ func waitForPodTargets(ctx context.Context, namespace, pod string) targetSnapsho
 		}
 		sort.Strings(urls)
 	}, 5*time.Minute, 3*time.Second).Should(Succeed())
-	return targetSnapshot{URLs: append([]string(nil), urls...)}
+	return targetSnapshot{URLs: append([]string(nil), urls...), Body: body}
 }
 
 func waitForRemoteAgentSeries(ctx context.Context, clusterID string, expectedAgents []string) {
