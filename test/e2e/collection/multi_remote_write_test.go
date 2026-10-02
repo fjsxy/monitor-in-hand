@@ -36,6 +36,8 @@ type gh63QueueSnapshot struct {
 var (
 	gh63PrimaryTarget   = gh63RemoteTarget{Name: "gh63-primary", URL: "http://vminsert.monitor-in-hand-test.svc:8480/insert/63/prometheus/api/v1/write"}
 	gh63SecondaryTarget = gh63RemoteTarget{Name: "gh63-secondary", URL: "http://gh63-secondary.monitor-in-hand-test.svc:8480/insert/630/prometheus/api/v1/write"}
+	gh63ReloadPrimary   = gh63RemoteTarget{Name: "gh63-reload-primary", URL: "http://vminsert.monitor-in-hand-test.svc:8480/insert/631/prometheus/api/v1/write"}
+	gh63ReloadSecondary = gh63RemoteTarget{Name: "gh63-reload-secondary", URL: "http://vminsert.monitor-in-hand-test.svc:8480/insert/632/prometheus/api/v1/write"}
 	gh63V2Target        = gh63RemoteTarget{Name: "gh63-v2", URL: "http://vminsert.monitor-in-hand-test.svc:8480/insert/633/prometheus/api/v1/write"}
 )
 
@@ -89,38 +91,40 @@ var _ = Describe("多目标 remote_write 故障语义", Serial, func() {
 
 		By(scenarioID + " 记录故障前两条 remote_write 队列基线")
 		pod := "prom-agent-" + gh63AgentName + "-0"
-		initialMetrics := waitForGH63AgentMetrics(ctx, pod, func(contents string) bool {
-			primary, primaryFound := gh63ReadQueueSnapshot(contents, gh63PrimaryTarget)
-			secondary, secondaryFound := gh63ReadQueueSnapshot(contents, gh63SecondaryTarget)
-			return primaryFound && secondaryFound && primary.Sent > 0 && secondary.Sent > 0
+		initialMetrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+			primary, primaryFound, err := gh63ReadQueueSnapshot(contents, gh63PrimaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			secondary, secondaryFound, err := gh63ReadQueueSnapshot(contents, gh63SecondaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(primaryFound && secondaryFound && primary.Sent > 0 && secondary.Sent > 0).To(BeTrue(), contents)
 		})
-		initialPrimary, _ := gh63ReadQueueSnapshot(initialMetrics, gh63PrimaryTarget)
-		initialSecondary, _ := gh63ReadQueueSnapshot(initialMetrics, gh63SecondaryTarget)
+		initialPrimary, primaryFound, err := gh63ReadQueueSnapshot(initialMetrics, gh63PrimaryTarget)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(primaryFound).To(BeTrue())
+		initialSecondary, secondaryFound, err := gh63ReadQueueSnapshot(initialMetrics, gh63SecondaryTarget)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(secondaryFound).To(BeTrue())
 		initialSecondaryLag := float64(time.Now().Unix()) - initialSecondary.HighestSent
 
 		By(scenarioID + " 切断第二目标 alias，并验证第一目标持续前进而第二队列独立积压、重试与增加 lag")
 		setGH63SecondarySelector(ctx, map[string]string{"monitoring.fjsxy.github.io/gh63-route": "disconnected"})
-		outageMetrics := waitForGH63AgentMetrics(ctx, pod, func(contents string) bool {
-			primary, primaryFound := gh63ReadQueueSnapshot(contents, gh63PrimaryTarget)
-			secondary, secondaryFound := gh63ReadQueueSnapshot(contents, gh63SecondaryTarget)
+		outageMetrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+			primary, primaryFound, err := gh63ReadQueueSnapshot(contents, gh63PrimaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			secondary, secondaryFound, err := gh63ReadQueueSnapshot(contents, gh63SecondaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
 			now := float64(time.Now().Unix())
-			return primaryFound && secondaryFound && primary.Sent > initialPrimary.Sent && primary.Retried == initialPrimary.Retried &&
+			g.Expect(primaryFound && secondaryFound && primary.Sent > initialPrimary.Sent && primary.Retried == initialPrimary.Retried &&
 				secondary.Retried > initialSecondary.Retried && secondary.Retried > primary.Retried &&
 				secondary.Pending > initialSecondary.Pending && secondary.Pending > primary.Pending && secondary.EnqueueRetries > 0 &&
-				now-secondary.HighestSent > initialSecondaryLag+3 && now-secondary.HighestSent > now-primary.HighestSent+3
+				now-secondary.HighestSent > initialSecondaryLag+3 && now-secondary.HighestSent > now-primary.HighestSent+3).To(BeTrue(), contents)
 		})
 		AddReportEntry("gh63-outage-queue-metrics", outageMetrics, ReportEntryVisibilityFailureOrVerbose)
 		primaryDuringOutage := waitForGH63InstantSeries(ctx, gh63PrimaryAccount, baseQuery)
 		AddReportEntry("gh63-primary-during-outage-query", primaryDuringOutage, ReportEntryVisibilityFailureOrVerbose)
 
 		By(scenarioID + " 将 alias 指向 429 responder，验证 retryOnRateLimit 使 retry 计数继续增长")
-		outageRetry, _ := gh63QueueMetric(outageMetrics, "prometheus_remote_storage_samples_retried_total", gh63SecondaryTarget)
 		setGH63SecondarySelector(ctx, map[string]string{"app.kubernetes.io/name": "gh63-rate-limit"})
-		rateLimitedMetrics := waitForGH63AgentMetrics(ctx, pod, func(contents string) bool {
-			retried, retryFound := gh63QueueMetric(contents, "prometheus_remote_storage_samples_retried_total", gh63SecondaryTarget)
-			dropped, droppedFound := gh63QueueMetric(contents, "prometheus_remote_storage_samples_dropped_total", gh63SecondaryTarget)
-			return retryFound && droppedFound && retried > outageRetry && dropped > 0
-		})
 		var rateLimiterLogs string
 		Eventually(func(g Gomega) {
 			var err error
@@ -128,6 +132,21 @@ var _ = Describe("多目标 remote_write 故障语义", Serial, func() {
 			g.Expect(err).NotTo(HaveOccurred(), rateLimiterLogs)
 			g.Expect(rateLimiterLogs).To(ContainSubstring(" 429 "))
 		}, 2*time.Minute, 2*time.Second).Should(Succeed())
+		rateLimitBaseline := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+			retried, retryFound, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_retried_total", gh63SecondaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(retryFound && retried > 0).To(BeTrue(), contents)
+		})
+		rateLimitRetry, retryFound, err := gh63QueueMetric(rateLimitBaseline, "prometheus_remote_storage_samples_retried_total", gh63SecondaryTarget)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(retryFound).To(BeTrue())
+		rateLimitedMetrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+			retried, found, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_retried_total", gh63SecondaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			dropped, droppedFound, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_dropped_total", gh63SecondaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(found && retried > rateLimitRetry && droppedFound && dropped > 0).To(BeTrue(), contents)
+		})
 		AddReportEntry("gh63-rate-limited-queue-metrics", rateLimitedMetrics, ReportEntryVisibilityFailureOrVerbose)
 		AddReportEntry("gh63-rate-limiter-logs", rateLimiterLogs, ReportEntryVisibilityFailureOrVerbose)
 
@@ -151,12 +170,19 @@ var _ = Describe("多目标 remote_write 故障语义", Serial, func() {
 		By(scenarioID + " 等待两 tenant 数据面恢复并保存每目标成功、失败、重试、丢弃、pending、lag、shards、enqueue retry 与 reload 指标")
 		finalPrimary := waitForGH63InstantSeries(ctx, gh63PrimaryAccount, baseQuery)
 		finalSecondary := waitForGH63InstantSeries(ctx, gh63SecondaryAccount, baseQuery)
-		finalMetrics := waitForGH63AgentMetrics(ctx, pod, func(contents string) bool {
-			secondaryPending, pendingFound := gh63QueueMetric(contents, "prometheus_remote_storage_samples_pending", gh63SecondaryTarget)
-			secondaryHighest, highestFound := gh63QueueMetric(contents, "prometheus_remote_storage_queue_highest_sent_timestamp_seconds", gh63SecondaryTarget)
-			reloadOK, reloadFound := gh63GlobalMetric(contents, "prometheus_config_last_reload_successful")
-			return pendingFound && highestFound && reloadFound && secondaryPending == 0 && float64(time.Now().Unix())-secondaryHighest < 15 && reloadOK == 1 &&
-				gh63HasQueueMetricFamilies(contents, gh63PrimaryTarget) && gh63HasQueueMetricFamilies(contents, gh63SecondaryTarget)
+		finalMetrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+			secondaryPending, pendingFound, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_pending", gh63SecondaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			secondaryHighest, highestFound, err := gh63QueueMetric(contents, "prometheus_remote_storage_queue_highest_sent_timestamp_seconds", gh63SecondaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			reloadOK, reloadFound, err := gh63GlobalMetric(contents, "prometheus_config_last_reload_successful")
+			g.Expect(err).NotTo(HaveOccurred())
+			primaryFamilies, err := gh63HasQueueMetricFamilies(contents, gh63PrimaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			secondaryFamilies, err := gh63HasQueueMetricFamilies(contents, gh63SecondaryTarget)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(pendingFound && highestFound && reloadFound && secondaryPending == 0 && float64(time.Now().Unix())-secondaryHighest < 15 && reloadOK == 1 &&
+				primaryFamilies && secondaryFamilies).To(BeTrue(), contents)
 		})
 		AddReportEntry("gh63-primary-final-query", finalPrimary, ReportEntryVisibilityFailureOrVerbose)
 		AddReportEntry("gh63-secondary-final-query", finalSecondary, ReportEntryVisibilityFailureOrVerbose)
@@ -181,17 +207,25 @@ var _ = Describe("多目标 remote_write 故障语义", Serial, func() {
 		Expect(statefulSet).NotTo(ContainSubstring("--no-storage.agent.wal-compression"))
 		waitForGH63InstantSeries(ctx, "631", query)
 		waitForGH63InstantSeries(ctx, "632", query)
-		baselineMetrics := waitForGH63AgentMetrics(ctx, pod, func(contents string) bool {
-			success, found := gh63GlobalMetric(contents, "prometheus_config_last_reload_successful")
-			return found && success == 1
+		baselineMetrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+			success, found, err := gh63GlobalMetric(contents, "prometheus_config_last_reload_successful")
+			g.Expect(err).NotTo(HaveOccurred())
+			primarySent, primaryFound, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_total", gh63ReloadPrimary)
+			g.Expect(err).NotTo(HaveOccurred())
+			secondarySent, secondaryFound, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_total", gh63ReloadSecondary)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(found && success == 1 && primaryFound && secondaryFound && primarySent > 0 && secondarySent > 0).To(BeTrue(), contents)
 		})
-		baselineReloadTimestamp, found := gh63GlobalMetric(baselineMetrics, "prometheus_config_last_reload_success_timestamp_seconds")
+		baselineReloadTimestamp, found, err := gh63GlobalMetric(baselineMetrics, "prometheus_config_last_reload_success_timestamp_seconds")
+		Expect(err).NotTo(HaveOccurred())
 		Expect(found).To(BeTrue())
+		baselinePrimarySent := gh63RequiredQueueMetric(baselineMetrics, "prometheus_remote_storage_samples_total", gh63ReloadPrimary)
+		baselineSecondarySent := gh63RequiredQueueMetric(baselineMetrics, "prometheus_remote_storage_samples_total", gh63ReloadSecondary)
 
 		By(scenarioID + " 提交重复 name，等待 reload 失败并验证活动配置与两个数据面保持旧值")
 		applyManifest(ctx, gh63ReloadAgentManifest(runLabel, gh63ReloadDuplicate))
 		waitForGH63GeneratedSubstring(ctx, "gh63-reload", "name: gh63-duplicate")
-		duplicateMetrics := waitForGH63FailedReload(ctx, pod, baselineReloadTimestamp)
+		duplicateMetrics := waitForGH63FailedReload(ctx, pod, baselineReloadTimestamp, baselinePrimarySent, baselineSecondarySent)
 		duplicateLogs := waitForGH63PrometheusLog(ctx, pod, `found multiple remote write configs with job name "gh63-duplicate"`)
 		activeAfterDuplicate := waitForGH63ActiveConfig(ctx, pod, "gh63-reload-primary", "gh63-reload-secondary")
 		waitForGH63InstantSeries(ctx, "631", query)
@@ -199,11 +233,13 @@ var _ = Describe("多目标 remote_write 故障语义", Serial, func() {
 		AddReportEntry("gh63-duplicate-reload-metrics", duplicateMetrics, ReportEntryVisibilityFailureOrVerbose)
 		AddReportEntry("gh63-duplicate-prometheus-logs", duplicateLogs, ReportEntryVisibilityFailureOrVerbose)
 		AddReportEntry("gh63-active-config-after-duplicate", activeAfterDuplicate, ReportEntryVisibilityFailureOrVerbose)
+		duplicatePrimarySent := gh63RequiredQueueMetric(duplicateMetrics, "prometheus_remote_storage_samples_total", gh63ReloadPrimary)
+		duplicateSecondarySent := gh63RequiredQueueMetric(duplicateMetrics, "prometheus_remote_storage_samples_total", gh63ReloadSecondary)
 
 		By(scenarioID + " 提交非法 URL，验证整份新配置仍不生效且旧目标继续发送")
 		applyManifest(ctx, gh63ReloadAgentManifest(runLabel, gh63ReloadInvalidURL))
 		waitForGH63GeneratedSubstring(ctx, "gh63-reload", "http://[::1")
-		invalidURLMetrics := waitForGH63FailedReload(ctx, pod, baselineReloadTimestamp)
+		invalidURLMetrics := waitForGH63FailedReload(ctx, pod, baselineReloadTimestamp, duplicatePrimarySent, duplicateSecondarySent)
 		invalidURLLogs := waitForGH63PrometheusLog(ctx, pod, "missing ']' in host")
 		activeAfterInvalidURL := waitForGH63ActiveConfig(ctx, pod, "gh63-reload-primary", "gh63-reload-secondary")
 		waitForGH63InstantSeries(ctx, "631", query)
@@ -214,10 +250,12 @@ var _ = Describe("多目标 remote_write 故障语义", Serial, func() {
 
 		By(scenarioID + " 恢复有效声明并等待 reload 指标重新成功")
 		applyManifest(ctx, gh63ReloadAgentManifest(runLabel, gh63ReloadValid))
-		recoveredMetrics := waitForGH63AgentMetrics(ctx, pod, func(contents string) bool {
-			success, successFound := gh63GlobalMetric(contents, "prometheus_config_last_reload_successful")
-			timestamp, timestampFound := gh63GlobalMetric(contents, "prometheus_config_last_reload_success_timestamp_seconds")
-			return successFound && timestampFound && success == 1 && timestamp > baselineReloadTimestamp
+		recoveredMetrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+			success, successFound, err := gh63GlobalMetric(contents, "prometheus_config_last_reload_successful")
+			g.Expect(err).NotTo(HaveOccurred())
+			timestamp, timestampFound, err := gh63GlobalMetric(contents, "prometheus_config_last_reload_success_timestamp_seconds")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(successFound && timestampFound && success == 1 && timestamp > baselineReloadTimestamp).To(BeTrue(), contents)
 		})
 		AddReportEntry("gh63-recovered-reload-metrics", recoveredMetrics, ReportEntryVisibilityFailureOrVerbose)
 	}, SpecTimeout(8*time.Minute))
@@ -239,9 +277,10 @@ var _ = Describe("多目标 remote_write 故障语义", Serial, func() {
 		AddReportEntry("gh63-v2-generated-config", generated, ReportEntryVisibilityFailureOrVerbose)
 
 		By(scenarioID + " 等待 V2 发送尝试后持续确认当前 VictoriaMetrics tenant 无正确摄入结果")
-		metrics := waitForGH63AgentMetrics(ctx, pod, func(contents string) bool {
-			sent, found := gh63QueueMetric(contents, "prometheus_remote_storage_samples_total", gh63V2Target)
-			return found && sent > 0
+		metrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+			sent, found, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_total", gh63V2Target)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(found && sent > 0).To(BeTrue(), contents)
 		})
 		noSeries := consistentlyNoGH63Series(ctx, "633", query, 20*time.Second)
 		AddReportEntry("gh63-v2-queue-metrics", metrics, ReportEntryVisibilityFailureOrVerbose)
@@ -284,20 +323,23 @@ func setGH63SecondarySelector(ctx context.Context, selector map[string]string) {
 	Expect(err).NotTo(HaveOccurred(), output)
 }
 
-func waitForGH63AgentMetrics(ctx context.Context, pod string, accepted func(string) bool) string {
-	GinkgoHelper()
-	return waitForGH61Metrics(ctx, "pod/"+pod, 9090, accepted)
-}
-
-func gh63QueueMetric(contents, metricName string, target gh63RemoteTarget) (float64, bool) {
+func gh63QueueMetric(contents, metricName string, target gh63RemoteTarget) (float64, bool, error) {
 	value, found, err := metricSumWithLabels(contents, metricName, map[string]string{"remote_name": target.Name, "url": target.URL})
 	if err != nil {
-		return 0, false
+		return 0, false, fmt.Errorf("read %s for remote %s (%s): %w", metricName, target.Name, target.URL, err)
 	}
-	return value, found
+	return value, found, nil
 }
 
-func gh63ReadQueueSnapshot(contents string, target gh63RemoteTarget) (gh63QueueSnapshot, bool) {
+func gh63RequiredQueueMetric(contents, metricName string, target gh63RemoteTarget) float64 {
+	GinkgoHelper()
+	value, found, err := gh63QueueMetric(contents, metricName, target)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(found).To(BeTrue(), "metric %s for remote %s (%s) is absent", metricName, target.Name, target.URL)
+	return value
+}
+
+func gh63ReadQueueSnapshot(contents string, target gh63RemoteTarget) (gh63QueueSnapshot, bool, error) {
 	// 将故障前后反复比较的队列维度一次读取，确保每个值都来自同一 remote_name/url 身份。
 	snapshot := gh63QueueSnapshot{}
 	metrics := []struct {
@@ -311,24 +353,27 @@ func gh63ReadQueueSnapshot(contents string, target gh63RemoteTarget) (gh63QueueS
 		{name: "prometheus_remote_storage_enqueue_retries_total", destination: &snapshot.EnqueueRetries},
 	}
 	for _, metric := range metrics {
-		value, found := gh63QueueMetric(contents, metric.name, target)
+		value, found, err := gh63QueueMetric(contents, metric.name, target)
+		if err != nil {
+			return gh63QueueSnapshot{}, false, err
+		}
 		if !found {
-			return gh63QueueSnapshot{}, false
+			return gh63QueueSnapshot{}, false, nil
 		}
 		*metric.destination = value
 	}
-	return snapshot, true
+	return snapshot, true, nil
 }
 
-func gh63GlobalMetric(contents, metricName string) (float64, bool) {
+func gh63GlobalMetric(contents, metricName string) (float64, bool, error) {
 	value, found, err := metricSumWithLabels(contents, metricName, nil)
 	if err != nil {
-		return 0, false
+		return 0, false, fmt.Errorf("read global metric %s: %w", metricName, err)
 	}
-	return value, found
+	return value, found, nil
 }
 
-func gh63HasQueueMetricFamilies(contents string, target gh63RemoteTarget) bool {
+func gh63HasQueueMetricFamilies(contents string, target gh63RemoteTarget) (bool, error) {
 	for _, metricName := range []string{
 		"prometheus_remote_storage_samples_total",
 		"prometheus_remote_storage_samples_failed_total",
@@ -338,11 +383,13 @@ func gh63HasQueueMetricFamilies(contents string, target gh63RemoteTarget) bool {
 		"prometheus_remote_storage_shards",
 		"prometheus_remote_storage_enqueue_retries_total",
 	} {
-		if _, found := gh63QueueMetric(contents, metricName, target); !found {
-			return false
+		if _, found, err := gh63QueueMetric(contents, metricName, target); err != nil {
+			return false, err
+		} else if !found {
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
 
 func waitForGH63InstantSeries(ctx context.Context, accountID, query string) string {
@@ -418,12 +465,19 @@ func waitForGH63GeneratedSubstring(ctx context.Context, agent, expected string) 
 	return generated
 }
 
-func waitForGH63FailedReload(ctx context.Context, pod string, successfulTimestamp float64) string {
+func waitForGH63FailedReload(ctx context.Context, pod string, successfulTimestamp, primarySentBaseline, secondarySentBaseline float64) string {
 	GinkgoHelper()
-	return waitForGH63AgentMetrics(ctx, pod, func(contents string) bool {
-		success, successFound := gh63GlobalMetric(contents, "prometheus_config_last_reload_successful")
-		timestamp, timestampFound := gh63GlobalMetric(contents, "prometheus_config_last_reload_success_timestamp_seconds")
-		return successFound && timestampFound && success == 0 && timestamp == successfulTimestamp
+	return waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
+		success, successFound, err := gh63GlobalMetric(contents, "prometheus_config_last_reload_successful")
+		g.Expect(err).NotTo(HaveOccurred())
+		timestamp, timestampFound, err := gh63GlobalMetric(contents, "prometheus_config_last_reload_success_timestamp_seconds")
+		g.Expect(err).NotTo(HaveOccurred())
+		primarySent, primaryFound, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_total", gh63ReloadPrimary)
+		g.Expect(err).NotTo(HaveOccurred())
+		secondarySent, secondaryFound, err := gh63QueueMetric(contents, "prometheus_remote_storage_samples_total", gh63ReloadSecondary)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(successFound && timestampFound && success == 0 && timestamp == successfulTimestamp &&
+			primaryFound && secondaryFound && primarySent > primarySentBaseline && secondarySent > secondarySentBaseline).To(BeTrue(), contents)
 	})
 }
 

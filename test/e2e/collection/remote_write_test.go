@@ -114,17 +114,17 @@ var _ = Describe("KubeStateMetrics remote_write 数据链路", Serial, func() {
 
 		By(scenarioID + " 保存两个 Agent shard 的 remote_write 输出指标")
 		for _, pod := range []string{"prom-agent-" + gh61AgentName + "-0", "prom-agent-" + gh61AgentName + "-shard-1-0"} {
-			metrics := waitForGH61Metrics(ctx, "pod/"+pod, 9090, func(contents string) bool {
+			metrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
 				value, found := metricSample(contents, "prometheus_remote_storage_samples_total", `remote_name="`+gh61RemoteWriteName+`"`)
-				return found && value > 0
+				g.Expect(found && value > 0).To(BeTrue(), contents)
 			})
 			AddReportEntry(pod+"-remote-write-metrics", metrics, ReportEntryVisibilityFailureOrVerbose)
 		}
 
 		By(scenarioID + " 保存 VictoriaMetrics 已接收 Prometheus remote_write 请求的指标")
-		vminsertMetrics := waitForGH61Metrics(ctx, "service/vminsert", 8480, func(contents string) bool {
+		vminsertMetrics := waitForCollectionMetrics(ctx, "service/vminsert", 8480, func(g Gomega, contents string) {
 			value, found := metricSample(contents, "vm_http_requests_total", `protocol="promremotewrite"`)
-			return found && value > 0
+			g.Expect(found && value > 0).To(BeTrue(), contents)
 		})
 		AddReportEntry("vminsert-receive-metrics", vminsertMetrics, ReportEntryVisibilityFailureOrVerbose)
 	}, SpecTimeout(15*time.Minute))
@@ -369,10 +369,10 @@ func waitForGH61QueryResult(ctx context.Context, accountID, testLabel, clusterID
 	})
 }
 
-func waitForGH61Metrics(ctx context.Context, target string, remotePort int, accepted func(string) bool) string {
+func waitForCollectionMetrics(ctx context.Context, target string, remotePort int, verify func(Gomega, string)) string {
 	GinkgoHelper()
 	return waitForGH61HTTPBody(ctx, target, remotePort, "/metrics", 2*time.Minute, func(g Gomega, contents []byte) {
-		g.Expect(accepted(string(contents))).To(BeTrue(), string(contents))
+		verify(g, string(contents))
 	})
 }
 
