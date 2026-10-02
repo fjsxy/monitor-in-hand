@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 )
 
 func TestCollectionHelpers(t *testing.T) {
@@ -67,6 +69,83 @@ vm_http_requests_total{path="/insert/{}/prometheus/", protocol="promremotewrite"
 		}
 		if _, found := metricSample(metrics, "prometheus_remote_storage_samples_total", `remote_name="missing"`); found {
 			t.Fatal("unexpected sample for missing remote")
+		}
+	})
+
+	t.Run("[UT-COLLECTION-GH63-001] 按 remote_name 和 url 精确汇总队列指标", func(t *testing.T) {
+		// 重放同一 metric family 中多目标、多 drop reason 与可变标签顺序的形态。
+		metrics := `# HELP prometheus_remote_storage_samples_dropped_total Total number of samples dropped.
+# TYPE prometheus_remote_storage_samples_dropped_total counter
+prometheus_remote_storage_samples_dropped_total{reason="too_old",remote_name="gh63-secondary",url="http://secondary"} 3
+prometheus_remote_storage_samples_dropped_total{url="http://secondary", reason="dropped_series", remote_name="gh63-secondary"} 2
+prometheus_remote_storage_samples_dropped_total{remote_name="gh63-primary",url="http://primary",reason="too_old"} 11
+`
+		// 按次目标完整身份执行汇总，不把主目标的同名 family 算入。
+		value, found, err := metricSumWithLabels(metrics, "prometheus_remote_storage_samples_dropped_total", map[string]string{
+			"remote_name": "gh63-secondary",
+			"url":         "http://secondary",
+		})
+		if err != nil {
+			t.Fatalf("parse metrics: %v", err)
+		}
+		// 验证多 reason 求和值，并以不存在的 remote 确认不会假阳性命中。
+		if !found || value != 5 {
+			t.Fatalf("expected secondary drop sum 5, got value=%v found=%v", value, found)
+		}
+		if _, found, err := metricSumWithLabels(metrics, "prometheus_remote_storage_samples_dropped_total", map[string]string{"remote_name": "missing"}); err != nil || found {
+			t.Fatalf("expected missing remote to stay absent, found=%v err=%v", found, err)
+		}
+	})
+
+	t.Run("[UT-COLLECTION-GH63-002] 生成配置只保留 Prometheus 2.55.1 支持子集", func(t *testing.T) {
+		// 准备一份与 Issue 显式输入逐项对齐的 Operator 生成配置。
+		valid := `
+remote_write:
+  - name: gh63-primary
+    url: http://vminsert.monitor-in-hand-test.svc:8480/insert/63/prometheus/api/v1/write
+    protobuf_message: prometheus.WriteRequest
+  - name: gh63-secondary
+    url: http://gh63-secondary.monitor-in-hand-test.svc:8480/insert/630/prometheus/api/v1/write
+    remote_timeout: 5s
+    protobuf_message: prometheus.WriteRequest
+    queue_config:
+      capacity: 10
+      min_shards: 1
+      max_shards: 1
+      max_samples_per_send: 5
+      batch_send_deadline: 1s
+      min_backoff: 100ms
+      max_backoff: 1s
+      retry_on_http_429: true
+      sample_age_limit: 30s
+`
+		// 先验证支持子集的正向产物可被接受。
+		if err := validateGH63GeneratedConfig(valid); err != nil {
+			t.Fatalf("expected supported generated config: %v", err)
+		}
+		// 再分别注入版本不兼容字段和额外默认值，确认精确性检查会拒绝。
+		for _, unsupported := range []string{
+			strings.Replace(valid, "      min_backoff: 100ms\n", "      max_retries: 7\n      min_backoff: 100ms\n", 1),
+			strings.Replace(valid, "    remote_timeout: 5s\n", "    remote_timeout: 5s\n    round_robin_dns: true\n", 1),
+			strings.Replace(valid, "    protobuf_message: prometheus.WriteRequest\n", "    protobuf_message: prometheus.WriteRequest\n    send_exemplars: false\n", 1),
+		} {
+			if err := validateGH63GeneratedConfig(unsupported); err == nil {
+				t.Fatal("expected unsupported Prometheus 2.55.1 field to be rejected")
+			}
+		}
+	})
+
+	t.Run("[UT-COLLECTION-GH63-003] reload 每种声明都是可提交的 Kubernetes YAML", func(t *testing.T) {
+		// 枚举正向、重名和非法 URL 三种 reload 输入，避免反向行为被 manifest 格式短路。
+		for _, mode := range []gh63ReloadMode{gh63ReloadValid, gh63ReloadDuplicate, gh63ReloadInvalidURL} {
+			var object map[string]any
+			if err := yaml.Unmarshal([]byte(gh63ReloadAgentManifest("gh63-test", mode)), &object); err != nil {
+				t.Fatalf("mode %s is not valid YAML: %v", mode, err)
+			}
+			// 每种输入不仅要可解析，还必须保留可提交的 spec 根。
+			if object["spec"] == nil {
+				t.Fatalf("mode %s has no spec", mode)
+			}
 		}
 	})
 }

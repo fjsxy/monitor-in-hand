@@ -44,6 +44,22 @@ URL、accountID `0`、无认证且无 TLS，并显式选择 remote write `V1.0`�
 生命周期内稳定的值；预检会拒绝通过采集配置 labels、target label 传播或
 relabeling 产生和修改该标签的计划。
 
+配置多个 `remoteWrite` 条目表示把同一 shard WAL 的样本分别复制给每个独立
+目标，不表示对同一 backend 做负载均衡或 failover。每个条目必须使用稳定、
+唯一的 `name`；重名或非法 URL 会使 Prometheus 拒绝整份新配置，已加载的旧配置
+继续运行。一期固定 Prometheus v2.55.1，验证的调优子集为 `remoteTimeout`、
+`queueConfig.capacity/minShards/maxShards/maxSamplesPerSend/batchSendDeadline/minBackoff/maxBackoff`、
+`sampleAgeLimit`、`retryOnRateLimit` 和 Agent 级 `walCompression`。这些值只在管理员
+显式输入时生成，项目不另行注入默认值。`maxRetries` 已不属于 Prometheus
+v2.55.1 配置，`roundRobinDNS` 需要 Prometheus 3.1+，因此两者不得进入当前
+生成配置。`messageVersion: V2.0` 能被上游 API 和 Agent 接受，但当前固定的
+VictoriaMetrics 不能正确摄入，不在一期支持子集。
+
+多目标运行时应按 `remote_name` 和 `url` 分别观测 sent/failed/retried/dropped、
+pending、`queue_highest_sent_timestamp_seconds`、shards 和 enqueue retry，并结合
+`prometheus_config_last_reload_successful` 与每个 tenant 的最终查询判定数据面健康。
+目标恢复后队列从共享 WAL 追赶；一期只承诺故障期样本可恢复，不承诺 exactly-once。
+
 示例中的四类 object selector 都是明确的非空 `LabelSelector`。上游允许 `{}` 选择
 可见范围内的全部对象，但一期预检会拒绝这种开放选择；省略某类 object selector
 则表示不选择该类，四类都省略也是合法零配置。
