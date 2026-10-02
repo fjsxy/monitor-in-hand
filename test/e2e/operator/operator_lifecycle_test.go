@@ -326,6 +326,13 @@ var _ = Describe("Operator 故障恢复、滚动升级与卸载", Ordered, Seria
 			}
 			return nil
 		}, 2*time.Minute, time.Second).Should(Succeed())
+		Consistently(func() error {
+			active, holder, activeErr := activeOperatorPod(ctx)
+			if activeErr != nil || active.UID != oldPod.UID || holder != oldHolder {
+				return fmt.Errorf("故障 rollout 期间 active reconciler 不唯一或发生切换: holder=%s err=%v", holder, activeErr)
+			}
+			return nil
+		}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
 
 		By(scenario + " 恢复可调度模板，并紧随 Lease holder 切换触发一次状态转换")
 		baselineEvents, err := eventCount(ctx, rolloutInstance, "Suspended")
@@ -356,6 +363,8 @@ var _ = Describe("Operator 故障恢复、滚动升级与卸载", Ordered, Seria
 			return nil
 		}, 2*time.Minute, time.Second).Should(Succeed())
 		Eventually(func() (int32, error) { return eventCount(ctx, rolloutInstance, "Suspended") }, time.Minute, time.Second).
+			Should(Equal(baselineEvents + 1))
+		Consistently(func() (int32, error) { return eventCount(ctx, rolloutInstance, "Suspended") }, 15*time.Second, time.Second).
 			Should(Equal(baselineEvents + 1))
 
 		By(scenario + " 恢复实例并验证 handoff 未产生重复资源")
@@ -401,6 +410,17 @@ var _ = Describe("Operator 故障恢复、滚动升级与卸载", Ordered, Seria
 
 	It(fmt.Sprintf("[%s] 第二个 Helm release 因稳定集群级身份冲突失败", scenarioID("007")), func(ctx SpecContext) {
 		scenario := scenarioID("007")
+		By(scenario + " 快照首 release 的集群级身份、控制面 Deployment 与 Lease")
+		roleBefore, err := getObject[metav1.PartialObjectMetadata](ctx, "", "clusterrole", "monitor-in-hand-manager-role")
+		Expect(err).NotTo(HaveOccurred())
+		bindingBefore, err := getObject[metav1.PartialObjectMetadata](ctx, "", "clusterrolebinding", operatorBinding)
+		Expect(err).NotTo(HaveOccurred())
+		deploymentBefore, err := getObject[appsv1.Deployment](ctx, operatorNamespace, "deployment", operatorDeployment)
+		Expect(err).NotTo(HaveOccurred())
+		leaseBefore, err := getObject[coordinationv1.Lease](ctx, operatorNamespace, "lease", operatorLease)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(leaseBefore.Spec.HolderIdentity).NotTo(BeNil())
+
 		By(scenario + " 安装第二个 release，验证稳定 ClusterRole 身份阻止第二套控制面")
 		secondNamespace := "gh64-second-" + config.testRunID
 		output, installErr := runResult(ctx, config.helm, "install", "gh64-second", filepath.Join(config.repoRoot, "charts", "monitor-in-hand"),
@@ -411,12 +431,25 @@ var _ = Describe("Operator 故障恢复、滚动升级与卸载", Ordered, Seria
 		Eventually(func() error {
 			return objectAbsent(ctx, secondNamespace, "deployment", "gh64-second-monitor-in-hand")
 		}, time.Minute, time.Second).Should(Succeed())
+		Expect(objectAbsent(ctx, secondNamespace, "lease", operatorLease)).To(Succeed())
+
+		By(scenario + " 验证失败安装没有接管或改写首 release 控制面")
 		managerRole, err := getObject[metav1.PartialObjectMetadata](ctx, "", "clusterrole", "monitor-in-hand-manager-role")
 		Expect(err).NotTo(HaveOccurred())
+		Expect(managerRole.UID).To(Equal(roleBefore.UID))
+		Expect(managerRole.Annotations).To(Equal(roleBefore.Annotations))
 		Expect(managerRole.Annotations).To(HaveKeyWithValue("meta.helm.sh/release-name", operatorRelease))
-		lease, err := getObject[coordinationv1.Lease](ctx, operatorNamespace, "lease", operatorLease)
+		bindingAfter, err := getObject[metav1.PartialObjectMetadata](ctx, "", "clusterrolebinding", operatorBinding)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(lease.Spec.HolderIdentity).NotTo(BeNil())
+		Expect(bindingAfter.UID).To(Equal(bindingBefore.UID))
+		Expect(bindingAfter.Annotations).To(Equal(bindingBefore.Annotations))
+		deploymentAfter, err := getObject[appsv1.Deployment](ctx, operatorNamespace, "deployment", operatorDeployment)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(deploymentAfter.UID).To(Equal(deploymentBefore.UID))
+		leaseAfter, err := getObject[coordinationv1.Lease](ctx, operatorNamespace, "lease", operatorLease)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(leaseAfter.UID).To(Equal(leaseBefore.UID))
+		Expect(leaseAfter.Spec.HolderIdentity).To(Equal(leaseBefore.Spec.HolderIdentity))
 	}, SpecTimeout(4*time.Minute))
 
 	It(fmt.Sprintf("[%s] 安全卸载先完成全部 finalizer 清理，且 Helm 保留 CRD", scenarioID("008")), func(ctx SpecContext) {

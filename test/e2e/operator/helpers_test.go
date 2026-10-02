@@ -32,6 +32,7 @@ const (
 	operatorNamespace  = "monitor-in-hand-system"
 	operatorRelease    = "monitor-in-hand"
 	operatorDeployment = "monitor-in-hand-monitor-in-hand"
+	operatorBinding    = "monitor-in-hand-monitor-in-hand-manager"
 	operatorLease      = "monitor-in-hand.monitoring.fjsxy.github.io"
 	testNamespace      = "monitor-in-hand-test"
 )
@@ -90,13 +91,12 @@ func scenarioID(sequence string) string {
 	return "E2E-UNSUPPORTED-OPERATOR-GH64-" + sequence
 }
 
-func installOperator(ctx context.Context, extraArgs ...string) {
+func installOperator(ctx context.Context) {
 	GinkgoHelper()
 	manifest := fmt.Sprintf("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n", operatorNamespace)
 	runWithInput(ctx, manifest, config.kubectl, "--context", config.kubeContext, "apply", "--filename", "-")
 	args := []string{"upgrade", "--install", operatorRelease, filepath.Join(config.repoRoot, "charts", "monitor-in-hand"),
 		"--kube-context", config.kubeContext, "--namespace", operatorNamespace, "--wait", "--timeout", "180s"}
-	args = append(args, extraArgs...)
 	run(ctx, config.helm, args...)
 }
 
@@ -419,17 +419,12 @@ func directManagedResourceKinds() []managedResourceKind {
 }
 
 func allManagedResourceKinds() []managedResourceKind {
-	return []managedResourceKind{
-		{"deployment", testNamespace, "deployment"},
+	return append(directManagedResourceKinds(), []managedResourceKind{
 		{"statefulset", testNamespace, "statefulset"},
 		{"daemonset", testNamespace, "daemonset"},
-		{"service", testNamespace, "service"},
-		{"serviceaccount", testNamespace, "serviceaccount"},
 		{"role", testNamespace, "role"},
 		{"rolebinding", testNamespace, "rolebinding"},
-		{"clusterrole", "", "clusterrole"},
-		{"clusterrolebinding", "", "clusterrolebinding"},
-	}
+	}...)
 }
 
 func managedUIDs(ctx context.Context, managed string) (map[string]types.UID, error) {
@@ -522,11 +517,11 @@ func eventCount(ctx context.Context, instance, reason string) (int32, error) {
 	output, err := runResult(ctx, config.kubectl, "--context", config.kubeContext, "--all-namespaces",
 		"get", "events", "--field-selector", "involvedObject.kind=KubeStateMetrics,involvedObject.name="+instance, "--output", "json")
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("读取 KubeStateMetrics %s 的 Event: %w: %s", instance, err, output)
 	}
 	events := &corev1.EventList{}
 	if err := json.Unmarshal([]byte(output), events); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("解析 KubeStateMetrics %s 的 Event: %w", instance, err)
 	}
 	var total int32
 	for _, event := range events.Items {
