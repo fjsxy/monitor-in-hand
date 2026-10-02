@@ -17,6 +17,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/common/expfmt"
 	"sigs.k8s.io/yaml"
 )
 
@@ -34,6 +35,28 @@ type gh61QueryResponse struct {
 			Metric map[string]string `json:"metric"`
 		} `json:"result"`
 	} `json:"data"`
+}
+
+type gh63GeneratedRemoteWrite struct {
+	Name            string                    `json:"name"`
+	URL             string                    `json:"url"`
+	RemoteTimeout   string                    `json:"remote_timeout"`
+	ProtobufMessage string                    `json:"protobuf_message"`
+	RoundRobinDNS   *bool                     `json:"round_robin_dns"`
+	QueueConfig     *gh63GeneratedQueueConfig `json:"queue_config"`
+}
+
+type gh63GeneratedQueueConfig struct {
+	Capacity          int    `json:"capacity"`
+	MinShards         int    `json:"min_shards"`
+	MaxShards         int    `json:"max_shards"`
+	MaxSamplesPerSend int    `json:"max_samples_per_send"`
+	BatchSendDeadline string `json:"batch_send_deadline"`
+	MaxRetries        *int   `json:"max_retries"`
+	MinBackoff        string `json:"min_backoff"`
+	MaxBackoff        string `json:"max_backoff"`
+	RetryOnHTTP429    bool   `json:"retry_on_http_429"`
+	SampleAgeLimit    string `json:"sample_age_limit"`
 }
 
 var _ = Describe("KubeStateMetrics remote_write 数据链路", Serial, func() {
@@ -91,17 +114,17 @@ var _ = Describe("KubeStateMetrics remote_write 数据链路", Serial, func() {
 
 		By(scenarioID + " 保存两个 Agent shard 的 remote_write 输出指标")
 		for _, pod := range []string{"prom-agent-" + gh61AgentName + "-0", "prom-agent-" + gh61AgentName + "-shard-1-0"} {
-			metrics := waitForGH61Metrics(ctx, "pod/"+pod, 9090, func(contents string) bool {
+			metrics := waitForCollectionMetrics(ctx, "pod/"+pod, 9090, func(g Gomega, contents string) {
 				value, found := metricSample(contents, "prometheus_remote_storage_samples_total", `remote_name="`+gh61RemoteWriteName+`"`)
-				return found && value > 0
+				g.Expect(found && value > 0).To(BeTrue(), contents)
 			})
 			AddReportEntry(pod+"-remote-write-metrics", metrics, ReportEntryVisibilityFailureOrVerbose)
 		}
 
 		By(scenarioID + " 保存 VictoriaMetrics 已接收 Prometheus remote_write 请求的指标")
-		vminsertMetrics := waitForGH61Metrics(ctx, "service/vminsert", 8480, func(contents string) bool {
+		vminsertMetrics := waitForCollectionMetrics(ctx, "service/vminsert", 8480, func(g Gomega, contents string) {
 			value, found := metricSample(contents, "vm_http_requests_total", `protocol="promremotewrite"`)
-			return found && value > 0
+			g.Expect(found && value > 0).To(BeTrue(), contents)
 		})
 		AddReportEntry("vminsert-receive-metrics", vminsertMetrics, ReportEntryVisibilityFailureOrVerbose)
 	}, SpecTimeout(15*time.Minute))
@@ -346,10 +369,10 @@ func waitForGH61QueryResult(ctx context.Context, accountID, testLabel, clusterID
 	})
 }
 
-func waitForGH61Metrics(ctx context.Context, target string, remotePort int, accepted func(string) bool) string {
+func waitForCollectionMetrics(ctx context.Context, target string, remotePort int, verify func(Gomega, string)) string {
 	GinkgoHelper()
 	return waitForGH61HTTPBody(ctx, target, remotePort, "/metrics", 2*time.Minute, func(g Gomega, contents []byte) {
-		g.Expect(accepted(string(contents))).To(BeTrue(), string(contents))
+		verify(g, string(contents))
 	})
 }
 
@@ -394,4 +417,133 @@ func metricSample(contents, metricName, requiredLabel string) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func metricSumWithLabels(contents, metricName string, requiredLabels map[string]string) (float64, bool, error) {
+	// 先使用标准 exposition parser 恢复 label set，避免标签顺序、空格或转义字符造成误命中。
+	var parser expfmt.TextParser
+	families, err := parser.TextToMetricFamilies(strings.NewReader(contents))
+	if err != nil {
+		return 0, false, fmt.Errorf("parse Prometheus metrics: %w", err)
+	}
+	family, found := families[metricName]
+	if !found {
+		return 0, false, nil
+	}
+
+	// 再汇总所有满足 remote_name/url 的 reason 维度，使 dropped 等 CounterVec 不丢证据。
+	var total float64
+	matched := false
+	for _, metric := range family.Metric {
+		labels := make(map[string]string, len(metric.Label))
+		for _, pair := range metric.Label {
+			labels[pair.GetName()] = pair.GetValue()
+		}
+		matches := true
+		for name, expected := range requiredLabels {
+			if labels[name] != expected {
+				matches = false
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		matched = true
+		switch {
+		case metric.Counter != nil:
+			total += metric.Counter.GetValue()
+		case metric.Gauge != nil:
+			total += metric.Gauge.GetValue()
+		case metric.Untyped != nil:
+			total += metric.Untyped.GetValue()
+		default:
+			return 0, false, fmt.Errorf("metric %q is not a scalar counter or gauge", metricName)
+		}
+	}
+	return total, matched, nil
+}
+
+func validateGH63GeneratedConfig(contents string) error {
+	// 结构化解析 Operator 产物，把未配置字段与零值明确区分。
+	var generated struct {
+		RemoteWrite []gh63GeneratedRemoteWrite `json:"remote_write"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &generated); err != nil {
+		return fmt.Errorf("parse generated config: %w", err)
+	}
+	if len(generated.RemoteWrite) != 2 {
+		return fmt.Errorf("expected two remote_write entries, got %d", len(generated.RemoteWrite))
+	}
+	var raw struct {
+		RemoteWrite []map[string]any `json:"remote_write"`
+	}
+	if err := yaml.Unmarshal([]byte(contents), &raw); err != nil {
+		return fmt.Errorf("parse generated config keys: %w", err)
+	}
+	if len(raw.RemoteWrite) != 2 {
+		return fmt.Errorf("expected two raw remote_write entries, got %d", len(raw.RemoteWrite))
+	}
+
+	// 主目标只允许显式 name/url/message version，用来证明项目没有注入 queue 默认值。
+	primary := generated.RemoteWrite[0]
+	if err := requireExactGH63Keys(raw.RemoteWrite[0], "name", "url", "protobuf_message"); err != nil {
+		return fmt.Errorf("primary remote_write keys: %w", err)
+	}
+	if primary.Name != "gh63-primary" || primary.URL != "http://vminsert.monitor-in-hand-test.svc:8480/insert/63/prometheus/api/v1/write" {
+		return fmt.Errorf("unexpected primary remote_write identity: %#v", primary)
+	}
+	if primary.ProtobufMessage != "prometheus.WriteRequest" || primary.RemoteTimeout != "" || primary.QueueConfig != nil || primary.RoundRobinDNS != nil {
+		return fmt.Errorf("primary remote_write contains injected or unsupported fields: %#v", primary)
+	}
+
+	// 次目标精确对齐管理员输入，同时确认版本门控排除两个不兼容字段。
+	secondary := generated.RemoteWrite[1]
+	if err := requireExactGH63Keys(raw.RemoteWrite[1], "name", "url", "remote_timeout", "protobuf_message", "queue_config"); err != nil {
+		return fmt.Errorf("secondary remote_write keys: %w", err)
+	}
+	if secondary.Name != "gh63-secondary" || secondary.URL != "http://gh63-secondary.monitor-in-hand-test.svc:8480/insert/630/prometheus/api/v1/write" {
+		return fmt.Errorf("unexpected secondary remote_write identity: %#v", secondary)
+	}
+	if secondary.RemoteTimeout != "5s" || secondary.ProtobufMessage != "prometheus.WriteRequest" || secondary.RoundRobinDNS != nil {
+		return fmt.Errorf("unexpected secondary remote_write fields: %#v", secondary)
+	}
+	queue := secondary.QueueConfig
+	if queue == nil {
+		return fmt.Errorf("secondary queue_config is absent")
+	}
+	rawQueue, ok := raw.RemoteWrite[1]["queue_config"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("secondary raw queue_config has type %T", raw.RemoteWrite[1]["queue_config"])
+	}
+	if err := requireExactGH63Keys(rawQueue, "capacity", "min_shards", "max_shards", "max_samples_per_send", "batch_send_deadline", "min_backoff", "max_backoff", "retry_on_http_429", "sample_age_limit"); err != nil {
+		return fmt.Errorf("secondary queue_config keys: %w", err)
+	}
+	if queue.Capacity != 10 || queue.MinShards != 1 || queue.MaxShards != 1 || queue.MaxSamplesPerSend != 5 ||
+		queue.BatchSendDeadline != "1s" || queue.MinBackoff != "100ms" || queue.MaxBackoff != "1s" ||
+		!queue.RetryOnHTTP429 || queue.SampleAgeLimit != "30s" || queue.MaxRetries != nil {
+		return fmt.Errorf("unexpected secondary queue_config: %#v", *queue)
+	}
+	return nil
+}
+
+func requireExactGH63Keys(values map[string]any, expected ...string) error {
+	if len(values) != len(expected) {
+		return fmt.Errorf("expected keys %v, got %v", expected, sortedGH63Keys(values))
+	}
+	for _, key := range expected {
+		if _, found := values[key]; !found {
+			return fmt.Errorf("expected keys %v, got %v", expected, sortedGH63Keys(values))
+		}
+	}
+	return nil
+}
+
+func sortedGH63Keys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
