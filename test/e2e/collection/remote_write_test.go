@@ -380,11 +380,15 @@ func metricSample(contents, metricName, requiredLabel string) (float64, bool) {
 		if !strings.HasPrefix(line, metricName+"{") || !strings.Contains(line, requiredLabel) {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
+		closingBrace := strings.LastIndexByte(line, '}')
+		if closingBrace == -1 {
 			continue
 		}
-		value, err := strconv.ParseFloat(fields[1], 64)
+		fields := strings.Fields(line[closingBrace+1:])
+		if len(fields) == 0 {
+			continue
+		}
+		value, err := strconv.ParseFloat(fields[0], 64)
 		if err == nil {
 			return value, true
 		}
