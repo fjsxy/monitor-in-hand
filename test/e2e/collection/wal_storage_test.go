@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -89,7 +90,7 @@ var _ = Describe("PrometheusAgent WAL 存储与恢复", Serial, func() {
 		agentName := "gh62-emptydir"
 
 		By(scenarioID + " 创建省略 storage 的 Agent 并等待 Pod 可用")
-		applyManifest(ctx, gh62AgentManifest(agentName, 1, gh62EmptyDirStorage, "vminsert", ""))
+		applyManifest(ctx, gh62AgentManifest(agentName, 1, 1, gh62EmptyDirStorage, "vminsert", ""))
 		DeferCleanup(func(cleanupCtx SpecContext) {
 			deleteResource(cleanupCtx, "prometheusagent", agentName, testNamespace)
 		})
@@ -115,29 +116,54 @@ var _ = Describe("PrometheusAgent WAL 存储与恢复", Serial, func() {
 		By(scenarioID + " 只验证可观察的卷替换边界，不对待发送 WAL 做时序敏感的必丢断言")
 	}, SpecTimeout(8*time.Minute))
 
-	It(fmt.Sprintf("[%s] PVC 在挂起、缩分片、删除与同名重建中保留", gh62CollectionScenarioID("002")), func(ctx SpecContext) {
+	It(fmt.Sprintf("[%s] PVC 在缩副本、挂起、缩分片、删除与同名重建中保留", gh62CollectionScenarioID("002")), func(ctx SpecContext) {
 		scenarioID := gh62CollectionScenarioID("002")
 		agentName := "gh62-pvc"
-		manifest := gh62AgentManifest(agentName, 2, gh62PVCStorage, "vminsert", "")
-		pvcNames := gh62PVCNames(agentName, 2)
+		manifest := gh62AgentManifest(agentName, 2, 2, gh62PVCStorage, "vminsert", "")
+		recoveryManifest := gh62AgentManifest(agentName, 1, 2, gh62PVCStorage, "vminsert", "")
+		pvcNames := gh62PVCNames(agentName, 2, 2)
+		allPodNames := []string{
+			"prom-agent-" + agentName + "-0",
+			"prom-agent-" + agentName + "-1",
+			"prom-agent-" + agentName + "-shard-1-0",
+			"prom-agent-" + agentName + "-shard-1-1",
+		}
+		oneReplicaPodNames := []string{
+			"prom-agent-" + agentName + "-0",
+			"prom-agent-" + agentName + "-shard-1-0",
+		}
 
-		By(scenarioID + " 创建两分片持久 Agent，验证每个 shard/ordinal 独立 PVC 的存储属性")
+		By(scenarioID + " 创建两副本、两分片持久 Agent，验证每个 shard/ordinal 独立 PVC 的存储属性")
 		applyManifest(ctx, manifest)
 		DeferCleanup(func(cleanupCtx SpecContext) {
 			deleteResource(cleanupCtx, "prometheusagent", agentName, testNamespace)
-			deleteResource(cleanupCtx, "persistentvolumeclaim", pvcNames[0], testNamespace)
-			deleteResource(cleanupCtx, "persistentvolumeclaim", pvcNames[1], testNamespace)
+			for _, pvcName := range pvcNames {
+				deleteResource(cleanupCtx, "persistentvolumeclaim", pvcName, testNamespace)
+			}
 			deleteResource(cleanupCtx, "persistentvolumeclaim", gh62ConflictPVCName, testNamespace)
 		})
 		waitForAgentConditionsInNamespace(ctx, testNamespace, agentName)
-		waitForReadyAgentPods(ctx, testNamespace, agentName, []string{"prom-agent-" + agentName + "-0", "prom-agent-" + agentName + "-shard-1-0"})
+		waitForReadyAgentPods(ctx, testNamespace, agentName, allPodNames)
 		originalPVCs := waitForGH62PVCs(ctx, agentName, pvcNames)
-		Expect(originalPVCs[0].Metadata.UID).NotTo(Equal(originalPVCs[1].Metadata.UID))
+		uniquePVCUIDs := map[string]struct{}{}
+		for _, claim := range originalPVCs {
+			uniquePVCUIDs[claim.Metadata.UID] = struct{}{}
+		}
+		Expect(uniquePVCUIDs).To(HaveLen(4))
 		assertGH62PVCProperties(originalPVCs[0], agentName, "0", "64Mi")
-		assertGH62PVCProperties(originalPVCs[1], agentName, "1", "64Mi")
+		assertGH62PVCProperties(originalPVCs[1], agentName, "0", "64Mi")
+		assertGH62PVCProperties(originalPVCs[2], agentName, "1", "64Mi")
+		assertGH62PVCProperties(originalPVCs[3], agentName, "1", "64Mi")
 		assertGH62StatefulSetStorage(ctx, agentName)
 
-		By(scenarioID + " 将 replicas 缩为 0 挂起全部 shard，验证 PVC UID 全部保留")
+		By(scenarioID + " 将 replicas 从 2 缩为 1，验证被缩减 ordinal 的 PVC UID 仍保留")
+		kubectl(ctx, "--namespace", testNamespace, "patch", "prometheusagent", agentName, "--type", "merge", "--patch", `{"spec":{"replicas":1}}`)
+		waitForAgentStatefulSetReplicas(ctx, testNamespace, "prom-agent-"+agentName, 1)
+		waitForAgentStatefulSetReplicas(ctx, testNamespace, "prom-agent-"+agentName+"-shard-1", 1)
+		waitForReadyAgentPods(ctx, testNamespace, agentName, oneReplicaPodNames)
+		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
+
+		By(scenarioID + " 再将 replicas 缩为 0 挂起全部 shard，验证 PVC UID 全部保留")
 		kubectl(ctx, "--namespace", testNamespace, "patch", "prometheusagent", agentName, "--type", "merge", "--patch", `{"spec":{"replicas":0}}`)
 		waitForAgentStatefulSetReplicas(ctx, testNamespace, "prom-agent-"+agentName, 0)
 		waitForAgentStatefulSetReplicas(ctx, testNamespace, "prom-agent-"+agentName+"-shard-1", 0)
@@ -146,22 +172,22 @@ var _ = Describe("PrometheusAgent WAL 存储与恢复", Serial, func() {
 
 		By(scenarioID + " 恢复后缩减 shards，验证被删除 StatefulSet 的 PVC 仍保留")
 		kubectl(ctx, "--namespace", testNamespace, "patch", "prometheusagent", agentName, "--type", "merge", "--patch", `{"spec":{"replicas":1}}`)
-		waitForReadyAgentPods(ctx, testNamespace, agentName, []string{"prom-agent-" + agentName + "-0", "prom-agent-" + agentName + "-shard-1-0"})
+		waitForReadyAgentPods(ctx, testNamespace, agentName, oneReplicaPodNames)
 		kubectl(ctx, "--namespace", testNamespace, "patch", "prometheusagent", agentName, "--type", "merge", "--patch", `{"spec":{"shards":1}}`)
 		waitForGH62ResourceAbsent(ctx, "statefulset", "prom-agent-"+agentName+"-shard-1")
 		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
 
 		By(scenarioID + " 重新扩为两分片，验证 shard 1 重新挂载原 PVC")
 		kubectl(ctx, "--namespace", testNamespace, "patch", "prometheusagent", agentName, "--type", "merge", "--patch", `{"spec":{"shards":2}}`)
-		waitForReadyAgentPods(ctx, testNamespace, agentName, []string{"prom-agent-" + agentName + "-0", "prom-agent-" + agentName + "-shard-1-0"})
+		waitForReadyAgentPods(ctx, testNamespace, agentName, oneReplicaPodNames)
 		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
-		assertGH62PVCDataVolume(readGH62Pod(ctx, "prom-agent-"+agentName+"-shard-1-0"), pvcNames[1])
+		assertGH62PVCDataVolume(readGH62Pod(ctx, "prom-agent-"+agentName+"-shard-1-0"), pvcNames[2])
 
 		By(scenarioID + " 直接删除 shard 1 StatefulSet，验证调谐重建不更换 PVC")
 		statefulSetUID := readObject(ctx, testNamespace, "statefulset", "prom-agent-"+agentName+"-shard-1").Metadata.UID
 		deleteResource(ctx, "statefulset", "prom-agent-"+agentName+"-shard-1", testNamespace)
 		waitForGH62StatefulSetReplacement(ctx, "prom-agent-"+agentName+"-shard-1", statefulSetUID)
-		waitForReadyAgentPods(ctx, testNamespace, agentName, []string{"prom-agent-" + agentName + "-0", "prom-agent-" + agentName + "-shard-1-0"})
+		waitForReadyAgentPods(ctx, testNamespace, agentName, oneReplicaPodNames)
 		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
 
 		By(scenarioID + " 删除 Agent，验证 StatefulSet 消失但 PVC 不依赖 retention policy 而保留")
@@ -171,20 +197,28 @@ var _ = Describe("PrometheusAgent WAL 存储与恢复", Serial, func() {
 		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
 
 		By(scenarioID + " 对同 namespace/name 恢复计划执行严格预检，再重建 Agent")
-		preflightOutput, preflightErr := runGH62Preflight(ctx, manifest)
+		preflightOutput, preflightErr := runGH62Preflight(ctx, recoveryManifest)
 		AddReportEntry("same-name-recovery-preflight", preflightOutput, ReportEntryVisibilityFailureOrVerbose)
 		Expect(preflightErr).NotTo(HaveOccurred(), preflightOutput)
 		Expect(preflightOutput).To(SatisfyAll(ContainSubstring(`"reason":"RetainedPVCCompatible"`), ContainSubstring(`"reason":"PreflightPassed"`)))
-		applyManifest(ctx, manifest)
+		applyManifest(ctx, recoveryManifest)
 		waitForAgentConditionsInNamespace(ctx, testNamespace, agentName)
-		waitForReadyAgentPods(ctx, testNamespace, agentName, []string{"prom-agent-" + agentName + "-0", "prom-agent-" + agentName + "-shard-1-0"})
+		waitForReadyAgentPods(ctx, testNamespace, agentName, oneReplicaPodNames)
 		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
 		assertGH62PVCDataVolume(readGH62Pod(ctx, "prom-agent-"+agentName+"-0"), pvcNames[0])
-		assertGH62PVCDataVolume(readGH62Pod(ctx, "prom-agent-"+agentName+"-shard-1-0"), pvcNames[1])
+		assertGH62PVCDataVolume(readGH62Pod(ctx, "prom-agent-"+agentName+"-shard-1-0"), pvcNames[2])
+
+		By(scenarioID + " 将同名恢复实例扩回两副本，验证每个 shard/ordinal 都重新挂载原 PVC")
+		kubectl(ctx, "--namespace", testNamespace, "patch", "prometheusagent", agentName, "--type", "merge", "--patch", `{"spec":{"replicas":2}}`)
+		waitForReadyAgentPods(ctx, testNamespace, agentName, allPodNames)
+		assertGH62PVCUIDs(ctx, agentName, originalPVCs)
+		for index, podName := range allPodNames {
+			assertGH62PVCDataVolume(readGH62Pod(ctx, podName), pvcNames[index])
+		}
 
 		By(scenarioID + " 创建容量与计划不匹配的同名 PVC，验证来源/属性冲突非零退出")
 		applyManifest(ctx, gh62ConflictPVCManifest)
-		conflictOutput, conflictErr := runGH62Preflight(ctx, gh62AgentManifest("gh62-conflict", 1, gh62PVCStorage, "vminsert", ""))
+		conflictOutput, conflictErr := runGH62Preflight(ctx, gh62AgentManifest("gh62-conflict", 1, 1, gh62PVCStorage, "vminsert", ""))
 		AddReportEntry("pvc-conflict-preflight", conflictOutput, ReportEntryVisibilityFailureOrVerbose)
 		Expect(conflictErr).To(HaveOccurred(), conflictOutput)
 		Expect(conflictErr.(*exec.ExitError).ExitCode()).To(Equal(1))
@@ -195,7 +229,7 @@ var _ = Describe("PrometheusAgent WAL 存储与恢复", Serial, func() {
 		scenarioID := gh62CollectionScenarioID("003")
 		agentName := "gh62-wal"
 		podName := "prom-agent-" + agentName + "-0"
-		pvcName := gh62PVCNames(agentName, 1)[0]
+		pvcName := gh62PVCNames(agentName, 1, 1)[0]
 		clusterID := "gh62-" + config.testRunID
 		sampleID := "gh62-wal-" + config.testRunID
 
@@ -255,7 +289,7 @@ func gh62CollectionScenarioID(sequence string) string {
 	return "E2E-UNSUPPORTED-COLLECTION-GH62-" + sequence
 }
 
-func gh62AgentManifest(name string, shards int, storageMode gh62StorageMode, remoteService, scrapeSelector string) string {
+func gh62AgentManifest(name string, replicas, shards int, storageMode gh62StorageMode, remoteService, scrapeSelector string) string {
 	storage := ""
 	if storageMode == gh62PVCStorage {
 		storage = `  storage:
@@ -279,7 +313,7 @@ spec:
   version: v2.55.1
   image: quay.io/prometheus/prometheus:v2.55.1
   serviceAccountName: prometheus-agent
-  replicas: 1
+  replicas: %d
   shards: %d
   walCompression: true
   replicaExternalLabelName: ""
@@ -288,7 +322,7 @@ spec:
     - name: %s
       url: http://%s.%s.svc:8480/insert/%s/prometheus/api/v1/write
       messageVersion: V1.0
-`, name, testNamespace, shards, config.testRunID, storage, selector, gh62RemoteWriteName, remoteService, testNamespace, gh62AccountID)
+`, name, testNamespace, replicas, shards, config.testRunID, storage, selector, gh62RemoteWriteName, remoteService, testNamespace, gh62AccountID)
 }
 
 func gh62WALAgentManifest(clusterID string) string {
@@ -365,14 +399,16 @@ spec:
 `
 )
 
-func gh62PVCNames(agentName string, shards int) []string {
-	names := make([]string, 0, shards)
+func gh62PVCNames(agentName string, replicas, shards int) []string {
+	names := make([]string, 0, replicas*shards)
 	for shard := 0; shard < shards; shard++ {
 		statefulSet := "prom-agent-" + agentName
 		if shard > 0 {
 			statefulSet += fmt.Sprintf("-shard-%d", shard)
 		}
-		names = append(names, "prom-agent-"+agentName+"-db-"+statefulSet+"-0")
+		for ordinal := 0; ordinal < replicas; ordinal++ {
+			names = append(names, fmt.Sprintf("prom-agent-%s-db-%s-%d", agentName, statefulSet, ordinal))
+		}
 	}
 	return names
 }
@@ -520,10 +556,11 @@ func assertGH62StatefulSetStorage(ctx context.Context, agentName string) {
 
 func waitForGH62ResourceAbsent(ctx context.Context, resource, name string) {
 	GinkgoHelper()
-	Eventually(func() bool {
-		_, err := kubectlResult(ctx, "--namespace", testNamespace, "get", resource, name, "--output", "name")
-		return err != nil
-	}, 3*time.Minute, 2*time.Second).Should(BeTrue())
+	Eventually(func(g Gomega) {
+		body, err := kubectlResult(ctx, "--namespace", testNamespace, "get", resource, name, "--ignore-not-found", "--output", "name")
+		g.Expect(err).NotTo(HaveOccurred(), body)
+		g.Expect(strings.TrimSpace(body)).To(BeEmpty())
+	}, 3*time.Minute, 2*time.Second).Should(Succeed())
 }
 
 func waitForGH62StatefulSetReplacement(ctx context.Context, name, oldUID string) {

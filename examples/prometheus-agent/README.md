@@ -42,8 +42,9 @@ StorageClass；显式空字符串则是 Kubernetes 的“不使用 StorageClass�
 `volumeClaimTemplate` 获得独立 PVC，不在 Pod 之间共享 WAL。一期预检的运行子集
 仍只接受 `replicas: 1` 或用 `replicas: 0` 挂起。
 
-PVC 的生命周期故意独立于 Agent workload：`replicas: 0`、缩减 shards、
-删除 StatefulSet 或删除 Agent 都不删除已有 PVC。这一边界依赖 StatefulSet
+PVC 的生命周期故意独立于 Agent workload：缩减 replicas（包括用
+`replicas: 0` 挂起）、缩减 shards、删除 StatefulSet 或删除 Agent 都不删除
+已有 PVC。这一边界依赖 StatefulSet
 volumeClaimTemplate 原有的保留语义，不配置 Kubernetes 1.19 不支持的
 PVC retention policy。在同一 Namespace 以同一 Agent name 重建时，相同
 shard/ordinal 会复用同名 PVC，这被定义为恢复操作。要创建全新实例，
