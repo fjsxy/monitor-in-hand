@@ -34,6 +34,15 @@ storage 能力。预检是创建前的时点检查，不代替 GitOps 变更控�
 一期正常运行仅支持省略 `replicas` 或设为 `1`；`replicas: 0` 挂起所有 shards；
 `replicas > 1` 仍是上游能力，但不能通过一期预检。扩展吞吐时使用至少为 `1`
 的 `shards`，每个 shard 会获得独立 StatefulSet、Pod 和 WAL。
+公开示例固定 `replicas: 1`、`shards: 2` 和 `walCompression: true`，且不通过
+`additionalArgs` 改写 WAL retention 或 truncate frequency。
+
+示例的 `victoriametrics-primary` 目标使用集群内 HTTP VictoriaMetrics Cluster
+URL、accountID `0`、无认证且无 TLS，并显式选择 remote write `V1.0`。实际部署时
+应把 URL 中的 accountID 与 VictoriaMetrics tenant 规划保持一致，不得把 userinfo、token
+或密码写入 URL。`mih_cluster_id` 必须替换为集群内一致、跨集群唯一且在集群
+生命周期内稳定的值；预检会拒绝通过采集配置 labels、target label 传播或
+relabeling 产生和修改该标签的计划。
 
 示例中的四类 object selector 都是明确的非空 `LabelSelector`。上游允许 `{}` 选择
 可见范围内的全部对象，但一期预检会拒绝这种开放选择；省略某类 object selector

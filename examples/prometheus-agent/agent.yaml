@@ -8,7 +8,8 @@ spec:
   image: quay.io/prometheus/prometheus:v2.55.1
   serviceAccountName: prometheus-agent-example
   replicas: 1
-  shards: 1
+  shards: 2
+  walCompression: true
   replicaExternalLabelName: ""
   externalLabels:
     mih_cluster_id: replace-with-stable-cluster-id
@@ -37,5 +38,6 @@ spec:
     matchLabels:
       monitoring.fjsxy.github.io/collection-scope: example
   remoteWrite:
-    - name: primary
+    - name: victoriametrics-primary
       url: http://vminsert.monitoring.svc:8480/insert/0/prometheus/api/v1/write
+      messageVersion: V1.0

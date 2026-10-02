@@ -182,7 +182,7 @@ render_manifest_documents() {
 }
 
 validate_collection_plan() {
-  local rendered agent_count invalid_identity replicas shards empty_selectors unsupported manifest
+  local rendered agent_count invalid_identity replicas shards empty_selectors protected_mutations unsupported manifest
   [[ -n "${agent_manifest}" ]] || return 0
 
   # 先把单个 Agent manifest 规范化为 JSON，并确认它与命令行声明的运行身份一致。
@@ -264,6 +264,118 @@ validate_collection_plan() {
     fi
   done
   if ((failures > 0)); then return; fi
+
+  # mih_cluster_id 只能来自 Agent 的稳定 externalLabels；采集对象不得直接造标签、传播目标标签或通过 relabeling 改写它。
+  protected_mutations=$(jq --compact-output '
+      def apply_re2_flags($current; $spec):
+        (reduce ($spec | explode[]) as $flag
+          ({flags: $current, enabled: true};
+           if $flag == 45 then .enabled = false
+           else .flags[([$flag] | implode)] = .enabled
+           end)) | .flags;
+      def capture_group_plan($regex):
+        ($regex | explode) as $chars |
+        (reduce range(0; $chars | length) as $index
+          ({escaped: false, inClass: false, stack: [], nextGroup: 1, groups: [],
+            flags: {i: false, m: false, s: false, U: false}};
+           ($chars[$index]) as $char |
+           if .escaped then .escaped = false
+           elif $char == 92 then .escaped = true
+           elif .inClass then
+             if $char == 93 then .inClass = false else . end
+           elif $char == 91 then .inClass = true
+           elif $char == 40 then
+             ($chars[$index:] | implode) as $suffix |
+             if (($suffix | startswith("(?P<")) or ($suffix | startswith("(?<"))) then
+               ($suffix | capture("^\\(\\?P?<(?<name>[A-Za-z_][A-Za-z0-9_]*)>")) as $named |
+               (.nextGroup) as $groupIndex |
+               .nextGroup += 1 |
+               .stack += [{capturing: true, index: $groupIndex, name: $named.name,
+                            flags: .flags, restoreFlags: .flags,
+                            start: ($index + ($named.name | length) +
+                                    (if ($suffix | startswith("(?P<")) then 5 else 4 end))}]
+             elif ($suffix | test("^\\(\\?[imsU-]+\\)")) then
+               ($suffix | capture("^\\(\\?(?<flags>[imsU-]+)\\)")) as $directive |
+               .stack += [{capturing: false, restoreFlags: null}] |
+               .flags = apply_re2_flags(.flags; $directive.flags)
+             elif ($suffix | test("^\\(\\?[imsU-]+:")) then
+               ($suffix | capture("^\\(\\?(?<flags>[imsU-]+):")) as $scoped |
+               (.flags) as $restoreFlags |
+               .flags = apply_re2_flags(.flags; $scoped.flags) |
+               .stack += [{capturing: false, restoreFlags: $restoreFlags}]
+             elif ($suffix | startswith("(?")) then
+               .stack += [{capturing: false, restoreFlags: .flags}]
+             else
+               (.nextGroup) as $groupIndex |
+               .nextGroup += 1 |
+               .stack += [{capturing: true, index: $groupIndex, name: null,
+                            flags: .flags, restoreFlags: .flags, start: ($index + 1)}]
+             end
+           elif $char == 41 and (.stack | length) > 0 then
+             (.stack[-1]) as $group |
+             .stack = .stack[0:-1] |
+             if $group.capturing then
+               .groups += [{index: $group.index, name: $group.name,
+                            flags: $group.flags,
+                            pattern: ($chars[$group.start:$index] | implode)}]
+             else . end |
+             if $group.restoreFlags != null then .flags = $group.restoreFlags else . end
+           else . end)) |
+        .groups | sort_by(.index);
+      def with_re2_flags($flags; $pattern):
+        ([if $flags.i then "i" else empty end,
+          if $flags.m then "m" else empty end,
+          if $flags.s then "s" else empty end] | join("")) as $modes |
+        if $modes == "" then $pattern else "(?" + $modes + ":" + $pattern + ")" end;
+      def replacement_output_pattern($replacement; $regex):
+        (capture_group_plan($regex)) as $groups |
+        ($groups | map(with_re2_flags(.flags; .pattern))) as $numbered |
+        (reduce ($groups[] | select(.name != null)) as $capture
+          ({}; . + {($capture.name): with_re2_flags($capture.flags; $capture.pattern)})) as $named |
+        ($replacement |
+          gsub("\\$(?:\\{(?<braced>[A-Za-z0-9_]+)\\}|(?<plain>[A-Za-z0-9_]+))";
+               "\u0000\(.braced // .plain)\u0000") |
+          gsub("(?<meta>[\\\\.^$|?*+()\\[\\]{}])"; "\\\\\(.meta)") |
+          gsub("\u0000(?<reference>[A-Za-z0-9_]+)\u0000";
+               "(?:\(if (.reference | test("^[0-9]+$")) then
+                        if (.reference | tonumber) == 0 then $regex
+                        else $numbered[((.reference | tonumber) - 1)] // ""
+                        end
+                      else $named[.reference] // ""
+                      end))"));
+      def labelmap_explicitly_emits($rule; $target):
+        ($rule.replacement // "$1") as $replacement |
+        ($rule.regex // "(.*)") as $regex |
+        ($replacement == $target) or
+        (try ($target | test("^(?:" + replacement_output_pattern($replacement; $regex) + ")$")) catch false);
+      [ .[] |
+        select(
+          (.apiVersion == "monitoring.coreos.com/v1" and
+            (.kind == "ServiceMonitor" or .kind == "PodMonitor" or .kind == "Probe")) or
+          (.apiVersion == "monitoring.coreos.com/v1alpha1" and .kind == "ScrapeConfig")
+        ) |
+        . as $config |
+        [(.spec | paths(scalars)) as $path |
+          (.spec | getpath($path)) as $value |
+          select(
+            (($path[-1] == "targetLabel") and $value == "mih_cluster_id") or
+            (($path[-2] == "labels") and ($path[-1] == "mih_cluster_id")) or
+            ((($path[-2] == "targetLabels") or ($path[-2] == "podTargetLabels")) and $value == "mih_cluster_id") or
+            (($path[-1] == "action") and ($value | type) == "string" and ($value | ascii_downcase) == "labelmap" and
+              ((.spec | getpath($path[0:-1])) as $rule |
+               labelmap_explicitly_emits($rule; "mih_cluster_id")))
+          ) |
+          {namespace: ($config.metadata.namespace // "default"), name: $config.metadata.name,
+           kind: $config.kind, path: ($path | map(tostring) | join("."))}]
+      ] | flatten
+    ' <<<"${collection_configs_json}")
+  if [[ "${protected_mutations}" != '[]' ]]; then
+    record_failure collection-configuration fail ProtectedExternalLabelMutation "采集配置不得产生或修改 mih_cluster_id" \
+      "$(jq --null-input --arg protectedLabel mih_cluster_id --argjson mutations "${protected_mutations}" '{label: $protectedLabel, mutations: $mutations}')"
+  else
+    record_pass collection-configuration pass ProtectedExternalLabelPreserved "采集配置不产生或修改 mih_cluster_id" \
+      "$(jq --null-input --arg protectedLabel mih_cluster_id '{label: $protectedLabel}')"
+  fi
 
   unsupported=$(jq --compact-output '
       def unsupported_sources:
