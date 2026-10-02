@@ -650,9 +650,7 @@ func gh62BacklogMetrics(contents string) (float64, float64, bool) {
 
 func waitForGH62OutageSamples(ctx context.Context, sampleID, clusterID string, start, end time.Time) string {
 	GinkgoHelper()
-	// 用测试运行身份与 Agent 身份锁定唯一 series，并把查询窗口截断在 Pod 故障之前。
-	query := fmt.Sprintf(`node_uname_info{mih_gh62_sample=%q,mih_cluster_id=%q,prometheus=%q}`, sampleID, clusterID, testNamespace+"/gh62-wal")
-	path := fmt.Sprintf("/select/%s/prometheus/api/v1/query_range?query=%s&start=%d&end=%d&step=1", gh62AccountID, url.QueryEscape(query), start.Unix(), end.Unix())
+	path := gh62OutageQueryPath(sampleID, clusterID, start, end)
 	return waitForGH61HTTPBody(ctx, "service/vmselect", 8481, path, 5*time.Minute, func(g Gomega, contents []byte) {
 		// 先验证 vmselect 返回的 series 唯一且标签身份完整。
 		var result gh62RangeResponse
@@ -676,4 +674,11 @@ func waitForGH62OutageSamples(ctx context.Context, sampleID, clusterID string, s
 			g.Expect(timestamp).To(BeNumerically("<=", end.Unix()))
 		}
 	})
+}
+
+func gh62OutageQueryPath(sampleID, clusterID string, start, end time.Time) string {
+	// 用测试运行身份与 Agent 身份锁定唯一 series，并把查询窗口截断在 Pod 故障之前。
+	query := fmt.Sprintf(`node_uname_info{mih_gh62_sample=%q,mih_cluster_id=%q,prometheus=%q}`, sampleID, clusterID, testNamespace+"/gh62-wal")
+	// WAL replay 会回填历史样本；禁用 vmselect cache，避免首次空结果遮蔽随后写入的数据。
+	return fmt.Sprintf("/select/%s/prometheus/api/v1/query_range?query=%s&start=%d&end=%d&step=1&nocache=1", gh62AccountID, url.QueryEscape(query), start.Unix(), end.Unix())
 }

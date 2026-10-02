@@ -73,6 +73,7 @@
 | `UT-PREFLIGHT-GH61-002` | #61 | 预检 CLI/兼容边界 | 通用 | 固定产生其他标签或带非保护前缀的动态 `labelmap` 保持可用，不被 `mih_cluster_id` 保护扫描误拒绝 | NDJSON diagnostics | `go test ./test/testenv` |
 | `UT-COLLECTION-GH61-001` | #61 | E2E 证据解析 | 通用 | 从 Prometheus text exposition 中按 metric family 与 remote name 精确读取 sample，容忍标签顺序和科学计数法且不误命中其他 remote | Go testing failure、metrics 文本 | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |
 | `UT-COLLECTION-GH62-001` | #62 | E2E 证据解析 | Prometheus 2.55 | 从 text exposition 同时读取无标签的全局入队最高时间与目标 remote 的 pending、已发送最高时间，并计算 WAL queue lag | Go testing failure、metrics 文本 | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |
+| `UT-COLLECTION-GH62-002` | #62 | E2E 查询构造 | VictoriaMetrics | WAL replay 回填固定历史窗口时，range query 显式携带 `nocache=1`，不让恢复开始前的空结果遮蔽随后写入的样本 | Go testing failure、query parameters | `go test ./test/e2e/collection -run '^TestCollectionHelpers$'` |
 | `UT-EXAMPLE-GH62-001` | #62 | 示例/WAL 存储 | 通用 | 默认 Agent 省略 storage 而选择 EmptyDir；持久示例显式声明 StorageClass、ReadWriteOnce、Filesystem 与容量，且不依赖 PVC retention policy | Ginkgo failure、示例 manifest | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH62-001` | #62 | 预检 CLI/不可变存储 | 通用 | 同 namespace/name 已有 Agent 创建 volumeClaimTemplate 后，扩容或移除模板在资源调谐前以 `ImmutableVolumeClaimTemplate` 非零拒绝 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 
