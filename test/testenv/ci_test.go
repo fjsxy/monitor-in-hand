@@ -10,8 +10,8 @@ import (
 )
 
 var _ = Describe("双版本一期验收门禁", func() {
-	It("按两个固定版本和两个 E2E lane 并行运行，并在失败时先保存证据再清理", func() {
-		By("读取 CI workflow 并定位双版本双 lane 验收 job")
+	It("按两个固定版本和三个 E2E lane 并行运行，并在失败时先保存证据再清理", func() {
+		By("读取 CI workflow 并定位双版本三 lane 验收 job")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		contents, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
@@ -24,12 +24,12 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(found).To(BeTrue(), "缺少 test-environment blocking job")
 		Expect(job).To(HaveKeyWithValue("name", "e2e-${{ matrix.lane }} (Kubernetes ${{ matrix.kubernetes }})"))
 
-		By("验证 Kubernetes 1.19 和 1.28 的 KSM、Agent lane 使用四个独立矩阵入口")
+		By("验证 Kubernetes 1.19 和 1.28 的 KSM、Agent、Operator lane 使用六个独立矩阵入口")
 		strategy := job["strategy"].(map[string]any)
 		Expect(strategy["fail-fast"]).To(BeFalse())
 		matrix := strategy["matrix"].(map[string]any)
 		entries := matrix["include"].([]any)
-		Expect(entries).To(HaveLen(4))
+		Expect(entries).To(HaveLen(6))
 		Expect(entries).To(ConsistOf(
 			SatisfyAll(
 				HaveKeyWithValue("kubernetes", "1.19"),
@@ -46,6 +46,13 @@ var _ = Describe("双版本一期验收门禁", func() {
 				HaveKeyWithValue("target", "e2e-agent"),
 			),
 			SatisfyAll(
+				HaveKeyWithValue("kubernetes", "1.19"),
+				HaveKeyWithValue("kubectl", "v1.19.16"),
+				HaveKeyWithValue("run_id_suffix", "119"),
+				HaveKeyWithValue("lane", "operator"),
+				HaveKeyWithValue("target", "e2e-operator"),
+			),
+			SatisfyAll(
 				HaveKeyWithValue("kubernetes", "1.28"),
 				HaveKeyWithValue("kubectl", "v1.28.15"),
 				HaveKeyWithValue("run_id_suffix", "128"),
@@ -58,6 +65,13 @@ var _ = Describe("双版本一期验收门禁", func() {
 				HaveKeyWithValue("run_id_suffix", "128"),
 				HaveKeyWithValue("lane", "agent"),
 				HaveKeyWithValue("target", "e2e-agent"),
+			),
+			SatisfyAll(
+				HaveKeyWithValue("kubernetes", "1.28"),
+				HaveKeyWithValue("kubectl", "v1.28.15"),
+				HaveKeyWithValue("run_id_suffix", "128"),
+				HaveKeyWithValue("lane", "operator"),
+				HaveKeyWithValue("target", "e2e-operator"),
 			),
 		))
 		Expect(job["env"]).To(HaveKeyWithValue(
@@ -126,6 +140,7 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/preflight"`))
 		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/collection"`))
 		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/kubestatemetrics"`))
+		Expect(string(makefile)).To(ContainSubstring(`--output-dir="$(E2E_REPORT_DIR)/operator"`))
 		Expect(string(makefile)).NotTo(ContainSubstring("./hack/e2e-default-deployment.sh"))
 
 		By("确认旧 shell 业务断言入口已被删除")

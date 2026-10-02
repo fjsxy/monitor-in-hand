@@ -75,7 +75,7 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-agent e2e-image e2e-operator-install e2e-collection e2e-kubestatemetrics e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
+.PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-agent e2e-image e2e-operator-install e2e-operator e2e-collection e2e-kubestatemetrics e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
 test: manifests verify-generated generate fmt typecheck test-unit test-integration test-helm test-testenv ## Run all tests.
 
 test-unit: ## Run control-plane unit tests.
@@ -137,6 +137,13 @@ e2e-operator-install: e2e-image ## Install the current worktree Operator for sta
 		$(KUBECTL) --context "$(E2E_KUBE_CONTEXT)" apply --filename -
 	$(HELM) upgrade --install "$(RELEASE)" charts/monitor-in-hand \
 		--kube-context "$(E2E_KUBE_CONTEXT)" --namespace "$(NAMESPACE)" --wait --timeout 180s
+
+e2e-operator: e2e-image ## Verify Operator failure recovery, rolling handoff, and uninstall boundaries.
+	mkdir -p "$(E2E_REPORT_DIR)/operator"
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
+		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=45m \
+		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/operator" \
+		./test/e2e/operator
 
 e2e-collection: e2e-operator-install ## Verify native PrometheusAgent collection and boundaries independently.
 	mkdir -p "$(E2E_REPORT_DIR)/collection"

@@ -76,6 +76,11 @@ jobs:
             run_id_suffix: "119"
             lane: agent
             target: e2e-agent
+          - kubernetes: "1.19"
+            kubectl: "v1.19.16"
+            run_id_suffix: "119"
+            lane: operator
+            target: e2e-operator
           - kubernetes: "1.28"
             kubectl: "v1.28.15"
             run_id_suffix: "128"
@@ -86,6 +91,11 @@ jobs:
             run_id_suffix: "128"
             lane: agent
             target: e2e-agent
+          - kubernetes: "1.28"
+            kubectl: "v1.28.15"
+            run_id_suffix: "128"
+            lane: operator
+            target: e2e-operator
     env:
       KUBERNETES_VERSION: ${{ matrix.kubernetes }}
       TEST_RUN_ID: ci-${{ github.run_id }}-${{ matrix.run_id_suffix }}-${{ matrix.lane }}
