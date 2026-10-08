@@ -9,6 +9,12 @@ NAMESPACE ?= monitor-in-hand-system
 E2E_REPORT_DIR ?= artifacts/e2e/$(TEST_RUN_ID)-$(KUBERNETES_VERSION)
 E2E_CLUSTER_NAME = mih-e2e-$(subst .,,$(KUBERNETES_VERSION))-$(TEST_RUN_ID)
 E2E_KUBE_CONTEXT = kind-$(E2E_CLUSTER_NAME)
+TEST_RESULTS_DIR ?= artifacts/test-results
+UNIT_REPORT_DIR ?= $(TEST_RESULTS_DIR)/unit
+INTEGRATION_REPORT_DIR ?= $(TEST_RESULTS_DIR)/integration
+HELM_REPORT_DIR ?= $(TEST_RESULTS_DIR)/helm
+TESTENV_REPORT_DIR ?= $(TEST_RESULTS_DIR)/testenv
+UNIT_COVERAGE_PROFILE ?= $(UNIT_REPORT_DIR)/unit.out
 # Kubebuilder v3.13.0 generated this project and matches the controller-runtime v0.16 line.
 KUBEBUILDER_VERSION ?= v3.13.0
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
@@ -78,17 +84,31 @@ vet: ## Run go vet against code.
 .PHONY: test test-unit test-integration test-helm test-testenv typecheck lint-chart verify-generated smoke-install preflight e2e-preflight e2e-agent e2e-image e2e-operator-install e2e-collection e2e-kubestatemetrics e2e-default-deployment test-env-up test-env-verify test-env-evidence test-env-down
 test: manifests verify-generated generate fmt typecheck test-unit test-integration test-helm test-testenv ## Run all tests.
 
-test-unit: ## Run control-plane unit tests.
-	go test ./internal/... ./cmd/...
+test-unit: ## Run control-plane unit tests and enforce phase-one statement coverage.
+	mkdir -p "$(UNIT_REPORT_DIR)"
+	$(GINKGO) -r --fail-on-pending --fail-on-empty --keep-separate-reports \
+		--junit-report=junit.xml --output-dir="$(UNIT_REPORT_DIR)" \
+		--cover --covermode=atomic --coverprofile=unit.out ./internal/...
+	$(GINKGO) --fail-on-pending --fail-on-empty \
+		--junit-report=junit.xml --output-dir="$(UNIT_REPORT_DIR)" ./cmd
+	go run ./cmd/phase1-gate --coverage-profile "$(UNIT_COVERAGE_PROFILE)" \
+		--aggregate-coverage 80 --package-coverage 70
 
 test-integration: envtest manifests ## Run controller integration tests against a real API server.
-	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./test/integration/...
+	mkdir -p "$(INTEGRATION_REPORT_DIR)"
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+		$(GINKGO) -r --fail-on-pending --fail-on-empty --keep-separate-reports \
+		--junit-report=junit.xml --output-dir="$(INTEGRATION_REPORT_DIR)" ./test/integration/...
 
 test-helm: ## Run Helm contract tests.
-	HELM_BIN="$(HELM)" go test ./test/helm
+	mkdir -p "$(HELM_REPORT_DIR)"
+	HELM_BIN="$(HELM)" $(GINKGO) --fail-on-pending --fail-on-empty \
+		--junit-report=junit.xml --output-dir="$(HELM_REPORT_DIR)" ./test/helm
 
 test-testenv: ## Run the external test-environment CLI contract tests.
-	go test ./test/testenv
+	mkdir -p "$(TESTENV_REPORT_DIR)"
+	$(GINKGO) --fail-on-pending --fail-on-empty \
+		--junit-report=junit.xml --output-dir="$(TESTENV_REPORT_DIR)" ./test/testenv
 
 typecheck: vet ## Compile all Go packages.
 	go build ./...
@@ -99,6 +119,7 @@ lint-chart: ## Lint the supported Helm installation artifact.
 verify-generated: manifests ## Verify Helm RBAC is synchronized from Kubebuilder markers.
 	cmp config/rbac/role.yaml charts/monitor-in-hand/generated/manager-role.yaml
 	cmp config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml charts/monitor-in-hand/crds/monitoring.fjsxy.github.io_kubestatemetrics.yaml
+	sha256sum --check config/crd/baselines/v0.1.0.sha256
 	git diff --exit-code -- config/rbac/role.yaml config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml charts/monitor-in-hand/generated/manager-role.yaml charts/monitor-in-hand/crds/monitoring.fjsxy.github.io_kubestatemetrics.yaml
 
 smoke-install: ## Run the isolated kind installation smoke test.

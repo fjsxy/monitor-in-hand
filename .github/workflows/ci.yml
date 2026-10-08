@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
@@ -28,6 +30,13 @@ jobs:
           make lint-chart HELM=helm
       - name: 验证生成物同步
         run: make verify-generated
+      - name: 上传 UT、IT、Helm JUnit 与 unit coverage 证据
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: blocking-quality-${{ github.run_id }}
+          path: artifacts/test-results/
+          if-no-files-found: error
 
   smoke:
     runs-on: ubuntu-latest
@@ -115,15 +124,15 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-${{ matrix.run_id_suffix }}-${{ matrix.lane }}-${{ github.run_id }}
+          name: e2e-${{ github.run_id }}-${{ matrix.run_id_suffix }}-${{ matrix.lane }}-${{ matrix.kubernetes }}
           path: artifacts/e2e/
           if-no-files-found: error
-      - name: 失败时保存测试环境证据
-        if: ${{ failure() }}
+      - name: 保存测试环境证据
+        if: ${{ always() }}
         continue-on-error: true
         run: make test-env-evidence
       - name: 上传测试环境证据
-        if: ${{ failure() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: test-environment-${{ matrix.run_id_suffix }}-${{ matrix.lane }}-${{ github.run_id }}
@@ -132,3 +141,44 @@ jobs:
       - name: 清理本次测试环境
         if: ${{ always() }}
         run: make test-env-down
+
+  phase1-release-gate:
+    name: 一期阻断式发布门禁
+    if: ${{ always() }}
+    needs:
+      - quality
+      - smoke
+      - test-environment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.22.12
+          cache: true
+      - name: 下载本次 E2E JUnit
+        uses: actions/download-artifact@v4
+        with:
+          pattern: e2e-${{ github.run_id }}-*
+          path: artifacts/e2e
+          merge-multiple: false
+      - name: 下载本次 UT、IT 与 Helm JUnit
+        uses: actions/download-artifact@v4
+        with:
+          name: blocking-quality-${{ github.run_id }}
+          path: artifacts/quality
+      - name: 校验一期全部 blocking JUnit
+        run: >-
+          go run ./cmd/phase1-gate
+          --reports artifacts
+          --expected-blocking-count 163
+          --expected-e2e-count 46
+      - name: 校验全部上游 blocking job
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          E2E_RESULT: ${{ needs.test-environment.result }}
+        run: |
+          test "${QUALITY_RESULT}" = success
+          test "${SMOKE_RESULT}" = success
+          test "${E2E_RESULT}" = success

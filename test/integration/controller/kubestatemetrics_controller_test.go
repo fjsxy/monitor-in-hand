@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -33,6 +34,12 @@ type serviceCreateAfterWriteErrorClient struct {
 	failed bool
 }
 
+type namespaceGetErrorOnceClient struct {
+	client.Client
+	target string
+	failed bool
+}
+
 func (f fixedServerVersion) ServerVersion() (*version.Info, error) {
 	return &version.Info{GitVersion: f.gitVersion}, nil
 }
@@ -46,6 +53,14 @@ func (c *serviceCreateAfterWriteErrorClient) Create(ctx context.Context, object 
 		return fmt.Errorf("injected ambiguous service apply failure")
 	}
 	return c.Client.Create(ctx, object, options...)
+}
+
+func (c *namespaceGetErrorOnceClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*corev1.Namespace); ok && key.Name == c.target && !c.failed {
+		c.failed = true
+		return apierrors.NewServiceUnavailable("injected transient namespace read failure")
+	}
+	return c.Client.Get(ctx, key, object, options...)
 }
 
 var _ = Describe("KubeStateMetrics reconciliation", func() {
@@ -1541,7 +1556,160 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 		Expect(condition(actual, "Ready").Reason).To(Equal("NoNamespaceMatched"))
 	})
+
+	It("IT-KSM-GH65-001 status 变化产生可追溯 Event 且同 generation 不重复发送", func() {
+		By("准备真实 API Server 对象与可观察 Event 的 recorder")
+		namespace := "it-gh65-events-" + suffix
+		name := "gh65-events-" + suffix
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				MetricFilter:    monitoringv1alpha1.KubeStateMetricsMetricFilter{Mode: monitoringv1alpha1.MetricFilterModeAllow, Patterns: []string{"["}},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		recorder := record.NewFakeRecorder(10)
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{Client: testClient, ServerVersion: fixedServerVersion{gitVersion: "v1.28.15"}, Recorder: recorder}
+		request := ctrl.Request{NamespacedName: client.ObjectKey{Name: name}}
+
+		By("执行失败调谐并验证 status 与 Warning Event 共同收敛")
+		_, err := reconciler.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Degraded")).To(SatisfyAll(HaveField("Status", metav1.ConditionTrue), HaveField("Reason", ksm.ReasonInvalidSpec)))
+		Eventually(recorder.Events, time.Second).Should(Receive(SatisfyAll(ContainSubstring("Warning"), ContainSubstring(ksm.ReasonInvalidSpec))))
+
+		By("重复同 generation 调谐，验证 status 不重写且 Event 不重复")
+		resourceVersion := actual.ResourceVersion
+		_, err = reconciler.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.ResourceVersion).To(Equal(resourceVersion))
+		Consistently(recorder.Events, 250*time.Millisecond).ShouldNot(Receive())
+
+		By("修正声明产生新 generation，验证恢复 status 与 Recovered Event")
+		actual.Spec.MetricFilter = monitoringv1alpha1.KubeStateMetricsMetricFilter{}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.ObservedGeneration).To(Equal(actual.Generation))
+		Expect(condition(actual, "Degraded").Status).To(Equal(metav1.ConditionFalse))
+		Eventually(recorder.Events, time.Second).Should(Receive(SatisfyAll(ContainSubstring("Normal"), ContainSubstring(ksm.ReasonRecovered))))
+	})
+
+	It("IT-KSM-GH65-002 依赖缺失与 API 瞬时错误使用不同 retry class", func() {
+		By("准备目标 Namespace 不存在的声明")
+		missingNamespace := "it-gh65-missing-" + suffix
+		name := "gh65-retry-" + suffix
+		instance := &monitoringv1alpha1.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: monitoringv1alpha1.KubeStateMetricsSpec{TargetNamespace: missingNamespace}}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		request := ctrl.Request{NamespacedName: client.ObjectKey{Name: name}}
+
+		By("执行可预期依赖缺失调谐，验证返回有界延时重试而非 error")
+		reconciler := &ksmcontroller.KubeStateMetricsReconciler{Client: testClient, ServerVersion: fixedServerVersion{gitVersion: "v1.28.15"}}
+		result, err := reconciler.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(condition(actual, "Degraded").Reason).To(Equal(ksm.ReasonDependencyMissing))
+
+		By("创建依赖后注入一次 API 瞬时读取错误，验证返回 error 交由 controller 限速重试")
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: missingNamespace}})).To(Succeed())
+		transientClient := &namespaceGetErrorOnceClient{Client: testClient, target: missingNamespace}
+		reconciler.Client = transientClient
+		result, err = reconciler.Reconcile(ctx, request)
+		Expect(err).To(MatchError(ContainSubstring("injected transient namespace read failure")))
+		Expect(result).To(Equal(ctrl.Result{}))
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: missingNamespace, Name: ksm.ManagedResourceName(name)}, &appsv1.Deployment{})).To(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("IT-KSM-GH65-003 manager 重启后只按最新 generation 收敛", func() {
+		By("准备初始非法声明并启动第一个真实 manager")
+		namespace := "it-gh65-restart-" + suffix
+		name := "gh65-restart-" + suffix
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				MetricFilter:    monitoringv1alpha1.KubeStateMetricsMetricFilter{Mode: monitoringv1alpha1.MetricFilterModeAllow, Patterns: []string{"["}},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		cancelFirst, firstDone := startIntegrationManager(ctx)
+		firstStopped := false
+		DeferCleanup(func() {
+			if !firstStopped {
+				stopIntegrationManager(cancelFirst, firstDone)
+			}
+		})
+		Eventually(func(g Gomega) {
+			actual := &monitoringv1alpha1.KubeStateMetrics{}
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			degraded := apiMeta.FindStatusCondition(actual.Status.Conditions, "Degraded")
+			g.Expect(degraded).NotTo(BeNil())
+			g.Expect(degraded.Reason).To(Equal(ksm.ReasonInvalidSpec))
+		}, 5*time.Second).Should(Succeed())
+
+		By("停止 manager，在无 controller 窗口内修正声明以产生最新 generation")
+		stopIntegrationManager(cancelFirst, firstDone)
+		firstStopped = true
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		actual.Spec.MetricFilter = monitoringv1alpha1.KubeStateMetricsMetricFilter{}
+		Expect(testClient.Update(ctx, actual)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		latestGeneration := actual.Generation
+
+		By("启动全新 manager，验证它不依赖内存状态并按最新 generation 创建 workload")
+		cancelSecond, secondDone := startIntegrationManager(ctx)
+		DeferCleanup(func() { stopIntegrationManager(cancelSecond, secondDone) })
+		Eventually(func(g Gomega) {
+			current := &monitoringv1alpha1.KubeStateMetrics{}
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, current)).To(Succeed())
+			g.Expect(current.Generation).To(Equal(latestGeneration))
+			g.Expect(current.Status.ObservedGeneration).To(Equal(latestGeneration))
+			degraded := apiMeta.FindStatusCondition(current.Status.Conditions, "Degraded")
+			g.Expect(degraded).NotTo(BeNil())
+			g.Expect(degraded.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ksm.ManagedResourceName(name)}, &appsv1.Deployment{})).To(Succeed())
+		}, 5*time.Second).Should(Succeed())
+	})
 })
+
+func startIntegrationManager(ctx context.Context) (context.CancelFunc, chan error) {
+	GinkgoHelper()
+	By("构建 manager 并注册待测 reconciler")
+	manager, err := ctrl.NewManager(testConfig, ctrl.Options{Scheme: testScheme, Metrics: server.Options{BindAddress: "0"}, HealthProbeBindAddress: "0"})
+	Expect(err).NotTo(HaveOccurred())
+	reconciler := &ksmcontroller.KubeStateMetricsReconciler{
+		Client:        manager.GetClient(),
+		ServerVersion: fixedServerVersion{gitVersion: "v1.28.15"},
+		Recorder:      manager.GetEventRecorderFor("kubestatemetrics-controller"),
+	}
+	Expect(reconciler.SetupWithManager(manager)).To(Succeed())
+
+	By("启动 manager 后在有界时间内等待 cache 同步")
+	managerContext, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- manager.Start(managerContext) }()
+	cacheSyncContext, stopWaiting := context.WithTimeout(ctx, 5*time.Second)
+	defer stopWaiting()
+	Expect(manager.GetCache().WaitForCacheSync(cacheSyncContext)).To(BeTrue())
+	return cancel, done
+}
+
+func stopIntegrationManager(cancel context.CancelFunc, done chan error) {
+	GinkgoHelper()
+	By("停止 manager 并在有界时间内等待退出")
+	cancel()
+	Eventually(done, 5*time.Second).Should(Receive(BeNil()))
+}
 
 func condition(instance *monitoringv1alpha1.KubeStateMetrics, conditionType string) metav1.Condition {
 	for _, current := range instance.Status.Conditions {

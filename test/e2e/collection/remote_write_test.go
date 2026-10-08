@@ -1,6 +1,7 @@
 package collection_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,6 +59,9 @@ var _ = Describe("KubeStateMetrics remote_write 数据链路", Serial, func() {
 			deleteResource(cleanupCtx, "prometheusagent", gh61AgentName, testNamespace)
 			deleteResource(cleanupCtx, "servicemonitor", gh61AgentName, testNamespace)
 			deleteResource(cleanupCtx, "kubestatemetrics", gh61KSMName, "")
+		})
+		DeferCleanup(func(cleanupCtx SpecContext) {
+			collectGH61Evidence(cleanupCtx, testLabel, clusterID)
 		})
 		applyManifest(ctx, gh61KSMManifest)
 		applyManifest(ctx, serviceMonitorManifest)
@@ -112,7 +117,8 @@ func gh61CollectionScenarioID(sequence string) string {
 		"1.19": {"001": "E2E-119-COLLECTION-GH61-001"},
 		"1.28": {"001": "E2E-128-COLLECTION-GH61-001"},
 	}
-	if versionIDs, supported := ids[config.kubernetesMinor]; supported {
+	// Ginkgo 在 BeforeSuite 之前注册测试树，因此场景名必须直接读取进程环境。
+	if versionIDs, supported := ids[os.Getenv("KUBERNETES_VERSION")]; supported {
 		if id, found := versionIDs[sequence]; found {
 			return id
 		}
@@ -373,6 +379,139 @@ func waitForGH61HTTPBody(ctx context.Context, target string, remotePort int, pat
 		verify(g, contents)
 	}, timeout, 2*time.Second).Should(Succeed())
 	return body
+}
+
+func collectGH61Evidence(ctx context.Context, testLabel, clusterID string) {
+	GinkgoHelper()
+	// 先在删除 fixture 前独立保存持久化工作负载、PVC 和控制面对象，单项失败不中断其他证据。
+	commands := []struct {
+		name string
+		args []string
+	}{
+		{name: "final-statefulset-pvc", args: []string{"--namespace", testNamespace, "get", "statefulset,pvc", "--output", "yaml"}},
+		{name: "final-ksm", args: []string{"get", "kubestatemetrics", gh61KSMName, "--output", "yaml"}},
+		{name: "final-agent", args: []string{"--namespace", testNamespace, "get", "prometheusagent", gh61AgentName, "--output", "yaml"}},
+	}
+	for _, command := range commands {
+		output, err := kubectlResult(ctx, command.args...)
+		AddReportEntry(command.name, evidenceBody(output, err), ReportEntryVisibilityFailureOrVerbose)
+	}
+
+	// 再对每个数据面观察点做一次有界尽力读取，确保 vmselect 查询失败时仍会尝试保存 remote-write 指标。
+	query := fmt.Sprintf(`kube_pod_info{mih_test_run_id=%q,mih_cluster_id=%q}`, testLabel, clusterID)
+	observations := []struct {
+		name       string
+		target     string
+		remotePort int
+		path       string
+	}{
+		{name: "final-vmselect-query", target: "service/vmselect", remotePort: 8481, path: "/select/" + gh61AccountID + "/prometheus/api/v1/query?query=" + url.QueryEscape(query)},
+		{name: "final-wrong-tenant-query", target: "service/vmselect", remotePort: 8481, path: "/select/0/prometheus/api/v1/query?query=" + url.QueryEscape(query)},
+		{name: "final-shard-0-remote-write-metrics", target: "pod/prom-agent-" + gh61AgentName + "-0", remotePort: 9090, path: "/metrics"},
+		{name: "final-shard-1-remote-write-metrics", target: "pod/prom-agent-" + gh61AgentName + "-shard-1-0", remotePort: 9090, path: "/metrics"},
+		{name: "final-vminsert-metrics", target: "service/vminsert", remotePort: 8480, path: "/metrics"},
+	}
+	type observationResult struct {
+		index int
+		body  string
+		err   error
+	}
+	results := make(chan observationResult, len(observations))
+	for index, observation := range observations {
+		go func(index int, observation struct {
+			name       string
+			target     string
+			remotePort int
+			path       string
+		}) {
+			body, err := bestEffortGH61HTTPBody(ctx, observation.target, observation.remotePort, observation.path)
+			results <- observationResult{index: index, body: body, err: err}
+		}(index, observation)
+	}
+	collected := make([]observationResult, len(observations))
+	for range observations {
+		result := <-results
+		collected[result.index] = result
+	}
+	for index, observation := range observations {
+		AddReportEntry(observation.name, evidenceBody(collected[index].body, collected[index].err), ReportEntryVisibilityFailureOrVerbose)
+	}
+}
+
+func bestEffortGH61HTTPBody(ctx context.Context, target string, remotePort int, path string) (string, error) {
+	// 启动阶段：为单个观察点建立短生命周期端口转发，并注册无断言的子进程清理。
+	evidenceCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	command := exec.CommandContext(evidenceCtx, "kubectl", "--context", config.kubeContext, "--namespace", testNamespace,
+		"port-forward", target, fmt.Sprintf("0:%d", remotePort))
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	stderr, err := command.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+	if err := command.Start(); err != nil {
+		return "", err
+	}
+	defer func() {
+		if command.Process != nil {
+			_ = command.Process.Kill()
+		}
+		_ = command.Wait()
+	}()
+
+	// 就绪阶段：并行读取 stdout/stderr，等待 kubectl 报告实际绑定的本地端口。
+	lines := make(chan string, 8)
+	readLines := func(reader io.Reader) {
+		scanner := bufio.NewScanner(reader)
+		for scanner.Scan() {
+			select {
+			case lines <- scanner.Text():
+			case <-evidenceCtx.Done():
+				return
+			}
+		}
+	}
+	go readLines(stdout)
+	go readLines(stderr)
+	pattern := regexp.MustCompile(`Forwarding from 127\.0\.0\.1:(\d+)`)
+	port := 0
+	for port == 0 {
+		select {
+		case line := <-lines:
+			match := pattern.FindStringSubmatch(line)
+			if len(match) == 2 {
+				port, _ = strconv.Atoi(match[1])
+			}
+		case <-evidenceCtx.Done():
+			return "", fmt.Errorf("端口转发 %s 未就绪: %w", target, evidenceCtx.Err())
+		}
+	}
+
+	// 取证阶段：对已就绪的观察面执行一次有界 HTTP 请求，原样保留非 200 响应体。
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Get("http://127.0.0.1:" + strconv.Itoa(port) + path)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	contents, err := io.ReadAll(response.Body)
+	if err != nil {
+		return "", err
+	}
+	if response.StatusCode != http.StatusOK {
+		return string(contents), fmt.Errorf("HTTP status %s", response.Status)
+	}
+	return string(contents), nil
+}
+
+func evidenceBody(body string, err error) string {
+	if err == nil {
+		return body
+	}
+	return fmt.Sprintf("error: %v\n%s", err, body)
 }
 
 func metricSample(contents, metricName, requiredLabel string) (float64, bool) {

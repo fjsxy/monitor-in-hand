@@ -379,6 +379,9 @@ capture_evidence() {
   "${kubectl_bin}" --context "${context}" version --output yaml >"${evidence_dir}/version.yaml" 2>&1 || true
   "${kubectl_bin}" --context "${context}" get nodes --output yaml >"${evidence_dir}/nodes.yaml" 2>&1 || true
   "${kubectl_bin}" --context "${context}" get pods --all-namespaces --output wide >"${evidence_dir}/pods.txt" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" get pods --all-namespaces --output yaml >"${evidence_dir}/pods.yaml" 2>&1 || true
+  "${kubectl_bin}" --context "${context}" get statefulset,pvc --all-namespaces --output yaml \
+    >"${evidence_dir}/persistent-workloads.yaml" 2>&1 || true
   "${kubectl_bin}" --context "${context}" get events --all-namespaces --sort-by=.lastTimestamp >"${evidence_dir}/events.txt" 2>&1 || true
   "${kubectl_bin}" --context "${context}" get crd --output yaml >"${evidence_dir}/crds.yaml" 2>&1 || true
   "${kubectl_bin}" --context "${context}" --namespace "${test_namespace}" get all --output yaml >"${evidence_dir}/test-resources.yaml" 2>&1 || true

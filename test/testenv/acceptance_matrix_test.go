@@ -64,6 +64,23 @@ var _ = Describe("一期验收矩阵可追溯性", func() {
 		Entry("其他测试层级保留原有字段", "| 场景 ID | 来源 | 动作与精确断言 |\n| `UT-KSM-GH"+"53-001` | #53 | 返回计划 |", []string(nil)),
 	)
 
+	It("UT-GATE-GH65-007 每条验收记录都具备决策来源、层级、目标版本、前置条件、失败证据和测试入口", func() {
+		By("准备一个完整条目和一个缺少前置条件与测试入口的条目")
+		goodID := "UT-GATE-GH" + "65-901"
+		badID := "UT-GATE-GH" + "65-902"
+		matrix := strings.Join([]string{
+			"| 场景 ID | 来源 | 层级 | 目标版本 | 前置条件 | 动作与精确断言 | 失败证据 | 测试入口 |",
+			"| `" + goodID + "` | #65 | 纯逻辑 | 通用 | Go 可用 | 放行 | Ginkgo failure | `go test` |",
+			"| `" + badID + "` | #65 | 纯逻辑 | 通用 | | 拒绝 | Ginkgo failure | |",
+		}, "\n")
+
+		By("验证缺失字段逐个归属到稳定场景 ID")
+		Expect(missingAcceptanceMatrixDetails(matrix)).To(Equal([]string{
+			badID + " 缺少前置条件",
+			badID + " 缺少测试入口",
+		}))
+	})
+
 	It("测试源码与矩阵中的稳定场景 ID 双向一致且各自唯一", func() {
 		By("从所有 Go 测试源码收集会进入测试报告的稳定场景 ID")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -86,15 +103,58 @@ var _ = Describe("一期验收矩阵可追溯性", func() {
 		Expect(duplicates(matrixIDs)).To(BeEmpty(), "验收矩阵中的稳定场景 ID 必须唯一")
 		Expect(missingIDs(sourceIDs, matrixIDs)).To(BeEmpty(), "以下测试场景尚未登记到一期验收矩阵")
 		Expect(missingIDs(matrixIDs, sourceIDs)).To(BeEmpty(), "以下矩阵场景没有对应的 Go 测试")
+		Expect(missingAcceptanceMatrixDetails(string(matrix))).To(BeEmpty(), "验收矩阵每行都必须包含全部追溯字段")
 
 		By("验证每个 E2E case 都明确验收目的、执行步骤和执行预期")
 		Expect(missingE2EAcceptanceDetails(string(matrix))).To(BeEmpty(), "E2E 验收条目的三个部分必须分别填写且不能为空")
 	})
 })
 
+func missingAcceptanceMatrixDetails(matrix string) []string {
+	var result []string
+	// 对每个已解析矩阵条目检查全部公共追溯字段，缺列、短行与空白值都归属到稳定 ID。
+	for _, row := range acceptanceTableRows(matrix) {
+		for _, id := range stableAcceptanceID.FindAllString(row.cells[0], -1) {
+			for _, field := range []string{"来源", "层级", "目标版本", "前置条件", "失败证据", "测试入口"} {
+				index, found := row.columns[field]
+				if !found || index >= len(row.cells) || strings.TrimSpace(row.cells[index]) == "" {
+					result = append(result, id+" 缺少"+field)
+				}
+			}
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
 func missingE2EAcceptanceDetails(matrix string) []string {
 	var result []string
+	// 同一行可以登记两个版本；缺列、短行和空白内容都逐个归属到稳定 ID。
+	for _, row := range acceptanceTableRows(matrix) {
+		for _, id := range stableAcceptanceID.FindAllString(row.cells[0], -1) {
+			if !strings.HasPrefix(id, "E2E-") {
+				continue
+			}
+			for _, field := range []string{"验收目的", "执行步骤", "执行预期"} {
+				index, found := row.columns[field]
+				if !found || index >= len(row.cells) || strings.TrimSpace(row.cells[index]) == "" {
+					result = append(result, id+" 缺少"+field)
+				}
+			}
+		}
+	}
+	return result
+}
+
+type acceptanceTableRow struct {
+	cells   []string
+	columns map[string]int
+}
+
+func acceptanceTableRows(matrix string) []acceptanceTableRow {
+	var rows []acceptanceTableRow
 	var columns map[string]int
+	// 按 Markdown 表边界维护当前表头；离开表格后不得沿用上一张表的列定义。
 	for _, line := range strings.Split(matrix, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "|") {
@@ -103,28 +163,17 @@ func missingE2EAcceptanceDetails(matrix string) []string {
 		}
 		cells := strings.Split(strings.Trim(line, "|"), "|")
 		if strings.TrimSpace(cells[0]) == "场景 ID" {
-			// 按当前表的列名定位必填部分，避免重排字段后校验错列。
 			columns = map[string]int{}
 			for index, cell := range cells {
 				columns[strings.TrimSpace(cell)] = index
 			}
 			continue
 		}
-
-		// 同一行可以登记两个版本；缺列、短行和空白内容都逐个归属到稳定 ID。
-		for _, id := range stableAcceptanceID.FindAllString(cells[0], -1) {
-			if !strings.HasPrefix(id, "E2E-") {
-				continue
-			}
-			for _, field := range []string{"验收目的", "执行步骤", "执行预期"} {
-				index, found := columns[field]
-				if !found || index >= len(cells) || strings.TrimSpace(cells[index]) == "" {
-					result = append(result, id+" 缺少"+field)
-				}
-			}
+		if len(stableAcceptanceID.FindAllString(cells[0], -1)) > 0 {
+			rows = append(rows, acceptanceTableRow{cells: cells, columns: columns})
 		}
 	}
-	return result
+	return rows
 }
 
 func collectStableIDs(root string) map[string][]string {

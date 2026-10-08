@@ -3,6 +3,7 @@ package testenv_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -10,6 +11,113 @@ import (
 )
 
 var _ = Describe("双版本一期验收门禁", func() {
+	It("UT-GATE-GH65-005 汇总本次全部 blocking JUnit 并作为 PR、main 与版本发布的最终阻断门禁", func() {
+		By("读取 workflow 并确认版本 tag 与日常变更使用同一套 CI")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		contents, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
+		Expect(err).NotTo(HaveOccurred())
+
+		workflow := map[string]any{}
+		Expect(yaml.Unmarshal(contents, &workflow)).To(Succeed())
+		Expect(string(contents)).To(ContainSubstring("tags:\n      - 'v*'"))
+
+		By("验证最终门禁无论上游成功与否都会把本次 E2E artifact 保存在独立来源目录")
+		jobs := workflow["jobs"].(map[string]any)
+		job, found := jobs["phase1-release-gate"].(map[string]any)
+		Expect(found).To(BeTrue(), "缺少一期最终发布门禁 job")
+		Expect(job["if"]).To(Equal("${{ always() }}"))
+		Expect(job["needs"]).To(ConsistOf("quality", "smoke", "test-environment"))
+		steps := job["steps"].([]any)
+		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("uses", "actions/download-artifact@v4"),
+			HaveKeyWithValue("with", SatisfyAll(
+				HaveKeyWithValue("pattern", "e2e-${{ github.run_id }}-*"),
+				HaveKeyWithValue("path", "artifacts/e2e"),
+				HaveKeyWithValue("merge-multiple", false),
+			)),
+		)))
+		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("uses", "actions/download-artifact@v4"),
+			HaveKeyWithValue("with", SatisfyAll(
+				HaveKeyWithValue("name", "blocking-quality-${{ github.run_id }}"),
+				HaveKeyWithValue("path", "artifacts/quality"),
+			)),
+		)))
+
+		By("验证矩阵全部 163 个 ID 与其中 46 个版本化 E2E 都受本次结果门禁约束")
+		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("name", "校验一期全部 blocking JUnit"),
+			HaveKeyWithValue("run", And(
+				ContainSubstring("go run ./cmd/phase1-gate"),
+				ContainSubstring("--reports artifacts"),
+				ContainSubstring("--expected-blocking-count 163"),
+				ContainSubstring("--expected-e2e-count 46"),
+			)),
+		)))
+
+		By("确认最终门禁还会拒绝任一上游 blocking job 的非成功状态")
+		Expect(steps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("name", "校验全部上游 blocking job"),
+			HaveKeyWithValue("env", SatisfyAll(
+				HaveKeyWithValue("QUALITY_RESULT", "${{ needs.quality.result }}"),
+				HaveKeyWithValue("SMOKE_RESULT", "${{ needs.smoke.result }}"),
+				HaveKeyWithValue("E2E_RESULT", "${{ needs.test-environment.result }}"),
+			)),
+			HaveKeyWithValue("run", And(
+				ContainSubstring(`test "${QUALITY_RESULT}" = success`),
+				ContainSubstring(`test "${SMOKE_RESULT}" = success`),
+				ContainSubstring(`test "${E2E_RESULT}" = success`),
+			)),
+		)))
+
+		By("验证 quality job 同时保存 UT、IT、Helm JUnit 与 unit coverage profile")
+		quality := jobs["quality"].(map[string]any)
+		qualitySteps := quality["steps"].([]any)
+		Expect(qualitySteps).To(ContainElement(SatisfyAll(
+			HaveKeyWithValue("uses", "actions/upload-artifact@v4"),
+			HaveKeyWithValue("with", SatisfyAll(
+				HaveKeyWithValue("name", "blocking-quality-${{ github.run_id }}"),
+				HaveKeyWithValue("path", "artifacts/test-results/"),
+			)),
+		)))
+
+		By("验证成功与失败证据显式保存 Pod digest、StatefulSet 与 PVC 状态")
+		evidenceScript, err := os.ReadFile(filepath.Join(root, "hack", "test-env.sh"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(evidenceScript)).To(ContainSubstring(`get pods --all-namespaces --output yaml`))
+		Expect(string(evidenceScript)).To(ContainSubstring(`get statefulset,pvc --all-namespaces --output yaml`))
+		Expect(string(evidenceScript)).To(ContainSubstring(`persistent-workloads.yaml`))
+		Expect(strings.Count(string(contents), "paths:")).To(Equal(0), "blocking job 不得按 changed paths 跳过")
+	})
+
+	It("UT-GATE-GH65-008 在删除 remote_write fixture 前独立尽力保全失败证据", func() {
+		By("读取 remote_write E2E 并定位业务 fixture 的证据与删除清理")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		Expect(err).NotTo(HaveOccurred())
+		contents, err := os.ReadFile(filepath.Join(root, "test", "e2e", "collection", "remote_write_test.go"))
+		Expect(err).NotTo(HaveOccurred())
+		source := string(contents)
+		cleanupRegistration := strings.Index(source, `DeferCleanup(func(cleanupCtx SpecContext) {
+			deleteResource`)
+		evidenceRegistration := strings.Index(source, `DeferCleanup(func(cleanupCtx SpecContext) {
+			collectGH61Evidence`)
+		firstApply := strings.Index(source, `applyManifest(ctx, gh61KSMManifest)`)
+		Expect(cleanupRegistration).To(BeNumerically(">=", 0))
+		Expect(evidenceRegistration).To(BeNumerically(">", cleanupRegistration), "Ginkgo LIFO 必须先取证再删除 fixture")
+		Expect(firstApply).To(BeNumerically(">", evidenceRegistration), "fixture 部分创建失败时也必须先取证再删除")
+
+		By("验证查询失败不会阻止其他观察点，且覆盖必需证据")
+		Expect(source).To(SatisfyAll(
+			ContainSubstring(`name: "final-statefulset-pvc"`),
+			ContainSubstring(`name: "final-vmselect-query"`),
+			ContainSubstring(`name: "final-shard-0-remote-write-metrics"`),
+			ContainSubstring(`name: "final-shard-1-remote-write-metrics"`),
+			ContainSubstring(`name: "final-vminsert-metrics"`),
+			ContainSubstring(`results := make(chan observationResult, len(observations))`),
+		))
+	})
+
 	It("按两个固定版本和两个 E2E lane 并行运行，并在失败时先保存证据再清理", func() {
 		By("读取 CI workflow 并定位双版本双 lane 验收 job")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -65,7 +173,7 @@ var _ = Describe("双版本一期验收门禁", func() {
 			"ci-${{ github.run_id }}-${{ matrix.run_id_suffix }}-${{ matrix.lane }}",
 		))
 
-		By("验证环境准备、Ginkgo E2E、报告上传和最终清理都是 blocking 步骤")
+		By("验证环境准备、Ginkgo E2E、报告上传、成功或失败证据与最终清理")
 		steps := job["steps"].([]any)
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("uses", "azure/setup-kubectl@v4"),
@@ -91,17 +199,18 @@ var _ = Describe("双版本一期验收门禁", func() {
 			HaveKeyWithValue("if", "${{ always() }}"),
 			HaveKeyWithValue("uses", "actions/upload-artifact@v4"),
 			HaveKeyWithValue("with", SatisfyAll(
-				HaveKeyWithValue("name", "e2e-${{ matrix.run_id_suffix }}-${{ matrix.lane }}-${{ github.run_id }}"),
+				HaveKeyWithValue("name", "e2e-${{ github.run_id }}-${{ matrix.run_id_suffix }}-${{ matrix.lane }}-${{ matrix.kubernetes }}"),
 				HaveKeyWithValue("path", "artifacts/e2e/"),
 			)),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
-			HaveKeyWithValue("name", "失败时保存测试环境证据"),
-			HaveKeyWithValue("if", "${{ failure() }}"),
+			HaveKeyWithValue("name", "保存测试环境证据"),
+			HaveKeyWithValue("if", "${{ always() }}"),
+			HaveKeyWithValue("continue-on-error", true),
 		)))
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("uses", "actions/upload-artifact@v4"),
-			HaveKeyWithValue("if", "${{ failure() }}"),
+			HaveKeyWithValue("if", "${{ always() }}"),
 			HaveKeyWithValue("with", HaveKeyWithValue(
 				"name",
 				"test-environment-${{ matrix.run_id_suffix }}-${{ matrix.lane }}-${{ github.run_id }}",

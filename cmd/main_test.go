@@ -2,47 +2,33 @@ package main
 
 import (
 	"flag"
-	"testing"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
-func TestLeaderElectionFlagCompatibility(t *testing.T) {
-	tests := []struct {
-		name string
-		args []string
-	}{
-		{name: "default remains enabled"},
-		{name: "bare scaffold flag", args: []string{"--leader-elect"}},
-		{name: "explicit true", args: []string{"--leader-elect=true"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+var _ = Describe("manager leader election CLI", func() {
+	DescribeTable("保持兼容入口且始终启用 leader election",
+		func(arguments []string) {
 			options := defaultCLIOptions()
 			flags := flag.NewFlagSet("manager", flag.ContinueOnError)
 			options.bindFlags(flags)
 
-			if err := flags.Parse(tt.args); err != nil {
-				t.Fatalf("parse flags: %v", err)
-			}
-			if err := options.validate(); err != nil {
-				t.Fatalf("validate options: %v", err)
-			}
-			if !options.leaderElection {
-				t.Fatal("leader election must remain enabled")
-			}
-		})
-	}
-}
+			Expect(flags.Parse(arguments)).To(Succeed())
+			Expect(options.validate()).To(Succeed())
+			Expect(options.leaderElection).To(BeTrue())
+		},
+		Entry("default remains enabled", nil),
+		Entry("bare scaffold flag", []string{"--leader-elect"}),
+		Entry("explicit true", []string{"--leader-elect=true"}),
+	)
 
-func TestLeaderElectionCannotBeDisabled(t *testing.T) {
-	options := defaultCLIOptions()
-	flags := flag.NewFlagSet("manager", flag.ContinueOnError)
-	options.bindFlags(flags)
+	It("拒绝关闭 leader election", func() {
+		options := defaultCLIOptions()
+		flags := flag.NewFlagSet("manager", flag.ContinueOnError)
+		options.bindFlags(flags)
 
-	if err := flags.Parse([]string{"--leader-elect=false"}); err != nil {
-		t.Fatalf("parse flags: %v", err)
-	}
-	if err := options.validate(); err == nil {
-		t.Fatal("expected disabling leader election to be rejected")
-	}
-}
+		Expect(flags.Parse([]string{"--leader-elect=false"})).To(Succeed())
+		Expect(options.validate()).To(MatchError(ContainSubstring("--leader-elect=false")))
+	})
+})
