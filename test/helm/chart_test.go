@@ -2,12 +2,15 @@ package helm_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -239,6 +242,22 @@ var _ = Describe("Operator Helm chart", func() {
 		for _, field := range []string{"nodePodResources", "clusterPodResources", "unscheduledPodResources"} {
 			Expect(nested(crd, append(branchPath, field, "type")...)).To(Equal("object"))
 		}
+	})
+
+	It("HELM-GH65-001 patch 发布 CRD 与 v0.1.0 版本基线零漂移", func() {
+		By("读取生成 CRD 和已冻结的 patch 版本基线摘要")
+		root := repositoryRoot()
+		generated, err := os.ReadFile(filepath.Join(root, "config", "crd", "bases", "monitoring.fjsxy.github.io_kubestatemetrics.yaml"))
+		Expect(err).NotTo(HaveOccurred())
+		baseline, err := os.ReadFile(filepath.Join(root, "config", "crd", "baselines", "v0.1.0.sha256"))
+		Expect(err).NotTo(HaveOccurred())
+		fields := strings.Fields(string(baseline))
+		Expect(fields).To(HaveLen(2))
+
+		By("对比完整生成物摘要，阻断 markers 与 Chart 同时改变的 schema 漂移")
+		digest := sha256.Sum256(generated)
+		Expect(hex.EncodeToString(digest[:])).To(Equal(fields[0]))
+		Expect(fields[1]).To(Equal("config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml"))
 	})
 })
 

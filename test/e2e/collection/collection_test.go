@@ -223,7 +223,8 @@ func stableScenarioID(sequence string) string {
 			"003": "E2E-128-COLLECTION-GH59-003",
 		},
 	}
-	if versionIDs, supported := ids[config.kubernetesMinor]; supported {
+	// Ginkgo 在 BeforeSuite 之前注册测试树，因此场景名必须直接读取进程环境。
+	if versionIDs, supported := ids[os.Getenv("KUBERNETES_VERSION")]; supported {
 		if id, found := versionIDs[sequence]; found {
 			return id
 		}
