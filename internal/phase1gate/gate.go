@@ -160,11 +160,9 @@ func VerifyJUnitResults(expected []string, reportsRoot string) (JUnitSummary, er
 		}
 		valid := true
 		for _, outcome := range outcomes {
-			if isE2E {
-				if provenanceProblem := validateJUnitProvenance(id, outcome.Path); provenanceProblem != "" {
-					problems = append(problems, id+" "+provenanceProblem)
-					valid = false
-				}
+			if provenanceProblem := validateJUnitProvenance(id, outcome.Path); provenanceProblem != "" {
+				problems = append(problems, id+" "+provenanceProblem)
+				valid = false
 			}
 			if outcome.Outcome != junitPassed {
 				problems = append(problems, id+" "+string(outcome.Outcome))
@@ -183,6 +181,24 @@ func VerifyJUnitResults(expected []string, reportsRoot string) (JUnitSummary, er
 }
 
 func validateJUnitProvenance(id, path string) string {
+	normalized := "/" + strings.TrimPrefix(filepath.ToSlash(path), "/")
+	switch {
+	case strings.HasPrefix(id, "UT-"):
+		if !strings.Contains(normalized, "/quality/") {
+			return fmt.Sprintf("JUnit 来源不匹配，期望 quality artifact，实际 %s", path)
+		}
+		return ""
+	case strings.HasPrefix(id, "IT-"):
+		if !strings.Contains(normalized, "/quality/integration/") {
+			return fmt.Sprintf("JUnit 来源不匹配，期望 quality/integration，实际 %s", path)
+		}
+		return ""
+	case strings.HasPrefix(id, "HELM-"):
+		if !strings.Contains(normalized, "/quality/helm/") {
+			return fmt.Sprintf("JUnit 来源不匹配，期望 quality/helm，实际 %s", path)
+		}
+		return ""
+	}
 	parts := blockingE2EIDParts.FindStringSubmatch(id)
 	if len(parts) != 3 {
 		return "无法解析版本/lane"
@@ -197,7 +213,6 @@ func validateJUnitProvenance(id, path string) string {
 	if lane == "" {
 		return "没有声明所属 lane"
 	}
-	normalized := filepath.ToSlash(path)
 	wantRunIdentity := "-" + parts[1] + "-" + lane + "-" + version
 	if !strings.Contains(normalized, wantRunIdentity+"/") {
 		return fmt.Sprintf("JUnit 来源不匹配，期望 %s lane 的 Kubernetes %s，实际 %s", lane, version, path)

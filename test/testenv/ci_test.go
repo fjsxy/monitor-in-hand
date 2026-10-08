@@ -91,33 +91,6 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(strings.Count(string(contents), "paths:")).To(Equal(0), "blocking job 不得按 changed paths 跳过")
 	})
 
-	It("UT-GATE-GH65-008 在删除 remote_write fixture 前独立尽力保全失败证据", func() {
-		By("读取 remote_write E2E 并定位业务 fixture 的证据与删除清理")
-		root, err := filepath.Abs(filepath.Join("..", ".."))
-		Expect(err).NotTo(HaveOccurred())
-		contents, err := os.ReadFile(filepath.Join(root, "test", "e2e", "collection", "remote_write_test.go"))
-		Expect(err).NotTo(HaveOccurred())
-		source := string(contents)
-		cleanupRegistration := strings.Index(source, `DeferCleanup(func(cleanupCtx SpecContext) {
-			deleteResource`)
-		evidenceRegistration := strings.Index(source, `DeferCleanup(func(cleanupCtx SpecContext) {
-			collectGH61Evidence`)
-		firstApply := strings.Index(source, `applyManifest(ctx, gh61KSMManifest)`)
-		Expect(cleanupRegistration).To(BeNumerically(">=", 0))
-		Expect(evidenceRegistration).To(BeNumerically(">", cleanupRegistration), "Ginkgo LIFO 必须先取证再删除 fixture")
-		Expect(firstApply).To(BeNumerically(">", evidenceRegistration), "fixture 部分创建失败时也必须先取证再删除")
-
-		By("验证查询失败不会阻止其他观察点，且覆盖必需证据")
-		Expect(source).To(SatisfyAll(
-			ContainSubstring(`name: "final-statefulset-pvc"`),
-			ContainSubstring(`name: "final-vmselect-query"`),
-			ContainSubstring(`name: "final-shard-0-remote-write-metrics"`),
-			ContainSubstring(`name: "final-shard-1-remote-write-metrics"`),
-			ContainSubstring(`name: "final-vminsert-metrics"`),
-			ContainSubstring(`results := make(chan observationResult, len(observations))`),
-		))
-	})
-
 	It("按两个固定版本和两个 E2E lane 并行运行，并在失败时先保存证据再清理", func() {
 		By("读取 CI workflow 并定位双版本双 lane 验收 job")
 		root, err := filepath.Abs(filepath.Join("..", ".."))

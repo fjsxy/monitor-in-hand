@@ -64,9 +64,9 @@ var _ = Describe("一期发布门禁", func() {
 		})
 		writeJUnit(reports, "quality/unit", []junitCase{
 			{name: unitID + " unit"},
-			{name: integrationID + " integration"},
-			{name: helmID + " chart"},
 		})
+		writeJUnit(reports, "quality/integration", []junitCase{{name: integrationID + " integration"}})
+		writeJUnit(reports, "quality/helm", []junitCase{{name: helmID + " chart"}})
 		Expect(os.Rename(
 			filepath.Join(reports, "quality/unit/junit.xml"),
 			filepath.Join(reports, "quality/unit/internal_phase1gate_junit.xml"),
@@ -79,7 +79,7 @@ var _ = Describe("一期发布门禁", func() {
 		)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.Passed).To(Equal(5))
-		Expect(result.ReportFiles).To(Equal(3))
+		Expect(result.ReportFiles).To(Equal(5))
 	})
 
 	It("UT-GATE-GH65-003 拒绝各层缺失或非成功以及 E2E 重复和错误版本/lane", func() {
@@ -96,6 +96,7 @@ var _ = Describe("一期发布门禁", func() {
 		})
 		writeJUnit(reports, "ci-run-119-agent-1.19/collection", []junitCase{
 			{name: "[" + e2eID("119", "006") + "] wrong lane"},
+			{name: skippedUnitID + " wrong artifact"},
 		})
 		writeJUnit(reports, "quality/unit", []junitCase{
 			{name: skippedUnitID + " skipped unit", outcome: "skipped"},
@@ -119,6 +120,7 @@ var _ = Describe("一期发布门禁", func() {
 			ContainSubstring(e2eID("119", "005")+" 出现 2 次"),
 			ContainSubstring(e2eID("119", "006")+" JUnit 来源不匹配"),
 			ContainSubstring(skippedUnitID+" 被跳过"),
+			ContainSubstring(skippedUnitID+" JUnit 来源不匹配"),
 		)))
 
 		By("验证非法 expected 集合在读取报告前失败")

@@ -20,6 +20,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"sigs.k8s.io/yaml"
+
+	collectionsupport "github.com/fjsxy/monitor-in-hand/test/e2e/collection/support"
 )
 
 const (
@@ -56,12 +58,13 @@ var _ = Describe("KubeStateMetrics remote_write 数据链路", Serial, func() {
 
 		By(scenarioID + " 创建两分片 KubeStateMetrics、ServiceMonitor 和两 shard Agent")
 		DeferCleanup(func(cleanupCtx SpecContext) {
-			deleteResource(cleanupCtx, "prometheusagent", gh61AgentName, testNamespace)
-			deleteResource(cleanupCtx, "servicemonitor", gh61AgentName, testNamespace)
-			deleteResource(cleanupCtx, "kubestatemetrics", gh61KSMName, "")
-		})
-		DeferCleanup(func(cleanupCtx SpecContext) {
-			collectGH61Evidence(cleanupCtx, testLabel, clusterID)
+			collectionsupport.CollectBeforeCleanup(cleanupCtx, func(evidenceCtx context.Context) {
+				collectGH61Evidence(evidenceCtx, testLabel, clusterID)
+			}, func(deleteCtx context.Context) {
+				deleteResource(deleteCtx, "prometheusagent", gh61AgentName, testNamespace)
+				deleteResource(deleteCtx, "servicemonitor", gh61AgentName, testNamespace)
+				deleteResource(deleteCtx, "kubestatemetrics", gh61KSMName, "")
+			})
 		})
 		applyManifest(ctx, gh61KSMManifest)
 		applyManifest(ctx, serviceMonitorManifest)
@@ -97,7 +100,7 @@ var _ = Describe("KubeStateMetrics remote_write 数据链路", Serial, func() {
 		By(scenarioID + " 保存两个 Agent shard 的 remote_write 输出指标")
 		for _, pod := range []string{"prom-agent-" + gh61AgentName + "-0", "prom-agent-" + gh61AgentName + "-shard-1-0"} {
 			metrics := waitForGH61Metrics(ctx, "pod/"+pod, 9090, func(contents string) bool {
-				value, found := metricSample(contents, "prometheus_remote_storage_samples_total", `remote_name="`+gh61RemoteWriteName+`"`)
+				value, found := collectionsupport.MetricSample(contents, "prometheus_remote_storage_samples_total", `remote_name="`+gh61RemoteWriteName+`"`)
 				return found && value > 0
 			})
 			AddReportEntry(pod+"-remote-write-metrics", metrics, ReportEntryVisibilityFailureOrVerbose)
@@ -105,7 +108,7 @@ var _ = Describe("KubeStateMetrics remote_write 数据链路", Serial, func() {
 
 		By(scenarioID + " 保存 VictoriaMetrics 已接收 Prometheus remote_write 请求的指标")
 		vminsertMetrics := waitForGH61Metrics(ctx, "service/vminsert", 8480, func(contents string) bool {
-			value, found := metricSample(contents, "vm_http_requests_total", `protocol="promremotewrite"`)
+			value, found := collectionsupport.MetricSample(contents, "vm_http_requests_total", `protocol="promremotewrite"`)
 			return found && value > 0
 		})
 		AddReportEntry("vminsert-receive-metrics", vminsertMetrics, ReportEntryVisibilityFailureOrVerbose)
@@ -391,15 +394,40 @@ func collectGH61Evidence(ctx context.Context, testLabel, clusterID string) {
 		{name: "final-statefulset-pvc", args: []string{"--namespace", testNamespace, "get", "statefulset,pvc", "--output", "yaml"}},
 		{name: "final-ksm", args: []string{"get", "kubestatemetrics", gh61KSMName, "--output", "yaml"}},
 		{name: "final-agent", args: []string{"--namespace", testNamespace, "get", "prometheusagent", gh61AgentName, "--output", "yaml"}},
+		{name: "final-generated-config-secret", args: []string{"--namespace", testNamespace, "get", "secret", "prom-agent-" + gh61AgentName, "--output", "yaml"}},
+		{name: "final-shard-0-logs", args: []string{"--namespace", testNamespace, "logs", "pod/prom-agent-" + gh61AgentName + "-0", "--all-containers=true", "--tail=2000", "--prefix=true"}},
+		{name: "final-shard-1-logs", args: []string{"--namespace", testNamespace, "logs", "pod/prom-agent-" + gh61AgentName + "-shard-1-0", "--all-containers=true", "--tail=2000", "--prefix=true"}},
+		{name: "final-ksm-logs", args: []string{"--namespace", testNamespace, "logs", "--selector", "app.kubernetes.io/name=kube-state-metrics,app.kubernetes.io/instance=" + gh61KSMName, "--all-containers=true", "--tail=2000", "--prefix=true"}},
 	}
+	observations := make([]collectionsupport.Observation, 0, len(commands)+5)
 	for _, command := range commands {
-		output, err := kubectlResult(ctx, command.args...)
-		AddReportEntry(command.name, evidenceBody(output, err), ReportEntryVisibilityFailureOrVerbose)
+		command := command
+		observations = append(observations, collectionsupport.Observation{
+			Name: command.name,
+			Collect: func(collectCtx context.Context) (string, error) {
+				commandCtx, cancel := context.WithTimeout(collectCtx, 15*time.Second)
+				defer cancel()
+				return kubectlResult(commandCtx, command.args...)
+			},
+		})
 	}
+	// 配置尚未生成或读取失败时保留错误证据，不能阻止其他日志和数据面观察。
+	observations = append(observations, collectionsupport.Observation{
+		Name: "final-generated-config",
+		Collect: func(collectCtx context.Context) (string, error) {
+			commandCtx, cancel := context.WithTimeout(collectCtx, 15*time.Second)
+			defer cancel()
+			encoded, err := kubectlResult(commandCtx, "--namespace", testNamespace, "get", "secret", "prom-agent-"+gh61AgentName, "--output", `jsonpath={.data.prometheus\.yaml\.gz}`)
+			if err != nil {
+				return encoded, err
+			}
+			return collectionsupport.DecodeGeneratedConfig(encoded)
+		},
+	})
 
 	// 再对每个数据面观察点做一次有界尽力读取，确保 vmselect 查询失败时仍会尝试保存 remote-write 指标。
 	query := fmt.Sprintf(`kube_pod_info{mih_test_run_id=%q,mih_cluster_id=%q}`, testLabel, clusterID)
-	observations := []struct {
+	httpObservations := []struct {
 		name       string
 		target     string
 		remotePort int
@@ -411,30 +439,17 @@ func collectGH61Evidence(ctx context.Context, testLabel, clusterID string) {
 		{name: "final-shard-1-remote-write-metrics", target: "pod/prom-agent-" + gh61AgentName + "-shard-1-0", remotePort: 9090, path: "/metrics"},
 		{name: "final-vminsert-metrics", target: "service/vminsert", remotePort: 8480, path: "/metrics"},
 	}
-	type observationResult struct {
-		index int
-		body  string
-		err   error
+	for _, observation := range httpObservations {
+		observation := observation
+		observations = append(observations, collectionsupport.Observation{
+			Name: observation.name,
+			Collect: func(collectCtx context.Context) (string, error) {
+				return bestEffortGH61HTTPBody(collectCtx, observation.target, observation.remotePort, observation.path)
+			},
+		})
 	}
-	results := make(chan observationResult, len(observations))
-	for index, observation := range observations {
-		go func(index int, observation struct {
-			name       string
-			target     string
-			remotePort int
-			path       string
-		}) {
-			body, err := bestEffortGH61HTTPBody(ctx, observation.target, observation.remotePort, observation.path)
-			results <- observationResult{index: index, body: body, err: err}
-		}(index, observation)
-	}
-	collected := make([]observationResult, len(observations))
-	for range observations {
-		result := <-results
-		collected[result.index] = result
-	}
-	for index, observation := range observations {
-		AddReportEntry(observation.name, evidenceBody(collected[index].body, collected[index].err), ReportEntryVisibilityFailureOrVerbose)
+	for _, evidence := range collectionsupport.CollectAll(ctx, observations) {
+		AddReportEntry(evidence.Name, evidence.Body, ReportEntryVisibilityFailureOrVerbose)
 	}
 }
 
@@ -462,31 +477,58 @@ func bestEffortGH61HTTPBody(ctx context.Context, target string, remotePort int, 
 		_ = command.Wait()
 	}()
 
-	// 就绪阶段：并行读取 stdout/stderr，等待 kubectl 报告实际绑定的本地端口。
-	lines := make(chan string, 8)
-	readLines := func(reader io.Reader) {
+	// 就绪阶段：并行读取 stdout/stderr，显式保留流读取错误并等待 kubectl 报告实际绑定的本地端口。
+	type streamResult struct {
+		stream string
+		line   string
+		err    error
+		done   bool
+	}
+	lines := make(chan streamResult, 8)
+	readLines := func(stream string, reader io.Reader) {
 		scanner := bufio.NewScanner(reader)
 		for scanner.Scan() {
 			select {
-			case lines <- scanner.Text():
+			case lines <- streamResult{stream: stream, line: scanner.Text()}:
 			case <-evidenceCtx.Done():
 				return
 			}
 		}
+		select {
+		case lines <- streamResult{stream: stream, err: scanner.Err(), done: true}:
+		case <-evidenceCtx.Done():
+		}
 	}
-	go readLines(stdout)
-	go readLines(stderr)
+	go readLines("stdout", stdout)
+	go readLines("stderr", stderr)
 	pattern := regexp.MustCompile(`Forwarding from 127\.0\.0\.1:(\d+)`)
 	port := 0
+	openStreams := 2
+	var transcript []string
 	for port == 0 {
 		select {
-		case line := <-lines:
-			match := pattern.FindStringSubmatch(line)
+		case result := <-lines:
+			if result.err != nil {
+				return "", fmt.Errorf("读取端口转发 %s %s: %w", target, result.stream, result.err)
+			}
+			if result.done {
+				openStreams--
+				if openStreams == 0 {
+					return "", fmt.Errorf("端口转发 %s 在就绪前关闭 stdout/stderr: %s", target, strings.Join(transcript, "; "))
+				}
+				continue
+			}
+			transcript = append(transcript, result.stream+": "+result.line)
+			match := pattern.FindStringSubmatch(result.line)
 			if len(match) == 2 {
-				port, _ = strconv.Atoi(match[1])
+				parsedPort, parseErr := strconv.Atoi(match[1])
+				if parseErr != nil {
+					return "", fmt.Errorf("解析端口转发 %s 本地端口 %q: %w", target, match[1], parseErr)
+				}
+				port = parsedPort
 			}
 		case <-evidenceCtx.Done():
-			return "", fmt.Errorf("端口转发 %s 未就绪: %w", target, evidenceCtx.Err())
+			return "", fmt.Errorf("端口转发 %s 未就绪（%s）: %w", target, strings.Join(transcript, "; "), evidenceCtx.Err())
 		}
 	}
 
@@ -505,32 +547,4 @@ func bestEffortGH61HTTPBody(ctx context.Context, target string, remotePort int, 
 		return string(contents), fmt.Errorf("HTTP status %s", response.Status)
 	}
 	return string(contents), nil
-}
-
-func evidenceBody(body string, err error) string {
-	if err == nil {
-		return body
-	}
-	return fmt.Sprintf("error: %v\n%s", err, body)
-}
-
-func metricSample(contents, metricName, requiredLabel string) (float64, bool) {
-	for _, line := range strings.Split(contents, "\n") {
-		if !strings.HasPrefix(line, metricName+"{") || !strings.Contains(line, requiredLabel) {
-			continue
-		}
-		closingBrace := strings.LastIndexByte(line, '}')
-		if closingBrace == -1 {
-			continue
-		}
-		fields := strings.Fields(line[closingBrace+1:])
-		if len(fields) == 0 {
-			continue
-		}
-		value, err := strconv.ParseFloat(fields[0], 64)
-		if err == nil {
-			return value, true
-		}
-	}
-	return 0, false
 }

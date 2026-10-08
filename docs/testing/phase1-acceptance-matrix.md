@@ -48,10 +48,10 @@
 | `UT-KSM-GH57-001` | #57 | 纯规划 | Kubernetes 1.19 | Go 1.22.12；无外部集群 | 合法 DaemonSetSharded 返回 `UnsupportedMode` 且零资源计划 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-KSM-GH57-002` | #57 | 纯规划 | Kubernetes 1.28 | Go 1.22.12；无外部集群 | 规划 node DaemonSet、cluster/unscheduled companion Deployments、两组 Service，并统一过滤结果与整体 resources 覆盖 | Ginkgo failure | `go test ./internal/kubestatemetrics` |
 | `UT-KSM-GH57-003` | #57 | 纯规划 | 1.19、1.28 | Go 1.22.12；无外部集群 | 判别 union、collector 组合与三角色 resourceClaims 静态错误优先返回 `InvalidSpec` | Ginkgo failure | `go test ./internal/kubestatemetrics` |
-| `UT-KSM-GH57-004` | #57 | E2E 编排 | 本地 gate | Go 1.22.12；无外部集群 | Operator 先由宿主机工具链构建 Linux 二进制，再由 runtime-only Dockerfile 打包并导入 kind；镜像准备在 Ginkgo 进程前完成且不拉取编译器镜像 | Ginkgo failure、Make dry-run 命令顺序 | 双版本 `make e2e-kubestatemetrics` |
+| `UT-KSM-GH57-004` | #57 | E2E 编排 | 本地 gate | Go 1.22.12；无外部集群 | Operator 先由宿主机工具链构建 Linux 二进制，再由 runtime-only Dockerfile 打包并导入 kind；镜像准备在 Ginkgo 进程前完成且不拉取编译器镜像 | Ginkgo failure、Make dry-run 命令顺序 | `make test-unit` |
 | `UT-EXAMPLE-GH59-001` | #59 | 示例/RBAC | 通用 | Go 1.22.12；无外部集群 | 原生 Agent 示例为四类配置使用非空 object/namespace selector，ScrapeConfig 覆盖 static 与五种一期 Kubernetes discovery；统一 runtime ClusterRole 包含所需资源与 `/metrics` 且不含 nodes | Ginkgo failure、示例 manifest | `go test ./test/testenv` |
-| `UT-COLLECTION-GH59-001` | #59 | E2E 支撑 | 通用 | Go 1.22.12；无外部集群 | kubectl 将授权结果写入 stdout、将集群级资源 scope warning 写入 stderr 时，两条流保持分离且拒绝退出状态不丢失 | Ginkgo failure、stdout/stderr、退出码 | 双版本 `make e2e-collection` |
-| `UT-COLLECTION-GH59-002` | #59 | E2E 支撑 | 通用 | Go 1.22.12；无外部集群 | 从格式化 EventList JSON 结构化读取 `InvalidConfiguration` reason，且畸形 JSON 显式报错 | Ginkgo failure、Event JSON | 双版本 `make e2e-collection` |
+| `UT-COLLECTION-GH59-001` | #59 | E2E 支撑 | 通用 | Go 1.22.12；无外部集群 | kubectl 将授权结果写入 stdout、将集群级资源 scope warning 写入 stderr 时，两条流保持分离且拒绝退出状态不丢失 | Ginkgo failure、stdout/stderr、退出码 | `make test-unit` |
+| `UT-COLLECTION-GH59-002` | #59 | E2E 支撑 | 通用 | Go 1.22.12；无外部集群 | 从格式化 EventList JSON 结构化读取 `InvalidConfiguration` reason，且畸形 JSON 显式报错 | Ginkgo failure、Event JSON | `make test-unit` |
 | `UT-PREFLIGHT-GH59-001` | #59 | 预检 CLI | 通用 | Go 1.22.12；无外部集群 | 空 object selector 保持上游合法能力，但严格预检以非零退出拒绝将其报告为一期支持 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-002` | #59 | 预检 CLI | 通用 | Go 1.22.12；无外部集群 | Node、node metadata、FileSD、DNS、LightSail 代表的一期外 ScrapeConfig discovery 均被非零拒绝 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH59-003` | #59 | 预检 CLI | 通用 | Go 1.22.12；无外部集群 | 空 namespace selector 解析为 Operator watch scope 内全部 namespace，声明的配置范围覆盖不足时非零退出 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
@@ -77,15 +77,15 @@
 | `UT-EXAMPLE-GH61-001` | #61 | 示例/Agent 数据面 | 通用 | Go 1.22.12；无外部集群 | 公开 Agent 示例显式固定 Prometheus v2.55.1 版本/镜像、单副本两分片、WAL 压缩、稳定集群标签和无认证无 TLS 的 V1 remote_write 目标，不使用 `additionalArgs` | Ginkgo failure、示例 manifest | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH61-001` | #61 | 预检 CLI/外部标签 | 通用 | Go 1.22.12；无外部集群 | ServiceMonitor、PodMonitor、Probe 或 ScrapeConfig 通过 labels、target label 传播、relabeling、metric relabeling 或显式 `labelmap` 输出产生/修改 `mih_cluster_id` 时，在任何集群访问前非零退出 | NDJSON diagnostics、退出码 | `go test ./test/testenv` |
 | `UT-PREFLIGHT-GH61-002` | #61 | 预检 CLI/兼容边界 | 通用 | Go 1.22.12；无外部集群 | 固定产生其他标签或带非保护前缀的动态 `labelmap` 保持可用，不被 `mih_cluster_id` 保护扫描误拒绝 | NDJSON diagnostics | `go test ./test/testenv` |
-| `UT-COLLECTION-GH61-001` | #61 | E2E 证据解析 | 通用 | Go 1.22.12；无外部集群 | 从 Prometheus text exposition 中按 metric family 与 remote name 精确读取 sample，容忍标签顺序和科学计数法且不误命中其他 remote | Ginkgo failure、metrics 文本 | 双版本 `make e2e-collection` |
+| `UT-COLLECTION-GH61-001` | #61 | E2E 证据解析 | 通用 | Go 1.22.12；无外部集群 | 从 Prometheus text exposition 中按 metric family 与 remote name 精确读取 sample，容忍标签顺序和科学计数法且不误命中其他 remote | Ginkgo failure、metrics 文本 | `make test-unit` |
 | `UT-GATE-GH65-001` | #65 | 验收矩阵门禁 | 通用 | Go 1.22.12；无外部集群 | 从版本化验收矩阵提取唯一的 UT、IT、HELM 和双版本 E2E blocking ID，拒绝空集合与重复登记，并可单独得到 E2E 子集 | Ginkgo failure、矩阵 ID | `go test ./internal/phase1gate` |
-| `UT-GATE-GH65-002` | #65 | JUnit 发布门禁 | 通用 | Go 1.22.12；无外部集群 | 本次 JUnit 为每个 blocking ID 提供成功 testcase，且每个版本化 E2E ID 恰好一次出现在正确版本/lane 时放行；E2E suite 内 UT 的双版本成功结果允许重复 | Ginkgo failure、JUnit 汇总 | `go test ./internal/phase1gate` |
-| `UT-GATE-GH65-003` | #65 | JUnit 发布门禁 | 通用 | Go 1.22.12；无外部集群 | 任一层的 blocking ID 缺失、failure、error 或 skip 均非零拒绝；E2E 额外拒绝重复或错误版本/lane，矩阵外 deferred/optional 诊断不计入通过率 | Ginkgo failure、JUnit 汇总 | `go test ./internal/phase1gate` |
+| `UT-GATE-GH65-002` | #65 | JUnit 发布门禁 | 通用 | Go 1.22.12；无外部集群 | 本次 JUnit 为每个 blocking ID 提供来自对应 quality 层或 E2E 版本/lane 的成功 testcase，且每个版本化 E2E ID 恰好一次出现时放行 | Ginkgo failure、JUnit 汇总 | `go test ./internal/phase1gate` |
+| `UT-GATE-GH65-003` | #65 | JUnit 发布门禁 | 通用 | Go 1.22.12；无外部集群 | 任一层的 blocking ID 缺失、failure、error、skip 或 artifact 来源错误均非零拒绝；E2E 额外拒绝重复，矩阵外 deferred/optional 诊断不计入通过率 | Ginkgo failure、JUnit 汇总 | `go test ./internal/phase1gate` |
 | `UT-GATE-GH65-004` | #65 | unit coverage 门禁 | 通用 | Go 1.22.12；无外部集群 | 只聚合核心包 unit statement coverage，并同时阻断总体低于 80% 或任一核心包低于 70% | Ginkgo failure、coverage profile | `make test-unit` |
 | `UT-GATE-GH65-005` | #65 | CI 发布门禁 | PR、main、版本 tag | Go 1.22.12；无外部集群 | PR、main 与版本 tag 均上传本次 UT、IT、Helm 及四个双版本 lane 的 JUnit；最终 job 阻断任一上游失败、163 个 blocking ID 不完整或其中 46 个 E2E 结果不唯一 | Ginkgo failure、workflow、JUnit artifacts、CI job 状态 | `make test-testenv` |
 | `UT-GATE-GH65-006` | #65 | unit 框架门禁 | 通用 | Go 1.22.12；无外部集群 | 核心 unit test 仅允许 Ginkgo suite `Test*` 入口，拒绝不会进入统一 Ginkgo 报告的普通 Go test | Ginkgo failure、测试源码位置 | `go test ./internal/phase1gate` |
 | `UT-GATE-GH65-007` | #65 | 验收矩阵门禁 | 通用 | Go 1.22.12；无外部集群 | 每条验收记录必须同时具备决策来源、层级、目标版本、前置条件、失败证据和实际测试入口 | Ginkgo failure、矩阵字段 | `go test ./test/testenv` |
-| `UT-GATE-GH65-008` | #65 | E2E 失败证据合约 | 双版本 Agent lane | Go 1.22.12；remote_write E2E fixture | remote_write 场景依赖 Ginkgo LIFO 在删除 fixture 前取证；vmselect 单项失败不中断 StatefulSet/PVC、两 shard remote-write metrics 与 vminsert metrics 的独立尽力采集 | Ginkgo failure、E2E 源码与 report entries | `make test-testenv` |
+| `UT-GATE-GH65-008` | #65 | E2E 失败证据合约 | 双版本 Agent lane | Go 1.22.12；remote_write E2E fixture | remote_write 场景在删除 fixture 前取证；vmselect 单项失败不中断 StatefulSet/PVC、两 shard remote-write metrics 与 vminsert metrics 的独立尽力采集，取证异常时仍执行清理 | Ginkgo failure、独立 evidence 结果与清理顺序 | `make test-unit` |
 
 ## HELM
 
