@@ -45,6 +45,25 @@ var _ = Describe("一期验收矩阵可追溯性", func() {
 		Expect(unscopedAcceptanceIDs(found, allowedLegacy)).To(Equal([]string{"UT-KSM-" + "999"}))
 	})
 
+	const e2eID = "E2E-119-KSM-GH" + "53-001"
+	const pairedE2EID = "E2E-128-KSM-GH" + "53-001"
+	const e2eHeader = "| 场景 ID | 来源 | 验收目的 | 执行步骤 | 执行预期 |\n| --- | --- | --- | --- | --- |\n"
+	DescribeTable("检查 E2E 验收条目的三个必填部分",
+		func(matrix string, want []string) {
+			Expect(missingE2EAcceptanceDetails(matrix)).To(Equal(want))
+		},
+		Entry("完整条目通过", e2eHeader+"| `"+e2eID+"` | #53 | 验证隔离 | 创建两个实例 | 资源互不影响 |", []string(nil)),
+		Entry("验收目的为空", e2eHeader+"| `"+e2eID+"` | #53 | | 创建两个实例 | 资源互不影响 |", []string{e2eID + " 缺少验收目的"}),
+		Entry("执行步骤仅含空白", e2eHeader+"| `"+e2eID+"` | #53 | 验证隔离 | \t | 资源互不影响 |", []string{e2eID + " 缺少执行步骤"}),
+		Entry("执行预期为空", e2eHeader+"| `"+e2eID+"` | #53 | 验证隔离 | 创建两个实例 | |", []string{e2eID + " 缺少执行预期"}),
+		Entry("缺少必填列", "| 场景 ID | 来源 | 验收目的 | 执行预期 |\n| `"+e2eID+"` | #53 | 验证隔离 | 资源互不影响 |", []string{e2eID + " 缺少执行步骤"}),
+		Entry("截断条目不能沿用表头内容", e2eHeader+"| `"+e2eID+"` | #53 | 验证隔离 | 创建两个实例 |", []string{e2eID + " 缺少执行预期"}),
+		Entry("共用一行的两个版本均须完整", e2eHeader+"| `"+e2eID+"` / `"+pairedE2EID+"` | #53 | 验证隔离 | | 资源互不影响 |", []string{e2eID + " 缺少执行步骤", pairedE2EID + " 缺少执行步骤"}),
+		Entry("按列名识别重排后的字段", "| 场景 ID | 执行预期 | 执行步骤 | 验收目的 | 来源 |\n| `"+e2eID+"` | 资源互不影响 | 创建两个实例 | 验证隔离 | #53 |", []string(nil)),
+		Entry("不继承上一张表的表头", e2eHeader+"\n## E2E\n| `"+e2eID+"` | #53 | 验证隔离 | 创建两个实例 | 资源互不影响 |", []string{e2eID + " 缺少验收目的", e2eID + " 缺少执行步骤", e2eID + " 缺少执行预期"}),
+		Entry("其他测试层级保留原有字段", "| 场景 ID | 来源 | 动作与精确断言 |\n| `UT-KSM-GH"+"53-001` | #53 | 返回计划 |", []string(nil)),
+	)
+
 	It("测试源码与矩阵中的稳定场景 ID 双向一致且各自唯一", func() {
 		By("从所有 Go 测试源码收集会进入测试报告的稳定场景 ID")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -67,8 +86,46 @@ var _ = Describe("一期验收矩阵可追溯性", func() {
 		Expect(duplicates(matrixIDs)).To(BeEmpty(), "验收矩阵中的稳定场景 ID 必须唯一")
 		Expect(missingIDs(sourceIDs, matrixIDs)).To(BeEmpty(), "以下测试场景尚未登记到一期验收矩阵")
 		Expect(missingIDs(matrixIDs, sourceIDs)).To(BeEmpty(), "以下矩阵场景没有对应的 Go 测试")
+
+		By("验证每个 E2E case 都明确验收目的、执行步骤和执行预期")
+		Expect(missingE2EAcceptanceDetails(string(matrix))).To(BeEmpty(), "E2E 验收条目的三个部分必须分别填写且不能为空")
 	})
 })
+
+func missingE2EAcceptanceDetails(matrix string) []string {
+	var result []string
+	var columns map[string]int
+	for _, line := range strings.Split(matrix, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "|") {
+			columns = nil
+			continue
+		}
+		cells := strings.Split(strings.Trim(line, "|"), "|")
+		if strings.TrimSpace(cells[0]) == "场景 ID" {
+			// 按当前表的列名定位必填部分，避免重排字段后校验错列。
+			columns = map[string]int{}
+			for index, cell := range cells {
+				columns[strings.TrimSpace(cell)] = index
+			}
+			continue
+		}
+
+		// 同一行可以登记两个版本；缺列、短行和空白内容都逐个归属到稳定 ID。
+		for _, id := range stableAcceptanceID.FindAllString(cells[0], -1) {
+			if !strings.HasPrefix(id, "E2E-") {
+				continue
+			}
+			for _, field := range []string{"验收目的", "执行步骤", "执行预期"} {
+				index, found := columns[field]
+				if !found || index >= len(cells) || strings.TrimSpace(cells[index]) == "" {
+					result = append(result, id+" 缺少"+field)
+				}
+			}
+		}
+	}
+	return result
+}
 
 func collectStableIDs(root string) map[string][]string {
 	result := map[string][]string{}

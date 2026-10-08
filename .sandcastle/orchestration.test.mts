@@ -94,6 +94,7 @@ test("prompt 模板中的变量都有调度参数", () => {
   const builtInArgs = new Set(["SOURCE_BRANCH", "TARGET_BRANCH"]);
 
   for (const path of [
+    ".sandcastle/e2e-plan-prompt.md",
     ".sandcastle/implement-prompt.md",
     ".sandcastle/review-prompt.md",
     ".sandcastle/merge-conflict-prompt.md",

@@ -23,6 +23,7 @@
 
 ## GitHub 生命周期
 
+- 实现前按 `docs/agents/issue-tracker.md` 完成 E2E 计划评论；宿主发布并回读成功后才启动实现，规划阶段保持工作树与 HEAD 不变。
 - 本地实现完成不等于 Issue 完成。
 - implementer、reviewer 和 conflict resolver 不自行 push、merge 或关闭 Issue。
 - merge 流程只合并 code-review 已完成且全部 CI checks 成功的 head，并固定使用 rebase merge；冲突解决产生新 head 后必须重新 review 和等待 CI。

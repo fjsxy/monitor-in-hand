@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-本项目使用 GitHub Issues 管理 issues 和 specs。详见 `docs/agents/issue-tracker.md`。
+实现任何 Issue/ticket 前，必须完成领取、整理并发布相关 E2E case 评论、回读验证，再开始改代码。本项目使用 GitHub Issues 管理 issues 和 specs；完整流程见 `docs/agents/issue-tracker.md`。
 
 ### Triage labels
 

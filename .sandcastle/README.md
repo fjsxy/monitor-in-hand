@@ -7,6 +7,7 @@
 - 从 Issue 的 `## Blocked by` 章节确定性计算 frontier，不调用模型重新猜依赖。
 - 只选择无人认领或已经由当前 GitHub 用户认领的 ticket。
 - 启动 agent 前串行执行 `gh issue edit <n> --add-assignee @me` 并回读验证。
+- 领取后先运行只读 E2E planner，按验收矩阵格式整理相关 case；宿主校验草稿、发布 Issue 评论并回读一致后才启动 implementer。规划修改工作树、格式不完整、发布失败或回读失败均停止实现。当前 Issue 正文未变时复用已发布的有效计划，需求变化后重新整理。
 - 每个 ticket 使用 `codex/issue-<n>` 独立分支和 Sandcastle worktree。
 - 默认最多并行 3 个 ticket，每个 implementer 最多运行 3 次。
 - implementer 和 reviewer 只在隔离 sandbox 中运行；sandbox 不挂载宿主 Docker socket，也不运行 DinD。

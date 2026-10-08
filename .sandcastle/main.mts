@@ -21,6 +21,12 @@ import {
 import { createGitHubMergeOperations } from "./github-merge.mts";
 import { createIssueSandboxProvider } from "./sandbox.mts";
 import {
+  assertE2EPlanningReadOnly,
+  createGitHubE2EPlanOperations,
+  extractE2EPlan,
+  runWithE2EPlan,
+} from "./e2e-plan.mts";
+import {
   createSerialE2EGate,
   ensureLocalE2E,
   runLocalE2EGate,
@@ -304,14 +310,55 @@ async function executeIssue(
     });
 
     try {
-      const implementation = await sandbox.run(
-        withAgentIdleTimeout(idleTimeoutSeconds, {
-          name: `issue-${issue.number}-implement`,
-          agent,
-          maxIterations,
-          promptFile: "./.sandcastle/implement-prompt.md",
-          promptArgs,
+      // 领取后重新读取当前范围；E2E 计划先由只读 planner 整理，再由宿主发布和回读。
+      const claimedIssue = JSON.parse(command("gh", [
+        "issue", "view", String(issue.number), "--json", "number,title,body,state,labels,assignees",
+      ])) as IssueRecord;
+      if (!isAgentTicket(claimedIssue) || claimedIssue.assignees.length === 0) {
+        throw new Error(`#${issue.number} 已退出 ready-for-agent 实现范围或领取已被撤销。`);
+      }
+      const matrix = readFileSync(resolve(sandbox.worktreePath, "docs/testing/phase1-acceptance-matrix.md"), "utf8");
+      const implementation = await runWithE2EPlan(
+        claimedIssue,
+        matrix,
+        createGitHubE2EPlanOperations(issue.number, repoRoot, async () => {
+          const git = (args: string[]) => execFileSync("git", args, {
+            cwd: sandbox.worktreePath, encoding: "utf8",
+          }).trim();
+          const beforeHead = git(["rev-parse", "HEAD"]);
+          const planning = await sandbox.run(withAgentIdleTimeout(idleTimeoutSeconds, {
+            name: `issue-${issue.number}-e2e-plan`,
+            agent,
+            maxIterations: 1,
+            promptFile: "./.sandcastle/e2e-plan-prompt.md",
+            promptArgs,
+            completionSignal: "<promise>E2E_PLAN_READY</promise>",
+          }));
+          assertE2EPlanningReadOnly(
+            planning.commits, beforeHead,
+            git(["rev-parse", "HEAD"]), git(["status", "--porcelain"]),
+          );
+          if (!planning.completionSignal) throw new Error(`#${issue.number} E2E 规划未完成。`);
+          return extractE2EPlan(planning.stdout);
         }),
+        async (comment) => {
+          const currentIssue = JSON.parse(command("gh", [
+            "issue", "view", String(issue.number), "--json", "number,title,body,state,labels,assignees",
+          ])) as IssueRecord;
+          if (!isAgentTicket(currentIssue) || currentIssue.body !== claimedIssue.body ||
+              currentIssue.assignees.length !== claimedIssue.assignees.length ||
+              currentIssue.assignees.some((assignee) => !claimedIssue.assignees.some((owner) => owner.login === assignee.login))) {
+            throw new Error(`#${issue.number} 的范围或领取状态在 E2E 规划期间发生变化，停止实现。`);
+          }
+          console.log(`#${issue.number} 实现前 E2E 计划已发布并回读：${comment.url}`);
+          return sandbox.run(withAgentIdleTimeout(idleTimeoutSeconds, {
+            name: `issue-${issue.number}-implement`,
+            agent,
+            maxIterations,
+            promptFile: "./.sandcastle/implement-prompt.md",
+            promptArgs,
+          }));
+        },
       );
 
       if (!implementation.completionSignal) {
