@@ -1,4 +1,4 @@
-package kubestatemetrics_test
+package kubestatemetricssupport_test
 
 import (
 	"context"
@@ -15,8 +15,7 @@ import (
 var _ = Describe("E2E orchestration contracts", func() {
 	It("[UT-KSM-GH57-004] 镜像准备不占用 Ginkgo setup 时间预算", func() {
 		By("从公开 Make 入口读取实际 E2E 编排")
-		// 通过公开 Make 入口读取实际编排，避免在测试中复制 shell 行为或调用 Docker。
-		repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
+		repoRoot, err := filepath.Abs(filepath.Join("..", "..", "..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -34,7 +33,6 @@ var _ = Describe("E2E orchestration contracts", func() {
 		Expect(err).NotTo(HaveOccurred(), string(output))
 
 		By("验证宿主构建、runtime 镜像、kind 导入与 Ginkgo 的严格顺序")
-		// 镜像准备必须先用宿主机工具链生成 Linux 二进制，避免冷 Docker 构建等待编译器镜像元数据。
 		plan := string(output)
 		hostBuildAt := strings.Index(plan, "CGO_ENABLED=0 GOOS=linux go build")
 		buildAt := strings.Index(plan, `docker build --file test/e2e/kubestatemetrics/Dockerfile --tag "docker.io/fjsxy/monitor-in-hand:0.1.0" bin/e2e-kubestatemetrics`)
@@ -47,7 +45,6 @@ var _ = Describe("E2E orchestration contracts", func() {
 		Expect(hostBuildAt < buildAt && buildAt < loadAt && loadAt < ginkgoAt).To(BeTrue(), plan)
 
 		By("验证 E2E 镜像定义只有不依赖 Go toolchain 的 runtime stage")
-		// 读取公开编排引用的镜像定义，锁定 Docker 阶段不再依赖远端 Go 编译器镜像。
 		dockerfile, err := os.ReadFile(filepath.Join(repoRoot, "test", "e2e", "kubestatemetrics", "Dockerfile"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(dockerfile)).NotTo(ContainSubstring("FROM golang:"))

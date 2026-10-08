@@ -91,6 +91,11 @@ test-unit: ## Run control-plane unit tests and enforce phase-one statement cover
 		--cover --covermode=atomic --coverprofile=unit.out ./internal/...
 	$(GINKGO) --fail-on-pending --fail-on-empty \
 		--junit-report=junit.xml --output-dir="$(UNIT_REPORT_DIR)" ./cmd
+	mkdir -p "$(UNIT_REPORT_DIR)/collection-support" "$(UNIT_REPORT_DIR)/kubestatemetrics-support"
+	$(GINKGO) --fail-on-pending --fail-on-empty \
+		--junit-report=junit.xml --output-dir="$(UNIT_REPORT_DIR)/collection-support" ./test/e2e/collection/support
+	$(GINKGO) --fail-on-pending --fail-on-empty \
+		--junit-report=junit.xml --output-dir="$(UNIT_REPORT_DIR)/kubestatemetrics-support" ./test/e2e/kubestatemetrics/support
 	go run ./cmd/phase1-gate --coverage-profile "$(UNIT_COVERAGE_PROFILE)" \
 		--aggregate-coverage 80 --package-coverage 70
 
