@@ -1,6 +1,7 @@
 package kubestatemetrics_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -315,6 +316,7 @@ spec:
 		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
 			HaveLen(3), HaveExactElements("--resources=pods", HavePrefix("--namespaces="), `--node=""`),
 		))
+		var sharedNamespaces []string
 		for _, args := range [][]string{
 			node.Spec.Template.Spec.Containers[0].Args,
 			cluster.Spec.Template.Spec.Containers[0].Args,
@@ -322,8 +324,13 @@ spec:
 		} {
 			effectiveNamespaces, namespaceErr := namespacesFromArgs(args)
 			Expect(namespaceErr).NotTo(HaveOccurred())
-			Expect(effectiveNamespaces).To(Equal([]string{targetNamespace}))
+			if sharedNamespaces == nil {
+				sharedNamespaces = effectiveNamespaces
+				continue
+			}
+			Expect(effectiveNamespaces).To(Equal(sharedNamespaces))
 		}
+		Expect(sharedNamespaces).To(ContainElement(targetNamespace))
 		instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", defaultDaemonInstanceName)
 		Expect(err).NotTo(HaveOccurred())
 		assertOwnerReference(node, string(instance.UID))
@@ -405,17 +412,10 @@ func sharedCollectorCatalogWithoutPods() []string {
 func endpointPodNames(ctx SpecContext, serviceName string, expectedCount int, expectedPrefixes ...string) []string {
 	var podNames []string
 	Eventually(func() error {
-		endpoints, err := getObject[corev1.Endpoints](ctx, targetNamespace, "endpoints", serviceName)
+		var err error
+		podNames, err = readyEndpointPodNames(ctx, serviceName)
 		if err != nil {
 			return err
-		}
-		podNames = podNames[:0]
-		for _, subset := range endpoints.Subsets {
-			for _, address := range subset.Addresses {
-				if address.TargetRef != nil && address.TargetRef.Kind == "Pod" {
-					podNames = append(podNames, address.TargetRef.Name)
-				}
-			}
 		}
 		if len(podNames) != expectedCount {
 			return fmt.Errorf("Service %s ready Pod endpoints=%v，期望数量 %d", serviceName, podNames, expectedCount)
@@ -436,4 +436,21 @@ func endpointPodNames(ctx SpecContext, serviceName string, expectedCount int, ex
 	}, 2*time.Minute, 2*time.Second).Should(Succeed())
 	sort.Strings(podNames)
 	return podNames
+}
+
+func readyEndpointPodNames(ctx context.Context, serviceName string) ([]string, error) {
+	endpoints, err := getObject[corev1.Endpoints](ctx, targetNamespace, "endpoints", serviceName)
+	if err != nil {
+		return nil, err
+	}
+	podNames := make([]string, 0)
+	for _, subset := range endpoints.Subsets {
+		for _, address := range subset.Addresses {
+			if address.TargetRef != nil && address.TargetRef.Kind == "Pod" {
+				podNames = append(podNames, address.TargetRef.Name)
+			}
+		}
+	}
+	sort.Strings(podNames)
+	return podNames, nil
 }
