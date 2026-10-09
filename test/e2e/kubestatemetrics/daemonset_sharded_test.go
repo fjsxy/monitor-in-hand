@@ -315,6 +315,15 @@ spec:
 		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
 			HaveLen(3), HaveExactElements("--resources=pods", HavePrefix("--namespaces="), `--node=""`),
 		))
+		for _, args := range [][]string{
+			node.Spec.Template.Spec.Containers[0].Args,
+			cluster.Spec.Template.Spec.Containers[0].Args,
+			unscheduled.Spec.Template.Spec.Containers[0].Args,
+		} {
+			effectiveNamespaces, namespaceErr := namespacesFromArgs(args)
+			Expect(namespaceErr).NotTo(HaveOccurred())
+			Expect(effectiveNamespaces).To(Equal([]string{targetNamespace}))
+		}
 		instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", defaultDaemonInstanceName)
 		Expect(err).NotTo(HaveOccurred())
 		assertOwnerReference(node, string(instance.UID))
@@ -327,6 +336,7 @@ spec:
 
 		By("从两组 endpoints 读取真实指标，验证三角色不重复采集")
 		nodePodNames := endpointPodNames(ctx, defaultDaemonManagedName, int(desiredNodes))
+		scheduledPodName := nodePodNames[0]
 		for _, podName := range nodePodNames {
 			assertTargetMetricsBody(ctx, "pod/"+podName, 8080, func(body []byte) error {
 				metrics := string(body)
@@ -345,7 +355,8 @@ spec:
 					if !strings.Contains(metrics, "kube_deployment_created") || strings.Contains(metrics, "kube_pod_info") {
 						return fmt.Errorf("cluster 角色指标边界不符合预期")
 					}
-				} else if !strings.Contains(metrics, `pod="`+defaultUnscheduledProbe+`"`) || strings.Contains(metrics, "kube_deployment_created") {
+				} else if !strings.Contains(metrics, `pod="`+defaultUnscheduledProbe+`"`) ||
+					strings.Contains(metrics, `pod="`+scheduledPodName+`"`) || strings.Contains(metrics, "kube_deployment_created") {
 					return fmt.Errorf("unscheduled 角色指标边界不符合预期")
 				}
 				return nil
