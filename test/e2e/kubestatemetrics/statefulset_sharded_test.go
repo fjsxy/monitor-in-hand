@@ -460,8 +460,7 @@ spec:
 			}
 			return nil
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
-		currentPodNames := endpointPodNames(ctx, gh82ManagedName, 2)
-		expectPodsReplaced(ctx, currentPodNames, baselineUIDs)
+		currentPodNames := replacedEndpointPodNames(ctx, gh82ManagedName, 2, baselineUIDs)
 		for ordinal, podName := range currentPodNames {
 			pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
 			Expect(getErr).NotTo(HaveOccurred())
