@@ -319,10 +319,35 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
 		Expect(deployment.ResourceVersion).NotTo(Equal(driftedResourceVersion))
 		Expect(deployment.Spec.Template.Spec.Containers[0].Args).NotTo(ContainElement(HavePrefix("--resources")))
-		Expect(deployment.OwnerReferences).To(ContainElement(HaveField("UID", actual.UID)))
+		Expect(deployment.OwnerReferences).To(HaveLen(1))
+		owner := deployment.OwnerReferences[0]
+		Expect(owner).To(SatisfyAll(
+			HaveField("APIVersion", monitoringv1alpha1.GroupVersion.String()),
+			HaveField("Kind", "KubeStateMetrics"),
+			HaveField("Name", name),
+			HaveField("UID", actual.UID),
+		))
+		Expect(owner.Controller).NotTo(BeNil())
+		Expect(*owner.Controller).To(BeTrue())
 		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 		Expect(actual.Generation).To(Equal(generation))
-		Expect(actual.Status.EffectiveCollectors).To(Equal(defaultCollectorCatalog()))
+		Expect(actual.Status).To(SatisfyAll(
+			HaveField("ObservedGeneration", generation),
+			HaveField("AppliedTargetNamespace", namespace),
+			HaveField("KubeStateMetricsVersion", "2.11.0"),
+			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDeployment),
+			HaveField("DesiredPods", int32(1)),
+			HaveField("AvailablePods", int32(0)),
+			HaveField("EffectiveCollectors", Equal(defaultCollectorCatalog())),
+			HaveField("EffectiveNamespaceCount", BeNumerically(">", 0)),
+			HaveField("ManagedResources", ConsistOf(
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "ServiceAccount", Namespace: namespace, Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole", Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding", Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "Service", Namespace: namespace, Name: resourceName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "apps/v1", Kind: "Deployment", Namespace: namespace, Name: resourceName},
+			)),
+		))
 	})
 
 	DescribeTable("IT-KSM-002 在前置条件失败时只更新 status 且零写入",

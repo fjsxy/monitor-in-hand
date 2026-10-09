@@ -211,13 +211,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 
 		By("验证固定 catalog、Default 省略 resources 参数与省略容器资源的行为")
 		Expect(problem).To(BeNil())
-		Expect(plan.EffectiveCollectors).To(Equal([]string{
-			"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
-			"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
-			"namespaces", "networkpolicies", "nodes", "persistentvolumeclaims", "persistentvolumes", "poddisruptionbudgets",
-			"pods", "replicasets", "replicationcontrollers", "resourcequotas", "secrets", "services", "statefulsets",
-			"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
-		}))
+		Expect(plan.EffectiveCollectors).To(Equal(expectedDefaultCollectors()))
 		deployment := deploymentFrom(plan)
 		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--namespaces=monitoring"}))
 		Expect(deployment.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{}))
@@ -227,13 +221,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 	)
 
 	DescribeTable("UT-KSM-GH81-001 按 collector 模式和部署拓扑保持 resources 参数边界", func(kubernetesVersion string, daemonSetShardedSupported bool) {
-		wantDefaultCollectors := []string{
-			"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
-			"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
-			"namespaces", "networkpolicies", "nodes", "persistentvolumeclaims", "persistentvolumes", "poddisruptionbudgets",
-			"pods", "replicasets", "replicationcontrollers", "resourcequotas", "secrets", "services", "statefulsets",
-			"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
-		}
+		wantDefaultCollectors := expectedDefaultCollectors()
 		facts := ksm.ClusterFacts{
 			KubernetesVersion:     kubernetesVersion,
 			TargetNamespaceExists: true,
@@ -1000,6 +988,16 @@ func policyRulesAllow(rules []rbacv1.PolicyRule, apiGroup, resource, verb string
 		}
 	}
 	return false
+}
+
+func expectedDefaultCollectors() []string {
+	return []string{
+		"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
+		"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
+		"namespaces", "networkpolicies", "nodes", "persistentvolumeclaims", "persistentvolumes", "poddisruptionbudgets",
+		"pods", "replicasets", "replicationcontrollers", "resourcequotas", "secrets", "services", "statefulsets",
+		"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
+	}
 }
 
 func deploymentFrom(plan *ksm.ResourcePlan) *appsv1.Deployment {
