@@ -1489,13 +1489,13 @@ func assertTargetMetricsBody(ctx SpecContext, target string, remotePort int, ver
 	command.Stdout = logBuffer
 	command.Stderr = logBuffer
 	Expect(command.Start()).To(Succeed())
-	// 场景结束时清理转发进程，避免多个真实 workload 验收相互干扰。
-	DeferCleanup(func() {
+	// 单次抓取结束即清理转发进程，避免 Eventually 重试时累积旧连接。
+	defer func() {
 		if command.Process != nil {
 			_ = command.Process.Kill()
 			_, _ = command.Process.Wait()
 		}
-	})
+	}()
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	// 在有界时间内等待 metrics endpoint 可用，并验证允许与拒绝集合。
