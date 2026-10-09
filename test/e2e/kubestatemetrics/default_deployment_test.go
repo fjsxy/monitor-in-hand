@@ -28,6 +28,8 @@ import (
 
 const (
 	operatorNamespace   = "monitor-in-hand-system"
+	operatorDeployment  = "monitor-in-hand-monitor-in-hand"
+	operatorPodSelector = "app.kubernetes.io/name=monitor-in-hand,app.kubernetes.io/instance=monitor-in-hand"
 	targetNamespace     = "monitor-in-hand-test"
 	instanceName        = "default-deployment"
 	managedName         = "ksm-default-deployment"
@@ -206,7 +208,7 @@ spec:
 	}, SpecTimeout(15*time.Minute))
 
 	It(fmt.Sprintf("[%s] 已有 Default 实例不修改 CR 即收敛到上游默认参数", defaultConvergenceScenarioID()), func(ctx SpecContext) {
-		By("提交显式 Default 实例并记录 CR generation、Pod UID 与所有权")
+		By("提交显式 Default 实例并记录 CR generation、身份与所有权")
 		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
 kind: KubeStateMetrics
 metadata:
@@ -223,67 +225,144 @@ spec:
 		generation := instance.Generation
 		ownerUID := instance.UID
 		managedResources := append([]monitoringv1alpha1.ManagedResourceReference(nil), instance.Status.ManagedResources...)
-		initialPodName := endpointPodNames(ctx, convergenceWorkload, 1)[0]
-		initialPod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", initialPodName)
-		Expect(err).NotTo(HaveOccurred())
 
-		By("不修改 CR，将已拥有 Deployment 改成旧式显式 28 项 resources 参数")
+		By("暂停测试 fixture 的 Operator，并确认其 Pod 已消失")
+		operatorNeedsRestore := false
+		DeferCleanup(func(cleanupCtx SpecContext) {
+			if operatorNeedsRestore {
+				restoreOperator(cleanupCtx)
+			}
+		}, NodeTimeout(3*time.Minute))
+		operatorNeedsRestore = true
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", operatorNamespace,
+			"scale", "deployment/"+operatorDeployment, "--replicas=0")
+		Eventually(func() error {
+			pods, listErr := getObjects[corev1.PodList](ctx, operatorNamespace, "pods", operatorPodSelector)
+			if listErr != nil {
+				return listErr
+			}
+			if len(pods.Items) != 0 {
+				return fmt.Errorf("Operator Pod 尚未消失: %v", podNames(pods.Items))
+			}
+			return nil
+		}, 2*time.Minute, time.Second).Should(Succeed())
+
+		By("不修改 CR，将已拥有 Deployment 改成旧式显式 28 项 resources 参数并等待真实 Pod 就绪")
 		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
 		Expect(err).NotTo(HaveOccurred())
 		initialDeploymentGeneration := deployment.Generation
-		driftedArgs := append([]string{"--resources=" + strings.Join(sharedCollectorCatalog(), ",")}, deployment.Spec.Template.Spec.Containers[0].Args...)
+		legacyResourcesArg := "--resources=" + strings.Join(sharedCollectorCatalog(), ",")
+		driftedArgs := append([]string{legacyResourcesArg}, deployment.Spec.Template.Spec.Containers[0].Args...)
 		patch, err := json.Marshal([]map[string]any{{
 			"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": driftedArgs,
 		}})
 		Expect(err).NotTo(HaveOccurred())
-		// 直接校验 PATCH 响应中的服务端对象，避免 owner watch 在后续 GET 前已恢复期望状态造成竞态。
 		drifted, err := patchObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload, patch)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(drifted.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--resources=" + strings.Join(sharedCollectorCatalog(), ",")))
+		Expect(drifted.Spec.Template.Spec.Containers[0].Args).To(ContainElement(legacyResourcesArg))
 		Expect(drifted.Generation).To(BeNumerically(">", initialDeploymentGeneration))
 		driftedGeneration := drifted.Generation
-
-		By("等待 Operator 恢复期望 Pod template，并验证 Pod 更新、可用性和实例不变量")
+		var legacyPodUID types.UID
 		Eventually(func() error {
 			current, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
 			if getErr != nil {
 				return getErr
 			}
-			if current.Generation <= driftedGeneration || current.Status.AvailableReplicas != 1 {
-				return fmt.Errorf("Deployment 尚未在漂移后恢复: generation=%d drifted=%d available=%d", current.Generation, driftedGeneration, current.Status.AvailableReplicas)
+			if current.Generation != driftedGeneration || current.Status.ObservedGeneration != driftedGeneration ||
+				current.Status.Replicas != 1 || current.Status.UpdatedReplicas != 1 || current.Status.ReadyReplicas != 1 ||
+				current.Status.AvailableReplicas != 1 || current.Status.UnavailableReplicas != 0 {
+				return fmt.Errorf("旧参数 Deployment rollout 尚未完成: generation=%d observed=%d replicas=%d updated=%d ready=%d available=%d unavailable=%d",
+					current.Generation, current.Status.ObservedGeneration, current.Status.Replicas, current.Status.UpdatedReplicas,
+					current.Status.ReadyReplicas, current.Status.AvailableReplicas, current.Status.UnavailableReplicas)
+			}
+			readyPodNames, getErr := readyEndpointPodNames(ctx, convergenceWorkload)
+			if getErr != nil {
+				return getErr
+			}
+			if len(readyPodNames) != 1 {
+				return fmt.Errorf("旧参数 Service ready Pod endpoints=%v，期望数量 1", readyPodNames)
+			}
+			legacyPod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", readyPodNames[0])
+			if getErr != nil {
+				return getErr
+			}
+			if !podIsReady(legacyPod) || !contains(legacyPod.Spec.Containers[0].Args, legacyResourcesArg) {
+				return fmt.Errorf("旧参数 Pod 尚未就绪: pod=%s args=%v", legacyPod.Name, legacyPod.Spec.Containers[0].Args)
+			}
+			legacyPodUID = legacyPod.UID
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+
+		By("恢复 Operator，并等待其重新可用")
+		restoreOperator(ctx)
+		operatorNeedsRestore = false
+
+		By("等待新参数模板和真实 Ready Pod 同时收敛，并验证实例不变量")
+		Eventually(func() error {
+			current, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
+			if getErr != nil {
+				return getErr
+			}
+			if current.Generation <= driftedGeneration || current.Status.ObservedGeneration != current.Generation ||
+				current.Status.Replicas != 1 || current.Status.UpdatedReplicas != 1 || current.Status.ReadyReplicas != 1 || current.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("Deployment 尚未在旧参数基线后恢复: generation=%d drifted=%d observed=%d replicas=%d updated=%d ready=%d available=%d",
+					current.Generation, driftedGeneration, current.Status.ObservedGeneration, current.Status.Replicas,
+					current.Status.UpdatedReplicas, current.Status.ReadyReplicas, current.Status.AvailableReplicas)
 			}
 			for _, argument := range current.Spec.Template.Spec.Containers[0].Args {
 				if strings.HasPrefix(argument, "--resources") {
 					return fmt.Errorf("Deployment 仍包含 resources 参数: %v", current.Spec.Template.Spec.Containers[0].Args)
 				}
 			}
+			if current.Spec.Template.Spec.Containers[0].Image != active.image {
+				return fmt.Errorf("Deployment image=%q，期望 %q", current.Spec.Template.Spec.Containers[0].Image, active.image)
+			}
+			effectiveNamespaces, namespaceErr := namespacesFromArgs(current.Spec.Template.Spec.Containers[0].Args)
+			if namespaceErr != nil || !contains(effectiveNamespaces, targetNamespace) {
+				return fmt.Errorf("Deployment namespace 参数未保持有效: namespaces=%v err=%v", effectiveNamespaces, namespaceErr)
+			}
+			owners := current.GetOwnerReferences()
+			if len(owners) != 1 || owners[0].UID != ownerUID || owners[0].Controller == nil || !*owners[0].Controller {
+				return fmt.Errorf("Deployment ownerReference 未保持当前实例所有权: %v", owners)
+			}
+			readyPodNames, getErr := readyEndpointPodNames(ctx, convergenceWorkload)
+			if getErr != nil {
+				return getErr
+			}
+			if len(readyPodNames) != 1 {
+				return fmt.Errorf("新参数 Service ready Pod endpoints=%v，期望数量 1", readyPodNames)
+			}
+			finalPod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", readyPodNames[0])
+			if getErr != nil {
+				return getErr
+			}
+			if !podIsReady(finalPod) || finalPod.UID == legacyPodUID {
+				return fmt.Errorf("新参数 Pod 尚未完成更新: pod=%s uid=%s legacyUID=%s ready=%t",
+					finalPod.Name, finalPod.UID, legacyPodUID, podIsReady(finalPod))
+			}
+			for _, argument := range finalPod.Spec.Containers[0].Args {
+				if strings.HasPrefix(argument, "--resources") {
+					return fmt.Errorf("新 Ready Pod 仍包含 resources 参数: pod=%s args=%v", finalPod.Name, finalPod.Spec.Containers[0].Args)
+				}
+			}
 			currentInstance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", convergenceName)
 			if getErr != nil {
 				return getErr
 			}
-			if currentInstance.Generation != generation || currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady ||
-				currentInstance.Status.ObservedGeneration != generation || currentInstance.Status.AvailablePods != 1 {
-				return fmt.Errorf("CR 未在原 generation 上收敛: generation=%d observed=%d phase=%s available=%d",
-					currentInstance.Generation, currentInstance.Status.ObservedGeneration, currentInstance.Status.Phase, currentInstance.Status.AvailablePods)
+			if currentInstance.Generation != generation || currentInstance.UID != ownerUID ||
+				currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || currentInstance.Status.ObservedGeneration != generation ||
+				currentInstance.Status.AvailablePods != 1 || currentInstance.Status.KubeStateMetricsVersion != active.version ||
+				!equalStrings(currentInstance.Status.EffectiveCollectors, sharedCollectorCatalog()) ||
+				!equalManagedResources(currentInstance.Status.ManagedResources, managedResources) {
+				return fmt.Errorf("CR 未在原身份和 generation 上完整收敛: uid=%s generation=%d observed=%d phase=%s available=%d version=%s collectors=%v managed=%v",
+					currentInstance.UID, currentInstance.Generation, currentInstance.Status.ObservedGeneration, currentInstance.Status.Phase,
+					currentInstance.Status.AvailablePods, currentInstance.Status.KubeStateMetricsVersion,
+					currentInstance.Status.EffectiveCollectors, currentInstance.Status.ManagedResources)
 			}
 			return nil
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
-		finalPodName := endpointPodNames(ctx, convergenceWorkload, 1)[0]
-		finalPod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", finalPodName)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(finalPod.UID).NotTo(Equal(initialPod.UID))
-		instance, err = getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", convergenceName)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(instance.Status.KubeStateMetricsVersion).To(Equal(active.version))
-		Expect(instance.Status.EffectiveCollectors).To(Equal(sharedCollectorCatalog()))
-		Expect(instance.Status.ManagedResources).To(Equal(managedResources))
-		deployment, err = getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
-		effectiveNamespaces, err := namespacesFromArgs(deployment.Spec.Template.Spec.Containers[0].Args)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(effectiveNamespaces).To(ContainElement(targetNamespace))
-		assertOwnerReference(deployment, string(ownerUID))
+
+		By("通过真实 Service 端口读取指标，确认更新后的默认采集仍可用")
 		assertMetrics(ctx, convergenceWorkload, []string{"kube_pod_info"}, nil)
 	}, SpecTimeout(15*time.Minute))
 
@@ -1187,6 +1266,76 @@ func waitForInstanceReady(ctx SpecContext, instance, deployment string) {
 	}, 5*time.Minute, 2*time.Second).Should(Succeed())
 }
 
+func restoreOperator(ctx SpecContext) {
+	run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", operatorNamespace,
+		"scale", "deployment/"+operatorDeployment, "--replicas=1")
+	Eventually(func() error {
+		operator, err := getObject[appsv1.Deployment](ctx, operatorNamespace, "deployment", operatorDeployment)
+		if err != nil {
+			return err
+		}
+		desiredReplicas := int32(-1)
+		if operator.Spec.Replicas != nil {
+			desiredReplicas = *operator.Spec.Replicas
+		}
+		if desiredReplicas != 1 ||
+			operator.Status.ObservedGeneration != operator.Generation || operator.Status.AvailableReplicas != 1 {
+			return fmt.Errorf("Operator Deployment 尚未恢复: generation=%d observed=%d replicas=%d available=%d",
+				operator.Generation, operator.Status.ObservedGeneration, desiredReplicas, operator.Status.AvailableReplicas)
+		}
+		pods, err := getObjects[corev1.PodList](ctx, operatorNamespace, "pods", operatorPodSelector)
+		if err != nil {
+			return err
+		}
+		if len(pods.Items) != 1 || !podIsReady(&pods.Items[0]) {
+			return fmt.Errorf("Operator Ready Pod 尚未恢复: pods=%v", podNames(pods.Items))
+		}
+		return nil
+	}, 2*time.Minute, time.Second).Should(Succeed())
+}
+
+func podIsReady(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func podNames(pods []corev1.Pod) []string {
+	names := make([]string, 0, len(pods))
+	for index := range pods {
+		names = append(names, pods[index].Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalManagedResources(left, right []monitoringv1alpha1.ManagedResourceReference) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func conditionMatches(conditions []metav1.Condition, conditionType string, status metav1.ConditionStatus, reason string) bool {
 	for _, condition := range conditions {
 		if condition.Type == conditionType && condition.Status == status && condition.Reason == reason {
@@ -1387,6 +1536,24 @@ func getObject[T any](ctx context.Context, namespace, kind, name string) (*T, er
 		return nil, fmt.Errorf("解析 %s/%s: %w", kind, name, err)
 	}
 	return object, nil
+}
+
+func getObjects[T any](ctx context.Context, namespace, kind, selector string) (*T, error) {
+	args := []string{"--context", kubeContext}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+	args = append(args, "get", kind, "--selector", selector, "--output", "json")
+	command := exec.CommandContext(ctx, kubectlBin, args...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("kubectl get %s selector=%q: %w: %s", kind, selector, err, output)
+	}
+	objects := new(T)
+	if err := json.Unmarshal(output, objects); err != nil {
+		return nil, fmt.Errorf("解析 %s selector=%q: %w", kind, selector, err)
+	}
+	return objects, nil
 }
 
 func patchObject[T any](ctx context.Context, namespace, kind, name string, patch []byte) (*T, error) {
