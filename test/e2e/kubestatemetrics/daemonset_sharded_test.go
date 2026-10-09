@@ -19,6 +19,9 @@ const (
 	daemonShardedInstanceName = "daemonset-sharded"
 	daemonShardedManagedName  = "ksm-daemonset-sharded"
 	unscheduledProbeName      = "gh57-unscheduled-probe"
+	defaultDaemonInstanceName = "default-daemonset-sharded"
+	defaultDaemonManagedName  = "ksm-default-daemonset-sharded"
+	defaultUnscheduledProbe   = "gh81-unscheduled-probe"
 )
 
 var _ = Describe("experimental DaemonSetSharded 部署模式", Serial, func() {
@@ -205,6 +208,150 @@ spec:
 			return objectAbsent(ctx, targetNamespace, "deployment", daemonShardedManagedName)
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
 	}, SpecTimeout(20*time.Minute))
+
+	It(fmt.Sprintf("[%s] Default 保持三角色显式职责边界与版本拒绝", defaultDaemonScenarioID()), func(ctx SpecContext) {
+		By("提交显式 Default 的 DaemonSetSharded 受管实例")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  deployment:
+    mode: DaemonSetSharded
+    daemonSetSharded: {}
+  collectors:
+    mode: Default
+`, defaultDaemonInstanceName, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+
+		if active.kubernetes == "1.19" {
+			By("等待 UnsupportedMode，并验证 Default 不改变零写入拒绝语义")
+			Eventually(func() error {
+				instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", defaultDaemonInstanceName)
+				if err != nil {
+					return err
+				}
+				if !conditionMatches(instance.Status.Conditions, "Degraded", "True", "UnsupportedMode") {
+					return fmt.Errorf("Degraded 尚未报告 UnsupportedMode: %#v", instance.Status.Conditions)
+				}
+				if len(instance.Status.ManagedResources) != 0 {
+					return fmt.Errorf("managedResources=%v，期望为空", instance.Status.ManagedResources)
+				}
+				return nil
+			}, time.Minute, 2*time.Second).Should(Succeed())
+			for _, identity := range []struct{ kind, name string }{
+				{kind: "daemonset", name: defaultDaemonManagedName},
+				{kind: "deployment", name: defaultDaemonManagedName + "-cluster"},
+				{kind: "deployment", name: defaultDaemonManagedName + "-unscheduled"},
+				{kind: "service", name: defaultDaemonManagedName},
+				{kind: "service", name: defaultDaemonManagedName + "-control"},
+				{kind: "serviceaccount", name: defaultDaemonManagedName},
+				{kind: "clusterrole", name: defaultDaemonManagedName},
+				{kind: "clusterrolebinding", name: defaultDaemonManagedName},
+			} {
+				Expect(objectAbsent(ctx, targetNamespace, identity.kind, identity.name)).To(Succeed())
+			}
+			return
+		}
+
+		By("创建保持未调度的探测 Pod，并等待三角色 workload 与 status 就绪")
+		pendingPod := fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  nodeSelector:
+    monitor-in-hand.example/never: scheduled
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.9
+`, defaultUnscheduledProbe, targetNamespace)
+		runWithInput(ctx, repoRoot, pendingPod, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		var desiredNodes int32
+		Eventually(func() error {
+			node, err := getObject[appsv1.DaemonSet](ctx, targetNamespace, "daemonset", defaultDaemonManagedName)
+			if err != nil {
+				return err
+			}
+			desiredNodes = node.Status.DesiredNumberScheduled
+			if desiredNodes < 1 || node.Status.NumberAvailable != desiredNodes {
+				return fmt.Errorf("DaemonSet available=%d desired=%d", node.Status.NumberAvailable, desiredNodes)
+			}
+			for _, name := range []string{defaultDaemonManagedName + "-cluster", defaultDaemonManagedName + "-unscheduled"} {
+				deployment, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", name)
+				if getErr != nil || deployment.Status.AvailableReplicas != 1 {
+					return fmt.Errorf("Deployment %s 尚未可用: %v", name, getErr)
+				}
+			}
+			instance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", defaultDaemonInstanceName)
+			if getErr != nil {
+				return getErr
+			}
+			if instance.Status.DesiredPods != desiredNodes+2 || instance.Status.AvailablePods != desiredNodes+2 ||
+				instance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady {
+				return fmt.Errorf("Default DaemonSetSharded status 尚未收敛: %#v", instance.Status)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+
+		By("验证 node 与 unscheduled 只显式选择 pods，cluster 精确选择其余 27 项")
+		node, err := getObject[appsv1.DaemonSet](ctx, targetNamespace, "daemonset", defaultDaemonManagedName)
+		Expect(err).NotTo(HaveOccurred())
+		cluster, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", defaultDaemonManagedName+"-cluster")
+		Expect(err).NotTo(HaveOccurred())
+		unscheduled, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", defaultDaemonManagedName+"-unscheduled")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(node.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
+		Expect(cluster.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
+		Expect(node.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
+			HaveLen(3), HaveExactElements("--resources=pods", HavePrefix("--namespaces="), "--node=$(NODE_NAME)"),
+		))
+		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
+			HaveLen(2), HaveExactElements("--resources="+strings.Join(sharedCollectorCatalogWithoutPods(), ","), HavePrefix("--namespaces=")),
+		))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
+			HaveLen(3), HaveExactElements("--resources=pods", HavePrefix("--namespaces="), `--node=""`),
+		))
+		instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", defaultDaemonInstanceName)
+		Expect(err).NotTo(HaveOccurred())
+		assertOwnerReference(node, string(instance.UID))
+		assertOwnerReference(cluster, string(instance.UID))
+		assertOwnerReference(unscheduled, string(instance.UID))
+		Expect(instance.Status.KubeStateMetricsVersion).To(Equal(active.version))
+		Expect(instance.Status.DeploymentMode).To(Equal(monitoringv1alpha1.DeploymentModeDaemonSetSharded))
+		Expect(instance.Status.EffectiveCollectors).To(Equal(sharedCollectorCatalog()))
+		Expect(instance.Status.ManagedResources).To(HaveLen(8))
+
+		By("从两组 endpoints 读取真实指标，验证三角色不重复采集")
+		nodePodNames := endpointPodNames(ctx, defaultDaemonManagedName, int(desiredNodes))
+		for _, podName := range nodePodNames {
+			assertTargetMetricsBody(ctx, "pod/"+podName, 8080, func(body []byte) error {
+				metrics := string(body)
+				if !strings.Contains(metrics, "kube_pod_info") || strings.Contains(metrics, `pod="`+defaultUnscheduledProbe+`"`) || strings.Contains(metrics, "kube_deployment_created") {
+					return fmt.Errorf("node 角色 Pod %s 指标边界不符合预期", podName)
+				}
+				return nil
+			})
+		}
+		controlPodNames := endpointPodNames(ctx, defaultDaemonManagedName+"-control", 2,
+			defaultDaemonManagedName+"-cluster-", defaultDaemonManagedName+"-unscheduled-")
+		for _, podName := range controlPodNames {
+			assertTargetMetricsBody(ctx, "pod/"+podName, 8080, func(body []byte) error {
+				metrics := string(body)
+				if strings.HasPrefix(podName, defaultDaemonManagedName+"-cluster-") {
+					if !strings.Contains(metrics, "kube_deployment_created") || strings.Contains(metrics, "kube_pod_info") {
+						return fmt.Errorf("cluster 角色指标边界不符合预期")
+					}
+				} else if !strings.Contains(metrics, `pod="`+defaultUnscheduledProbe+`"`) || strings.Contains(metrics, "kube_deployment_created") {
+					return fmt.Errorf("unscheduled 角色指标边界不符合预期")
+				}
+				return nil
+			})
+		}
+	}, SpecTimeout(20*time.Minute))
 })
 
 func daemonShardedScenarioID(sequence string) string {
@@ -222,6 +369,26 @@ func daemonShardedScenarioID(sequence string) string {
 		}
 	}
 	return "E2E-UNSUPPORTED-KSM-GH57-" + sequence
+}
+
+func defaultDaemonScenarioID() string {
+	if os.Getenv("KUBERNETES_VERSION") == "1.19" {
+		return "E2E-119-KSM-GH81-003"
+	}
+	if os.Getenv("KUBERNETES_VERSION") == "1.28" {
+		return "E2E-128-KSM-GH81-003"
+	}
+	return "E2E-UNSUPPORTED-KSM-GH81-003"
+}
+
+func sharedCollectorCatalogWithoutPods() []string {
+	collectors := make([]string, 0, len(sharedCollectorCatalog())-1)
+	for _, collector := range sharedCollectorCatalog() {
+		if collector != "pods" {
+			collectors = append(collectors, collector)
+		}
+	}
+	return collectors
 }
 
 func endpointPodNames(ctx SpecContext, serviceName string, expectedCount int, expectedPrefixes ...string) []string {

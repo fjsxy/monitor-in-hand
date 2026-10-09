@@ -130,7 +130,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
 			container := deployment.Spec.Template.Spec.Containers[0]
 			Expect(container.Image).To(Equal(wantImage))
-			Expect(container.Args).To(Equal([]string{"--resources=" + strings.Join(plan.EffectiveCollectors, ","), "--namespaces=monitoring"}))
+			Expect(container.Args).To(Equal([]string{"--namespaces=monitoring"}))
 			Expect(container.Ports).To(ConsistOf(
 				corev1.ContainerPort{Name: "http-metrics", ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
 				corev1.ContainerPort{Name: "telemetry", ContainerPort: 8081, Protocol: corev1.ProtocolTCP},
@@ -209,7 +209,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			NamespaceNames:        []string{"monitoring"},
 		})
 
-		By("验证固定 catalog、实际参数与省略资源的行为")
+		By("验证固定 catalog、Default 省略 resources 参数与省略容器资源的行为")
 		Expect(problem).To(BeNil())
 		Expect(plan.EffectiveCollectors).To(Equal([]string{
 			"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
@@ -219,15 +219,81 @@ var _ = Describe("默认 Deployment 规划", func() {
 			"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
 		}))
 		deployment := deploymentFrom(plan)
-		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-			"--resources=" + strings.Join(plan.EffectiveCollectors, ","),
-			"--namespaces=monitoring",
-		}))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--namespaces=monitoring"}))
 		Expect(deployment.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{}))
 	},
 		Entry("Kubernetes 1.19", "v1.19.16"),
 		Entry("Kubernetes 1.28", "v1.28.15"),
 	)
+
+	It("UT-KSM-GH81-001 按 collector 模式和部署拓扑保持 resources 参数边界", func() {
+		wantDefaultCollectors := []string{
+			"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
+			"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
+			"namespaces", "networkpolicies", "nodes", "persistentvolumeclaims", "persistentvolumes", "poddisruptionbudgets",
+			"pods", "replicasets", "replicationcontrollers", "resourcequotas", "secrets", "services", "statefulsets",
+			"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
+		}
+		facts := ksm.ClusterFacts{
+			KubernetesVersion:     "v1.28.15",
+			TargetNamespaceExists: true,
+			NamespaceNames:        []string{"monitoring"},
+		}
+
+		By("验证省略 collectors 的 Deployment 依赖上游默认，status 仍保留完整集合")
+		deploymentPlan, problem := ksm.BuildPlan(newInstance(), facts)
+		Expect(problem).To(BeNil())
+		Expect(deploymentPlan.EffectiveCollectors).To(Equal(wantDefaultCollectors))
+		Expect(deploymentFrom(deploymentPlan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--namespaces=monitoring"}))
+
+		By("验证显式 Default 的 StatefulSetSharded 也省略 resources，但保留自动分片参数")
+		statefulInstance := newInstance()
+		statefulInstance.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+			StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+				Shards: 2,
+			},
+		}
+		statefulInstance.Spec.Collectors.Mode = monitoringv1alpha1.CollectorModeDefault
+		statefulPlan, problem := ksm.BuildPlan(statefulInstance, facts)
+		Expect(problem).To(BeNil())
+		Expect(statefulPlan.EffectiveCollectors).To(Equal(wantDefaultCollectors))
+		Expect(statefulSetFrom(statefulPlan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+			"--namespaces=monitoring",
+			"--pod=$(POD_NAME)",
+			"--pod-namespace=$(POD_NAMESPACE)",
+		}))
+
+		By("验证 Default DaemonSetSharded 仍为三角色显式划分完整 collector 集合")
+		daemonInstance := newInstance()
+		daemonInstance.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+			Mode:             monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+			DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+		}
+		daemonInstance.Spec.Collectors.Mode = monitoringv1alpha1.CollectorModeDefault
+		daemonPlan, problem := ksm.BuildPlan(daemonInstance, facts)
+		Expect(problem).To(BeNil())
+		Expect(daemonPlan.EffectiveCollectors).To(Equal(wantDefaultCollectors))
+		node := resourceOfType[*appsv1.DaemonSet](daemonPlan)
+		cluster := plannedDeploymentNamed(daemonPlan, "ksm-primary-cluster")
+		unscheduled := plannedDeploymentNamed(daemonPlan, "ksm-primary-unscheduled")
+		podIndex := slices.Index(wantDefaultCollectors, "pods")
+		clusterCollectors := slices.Delete(append([]string(nil), wantDefaultCollectors...), podIndex, podIndex+1)
+		Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods", "--namespaces=monitoring", "--node=$(NODE_NAME)"}))
+		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=" + strings.Join(clusterCollectors, ","), "--namespaces=monitoring"}))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods", "--namespaces=monitoring", `--node=""`}))
+
+		By("验证 Include 按声明顺序显式下发，不受 Default 参数策略影响")
+		includeInstance := newInstance()
+		includeInstance.Spec.Collectors = monitoringv1alpha1.KubeStateMetricsCollectors{
+			Mode:  monitoringv1alpha1.CollectorModeInclude,
+			Names: []string{"deployments", "pods"},
+		}
+		includePlan, problem := ksm.BuildPlan(includeInstance, facts)
+		Expect(problem).To(BeNil())
+		Expect(includePlan.EffectiveCollectors).To(Equal([]string{"deployments", "pods"}))
+		Expect(deploymentFrom(includePlan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=deployments,pods", "--namespaces=monitoring"}))
+	})
 
 	DescribeTable("UT-KSM-008 Include collectors 成为实际参数和 effective collectors", func(kubernetesVersion string) {
 		By("准备显式 Include collector 声明")

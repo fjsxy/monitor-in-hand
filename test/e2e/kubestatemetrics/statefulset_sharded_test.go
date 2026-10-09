@@ -20,6 +20,8 @@ const (
 	shardedInstanceName = "statefulset-sharded"
 	shardedManagedName  = "ksm-statefulset-sharded"
 	invalidShardsName   = "invalid-statefulset-shards"
+	defaultOmittedName  = "default-statefulset-omitted"
+	defaultExplicitName = "default-statefulset-explicit"
 )
 
 var _ = Describe("experimental StatefulSetSharded 部署模式", Serial, func() {
@@ -190,6 +192,91 @@ spec:
 		waitForShardedTopology(ctx, shardedInstanceName, shardedManagedName, 2)
 	}, SpecTimeout(20*time.Minute))
 
+	It(fmt.Sprintf("[%s] Default 与省略 collectors 均依赖上游默认集合", defaultStatefulScenarioID()), func(ctx SpecContext) {
+		By("分别提交省略 collectors 与显式 Default 的两分片实例")
+		manifests := []struct {
+			name       string
+			collectors string
+		}{
+			{name: defaultOmittedName},
+			{name: defaultExplicitName, collectors: "  collectors:\n    mode: Default\n"},
+		}
+		for _, current := range manifests {
+			manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  deployment:
+    mode: StatefulSetSharded
+    statefulSetSharded:
+      shards: 2
+%s`, current.name, targetNamespace, current.collectors)
+			runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		}
+
+		By("等待两个 StatefulSet、全部 shard Pod、endpoints 和 status 收敛")
+		for _, current := range manifests {
+			waitForShardedTopology(ctx, current.name, "ksm-"+current.name, 2)
+		}
+
+		By("验证所有 shard 完全省略 resources，同时保留分片参数和固定有效集合")
+		effectiveCollectorSets := make([][]string, 0, len(manifests))
+		for _, current := range manifests {
+			managedName := "ksm-" + current.name
+			var combinedMetrics strings.Builder
+			statefulSet, err := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", managedName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(statefulSet.Spec.Template.Spec.Containers).To(HaveLen(1))
+			Expect(statefulSet.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
+			args := statefulSet.Spec.Template.Spec.Containers[0].Args
+			Expect(args).NotTo(ContainElement(HavePrefix("--resources")))
+			Expect(args).To(ContainElements("--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)"))
+			effectiveNamespaces, err := namespacesFromArgs(args)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(effectiveNamespaces).To(ContainElement(targetNamespace))
+
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", current.name)
+			Expect(err).NotTo(HaveOccurred())
+			assertOwnerReference(statefulSet, string(instance.UID))
+			Expect(instance.Status.KubeStateMetricsVersion).To(Equal(active.version))
+			Expect(instance.Status.EffectiveCollectors).To(Equal(sharedCollectorCatalog()))
+			Expect(instance.Status.ManagedResources).To(ConsistOf(
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "ServiceAccount", Namespace: targetNamespace, Name: managedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole", Name: managedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding", Name: managedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "v1", Kind: "Service", Namespace: targetNamespace, Name: managedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role", Namespace: targetNamespace, Name: managedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding", Namespace: targetNamespace, Name: managedName},
+				monitoringv1alpha1.ManagedResourceReference{APIVersion: "apps/v1", Kind: "StatefulSet", Namespace: targetNamespace, Name: managedName},
+			))
+			effectiveCollectorSets = append(effectiveCollectorSets, append([]string(nil), instance.Status.EffectiveCollectors...))
+
+			podNames := endpointPodNames(ctx, managedName, 2, managedName+"-0", managedName+"-1")
+			for ordinal, podName := range podNames {
+				pod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(pod.Spec.Containers[0].Args).NotTo(ContainElement(HavePrefix("--resources")))
+				assertTargetMetricsBody(ctx, "pod/"+podName, 8081, func(body []byte) error {
+					if !strings.Contains(string(body), fmt.Sprintf("kube_state_metrics_total_shards 2")) ||
+						!strings.Contains(string(body), fmt.Sprintf(`kube_state_metrics_shard_ordinal{shard_ordinal="%d"} %d`, ordinal, ordinal)) {
+						return fmt.Errorf("Pod %s 的分片 telemetry 不完整", podName)
+					}
+					return nil
+				})
+				assertTargetMetricsBody(ctx, "pod/"+podName, 8080, func(body []byte) error {
+					combinedMetrics.Write(body)
+					return nil
+				})
+			}
+			Expect(combinedMetrics.String()).To(ContainSubstring("kube_pod_info"))
+			Expect(combinedMetrics.String()).To(ContainSubstring("kube_deployment_created"))
+		}
+		Expect(effectiveCollectorSets).To(HaveLen(2))
+		Expect(effectiveCollectorSets[0]).To(Equal(effectiveCollectorSets[1]))
+	}, SpecTimeout(20*time.Minute))
+
 	It(fmt.Sprintf("[%s] 非法 shards 仅产生 InvalidSpec", statefulShardedScenarioID("002")), func(ctx SpecContext) {
 		By("提交 shards=1 的非法判别 union 分支")
 		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
@@ -241,6 +328,16 @@ func statefulShardedScenarioID(sequence string) string {
 		}
 	}
 	return "E2E-UNSUPPORTED-KSM-GH56-" + sequence
+}
+
+func defaultStatefulScenarioID() string {
+	if os.Getenv("KUBERNETES_VERSION") == "1.19" {
+		return "E2E-119-KSM-GH81-002"
+	}
+	if os.Getenv("KUBERNETES_VERSION") == "1.28" {
+		return "E2E-128-KSM-GH81-002"
+	}
+	return "E2E-UNSUPPORTED-KSM-GH81-002"
 }
 
 func waitForShardedTopology(ctx SpecContext, instanceName, managedName string, shards int32) {

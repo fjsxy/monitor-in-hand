@@ -209,7 +209,11 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 	name := ManagedResourceName(instance.Name)
 	sharedFilterArgs := append([]string(nil), metricFilterArgs...)
 	sharedFilterArgs = append(sharedFilterArgs, "--namespaces="+strings.Join(effectiveNamespaces, ","))
-	containerArgs := append([]string{"--resources=" + strings.Join(effectiveCollectors, ",")}, sharedFilterArgs...)
+	// Default 依赖上游默认集合；只有 Include 才把声明的资源边界显式下发给非 DaemonSet 拓扑。
+	containerArgs := append([]string(nil), sharedFilterArgs...)
+	if instance.Spec.Collectors.Mode == monitoringv1alpha1.CollectorModeInclude {
+		containerArgs = append([]string{"--resources=" + strings.Join(effectiveCollectors, ",")}, containerArgs...)
+	}
 	var nonWorkloads []client.Object
 	var workloads []client.Object
 	desiredPods := int32(1)
