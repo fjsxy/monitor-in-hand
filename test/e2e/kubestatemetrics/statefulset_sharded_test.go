@@ -224,10 +224,8 @@ spec:
 
 		By("验证所有 shard 完全省略 resources，同时保留分片参数和固定有效集合")
 		effectiveCollectorSets := make([][]string, 0, len(manifests))
-		actualMetricFamilies := make([][]string, 0, len(manifests))
 		for _, current := range manifests {
 			managedName := "ksm-" + current.name
-			var combinedMetrics strings.Builder
 			statefulSet, err := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", managedName)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(statefulSet.Spec.Template.Spec.Containers).To(HaveLen(1))
@@ -285,19 +283,40 @@ spec:
 					}
 					return nil
 				})
-				assertTargetMetricsBody(ctx, "pod/"+podName, 8080, func(body []byte) error {
-					combinedMetrics.Write(body)
-					return nil
-				})
 			}
-			Expect(combinedMetrics.String()).To(ContainSubstring("kube_pod_info"))
-			Expect(combinedMetrics.String()).To(ContainSubstring("kube_deployment_created"))
-			actualMetricFamilies = append(actualMetricFamilies, metricFamilyNames(combinedMetrics.String()))
 		}
 		Expect(effectiveCollectorSets).To(HaveLen(2))
 		Expect(effectiveCollectorSets[0]).To(Equal(effectiveCollectorSets[1]))
-		Expect(actualMetricFamilies).To(HaveLen(2))
-		Expect(actualMetricFamilies[0]).To(Equal(actualMetricFamilies[1]))
+
+		By("等待两种输入的实际采集指标族在 collector 异步启动后收敛为相同集合")
+		Eventually(func() error {
+			// 每轮都重新抓取两个实例的全部 shard，避免把前一轮的瞬时样本累加到当前集合。
+			actualMetricFamilies := make([][]string, 0, len(manifests))
+			for _, current := range manifests {
+				managedName := "ksm-" + current.name
+				var combinedMetrics strings.Builder
+				podNames := endpointPodNames(ctx, managedName, 2, managedName+"-0", managedName+"-1")
+				for _, podName := range podNames {
+					assertTargetMetricsBody(ctx, "pod/"+podName, 8080, func(body []byte) error {
+						combinedMetrics.Write(body)
+						return nil
+					})
+				}
+				if !strings.Contains(combinedMetrics.String(), "kube_pod_info") ||
+					!strings.Contains(combinedMetrics.String(), "kube_deployment_created") {
+					return fmt.Errorf("实例 %s 的默认指标尚未完整可见", current.name)
+				}
+				actualMetricFamilies = append(actualMetricFamilies, metricFamilyNames(combinedMetrics.String()))
+			}
+
+			omittedOnly := metricFamilyDifference(actualMetricFamilies[0], actualMetricFamilies[1])
+			explicitOnly := metricFamilyDifference(actualMetricFamilies[1], actualMetricFamilies[0])
+			if len(omittedOnly) != 0 || len(explicitOnly) != 0 {
+				return fmt.Errorf("实际指标族尚未收敛: %s 独有=%v; %s 独有=%v",
+					defaultOmittedName, omittedOnly, defaultExplicitName, explicitOnly)
+			}
+			return nil
+		}, 2*time.Minute, 2*time.Second).Should(Succeed())
 	}, SpecTimeout(20*time.Minute))
 
 	It(fmt.Sprintf("[%s] 非法 shards 仅产生 InvalidSpec", statefulShardedScenarioID("002")), func(ctx SpecContext) {
@@ -382,6 +401,20 @@ func metricFamilyNames(metrics string) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func metricFamilyDifference(left, right []string) []string {
+	rightFamilies := make(map[string]struct{}, len(right))
+	for _, family := range right {
+		rightFamilies[family] = struct{}{}
+	}
+	difference := make([]string, 0)
+	for _, family := range left {
+		if _, found := rightFamilies[family]; !found {
+			difference = append(difference, family)
+		}
+	}
+	return difference
 }
 
 func waitForShardedTopology(ctx SpecContext, instanceName, managedName string, shards int32) {
