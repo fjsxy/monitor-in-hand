@@ -3,6 +3,7 @@ package kubestatemetrics_test
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -70,6 +71,10 @@ spec:
 			"--namespaces=" + targetNamespace,
 			"--pod=$(POD_NAME)",
 			"--pod-namespace=$(POD_NAMESPACE)",
+			"--logtostderr=true",
+			"--v=0",
+			"--enable-gzip-encoding=true",
+			"--use-apiserver-cache=true",
 		}
 		Expect(container.Args).To(Equal(expectedArgs))
 		expectedTemplateResources := corev1.ResourceRequirements{
@@ -318,6 +323,169 @@ spec:
 			return nil
 		}, 2*time.Minute, 2*time.Second).Should(Succeed())
 	}, SpecTimeout(20*time.Minute))
+
+	It(fmt.Sprintf("[%s] StatefulSetSharded 全部分片启用 gzip 与 API cache 并收敛旧模板", gh82ScenarioID("002")), func(ctx SpecContext) {
+		const gh82InstanceName = "gh82-statefulset-sharded"
+		const gh82ManagedName = "ksm-gh82-statefulset-sharded"
+		By("提交两分片且显式声明 collector、filter 与 resources 的实例")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  deployment:
+    mode: StatefulSetSharded
+    statefulSetSharded:
+      shards: 2
+  collectors:
+    mode: Include
+    names: [pods]
+  metricFilter:
+    mode: Allow
+    patterns: [kube_pod_info]
+  namespaceFilter:
+    mode: Include
+    names: [%s]
+  podResources:
+    requests:
+      cpu: 17m
+      memory: 32Mi
+    limits:
+      cpu: 170m
+      memory: 128Mi
+`, gh82InstanceName, targetNamespace, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		waitForShardedTopology(ctx, gh82InstanceName, gh82ManagedName, 2)
+
+		By("枚举两个实际 shard，验证参数、资源、分片 telemetry 和 gzip 协商")
+		wantArgs := []string{
+			"--resources=pods", "--metric-allowlist=kube_pod_info", "--namespaces=" + targetNamespace,
+			"--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)",
+			"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true",
+		}
+		wantResources := corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("17m"), corev1.ResourceMemory: resource.MustParse("32Mi")},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("170m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
+		}
+		statefulSet, err := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", gh82ManagedName)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(statefulSet.Spec.Template.Spec.Containers[0].Args).To(Equal(wantArgs))
+		Expect(statefulSet.Spec.Template.Spec.Containers[0].Resources).To(Equal(wantResources))
+		assertGH82Args(statefulSet.Spec.Template.Spec.Containers[0].Args, true)
+		instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", gh82InstanceName)
+		Expect(err).NotTo(HaveOccurred())
+		generation := instance.Generation
+		Expect(instance.Status).To(SatisfyAll(
+			HaveField("ObservedGeneration", generation),
+			HaveField("KubeStateMetricsVersion", active.version),
+			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeStatefulSetSharded),
+			HaveField("DesiredPods", int32(2)),
+			HaveField("AvailablePods", int32(2)),
+			HaveField("EffectiveCollectors", []string{"pods"}),
+		))
+		podNames := endpointPodNames(ctx, gh82ManagedName, 2)
+		initialUIDs := podUIDs(ctx, podNames)
+		for ordinal, podName := range podNames {
+			pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(pod.Spec.Containers[0].Args).To(Equal(wantArgs))
+			assertGH82Args(pod.Spec.Containers[0].Args, true)
+			assertPodMetricsNegotiation(ctx, podName, func(body []byte) error {
+				if !strings.Contains(string(body), "kube_pod_info") {
+					return fmt.Errorf("shard %s metrics 缺少 kube_pod_info", podName)
+				}
+				return nil
+			})
+			assertTargetMetricsBody(ctx, "pod/"+podName, 8081, func(body []byte) error {
+				if !strings.Contains(string(body), fmt.Sprintf(`kube_state_metrics_shard_ordinal{shard_ordinal="%d"} %d`, ordinal, ordinal)) ||
+					!strings.Contains(string(body), "kube_state_metrics_total_shards 2") {
+					return fmt.Errorf("shard %s telemetry 不符合 ordinal=%d total=2", podName, ordinal)
+				}
+				return nil
+			})
+		}
+
+		By("暂停 Operator 并将 StatefulSet 替换为缺少四个参数的升级前模板")
+		operatorPaused := false
+		DeferCleanup(func(cleanupCtx SpecContext) {
+			if operatorPaused {
+				resumeOperator(cleanupCtx)
+			}
+		}, NodeTimeout(5*time.Minute))
+		operatorPaused = true
+		pauseOperator(ctx)
+		statefulSet, err = getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", gh82ManagedName)
+		Expect(err).NotTo(HaveOccurred())
+		statefulSet.Spec.Template.Spec.Containers[0].Args = withoutGH82E2EArgs(statefulSet.Spec.Template.Spec.Containers[0].Args)
+		replaceObject(ctx, statefulSet)
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+			"rollout", "status", "statefulset/"+gh82ManagedName, "--timeout=5m")
+		baselinePodNames := endpointPodNames(ctx, gh82ManagedName, 2)
+		baselineUIDs := podUIDs(ctx, baselinePodNames)
+		Expect(baselineUIDs).NotTo(Equal(initialUIDs))
+		for _, podName := range baselinePodNames {
+			pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(pod.Spec.Containers[0].Args).To(Equal([]string{
+				"--resources=pods", "--metric-allowlist=kube_pod_info", "--namespaces=" + targetNamespace,
+				"--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)",
+			}))
+		}
+
+		By("恢复 Operator，验证两个 shard 在 CR generation 不变时全部更新")
+		resumeOperator(ctx)
+		operatorPaused = false
+		Eventually(func() error {
+			current, getErr := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", gh82ManagedName)
+			if getErr != nil {
+				return getErr
+			}
+			if !slices.Equal(current.Spec.Template.Spec.Containers[0].Args, wantArgs) || current.Status.ReadyReplicas != 2 ||
+				current.Status.CurrentRevision != current.Status.UpdateRevision {
+				return fmt.Errorf("StatefulSet 尚未收敛: args=%v ready=%d current=%s update=%s",
+					current.Spec.Template.Spec.Containers[0].Args, current.Status.ReadyReplicas, current.Status.CurrentRevision, current.Status.UpdateRevision)
+			}
+			currentInstance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", gh82InstanceName)
+			if getErr != nil {
+				return getErr
+			}
+			if currentInstance.Generation != generation || currentInstance.Status.ObservedGeneration != generation ||
+				currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || currentInstance.Status.AvailablePods != 2 ||
+				!slices.Equal(currentInstance.Status.EffectiveCollectors, []string{"pods"}) ||
+				!conditionIsTrue(currentInstance.Status.Conditions, "Ready", generation) ||
+				!conditionIsTrue(currentInstance.Status.Conditions, "Available", generation) {
+				return fmt.Errorf("CR/status 尚未收敛: generation=%d status=%#v", currentInstance.Generation, currentInstance.Status)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+		currentPodNames := endpointPodNames(ctx, gh82ManagedName, 2)
+		expectPodsReplaced(ctx, currentPodNames, baselineUIDs)
+		for ordinal, podName := range currentPodNames {
+			pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(pod.Spec.Containers[0].Args).To(Equal(wantArgs))
+			Expect(pod.Spec.Containers[0].Resources).To(Equal(wantResources))
+			assertGH82Args(pod.Spec.Containers[0].Args, true)
+			assertPodMetricsNegotiation(ctx, podName, func(body []byte) error {
+				if !strings.Contains(string(body), "kube_pod_info") {
+					return fmt.Errorf("收敛后 shard %s metrics 缺少 kube_pod_info", podName)
+				}
+				return nil
+			})
+			assertTargetMetricsBody(ctx, "pod/"+podName, 8081, func(body []byte) error {
+				if !strings.Contains(string(body), fmt.Sprintf(`kube_state_metrics_shard_ordinal{shard_ordinal="%d"} %d`, ordinal, ordinal)) ||
+					!strings.Contains(string(body), "kube_state_metrics_total_shards 2") {
+					return fmt.Errorf("收敛后 shard %s telemetry 不符合 ordinal=%d total=2", podName, ordinal)
+				}
+				return nil
+			})
+		}
+		_, err = getObject[rbacv1.Role](ctx, targetNamespace, "role", gh82ManagedName)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = getObject[rbacv1.RoleBinding](ctx, targetNamespace, "rolebinding", gh82ManagedName)
+		Expect(err).NotTo(HaveOccurred())
+	}, SpecTimeout(25*time.Minute))
 
 	It(fmt.Sprintf("[%s] 非法 shards 仅产生 InvalidSpec", statefulShardedScenarioID("002")), func(ctx SpecContext) {
 		By("提交 shards=1 的非法判别 union 分支")

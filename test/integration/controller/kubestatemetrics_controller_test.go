@@ -242,6 +242,51 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Entry("Kubernetes 1.28 profile", "v1.28.15", "128"),
 	)
 
+	DescribeTable("IT-KSM-GH82-001 Deployment 实例无需修改 CR 即收敛日志与 gzip 参数",
+		func(gitVersion, caseSuffix string) {
+			By("准备显式 collector 和过滤的普通 Deployment 实例")
+			namespace := "it-ksm-gh82-deployment-" + caseSuffix + "-" + suffix
+			name := "gh82-deployment-" + caseSuffix + "-" + suffix
+			resourceName := "ksm-" + name
+			Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+			instance := gh82Instance(name, namespace, monitoringv1alpha1.DeploymentModeDeployment)
+			Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+			By("验证实际 Deployment 参数、status 和普通拓扑的 cache 边界")
+			reconcile(name, gitVersion)
+			deployment := &appsv1.Deployment{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+			wantArgs := gh82DeploymentArgs(namespace)
+			Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal(wantArgs))
+			generation := instance.Generation
+			actual := &monitoringv1alpha1.KubeStateMetrics{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			Expect(actual.Status).To(SatisfyAll(
+				HaveField("ObservedGeneration", generation),
+				HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDeployment),
+				HaveField("EffectiveCollectors", []string{"pods", "deployments"}),
+			))
+
+			By("模拟缺少本 Issue 参数的旧模板，再以未变的 CR 调谐收敛")
+			deployment.Spec.Template.Spec.Containers[0].Args = withoutGH82Args(deployment.Spec.Template.Spec.Containers[0].Args)
+			Expect(testClient.Update(ctx, deployment)).To(Succeed())
+			reconcile(name, gitVersion)
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+			Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal(wantArgs))
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			Expect(actual.Generation).To(Equal(generation))
+			Expect(actual.Status.ObservedGeneration).To(Equal(generation))
+
+			By("重复调谐并确认已收敛模板不产生漂移")
+			resourceVersion := deployment.ResourceVersion
+			reconcile(name, gitVersion)
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+			Expect(deployment.ResourceVersion).To(Equal(resourceVersion))
+		},
+		Entry("Kubernetes 1.19 profile", "v1.19.16", "119"),
+		Entry("Kubernetes 1.28 profile", "v1.28.15", "128"),
+	)
+
 	It("IT-KSM-GH81-002 Default DaemonSetSharded 保持三角色显式资源边界", func() {
 		By("准备 Kubernetes 1.28 支持的 Default DaemonSetSharded 受管实例")
 		namespace := "it-gh81-daemon-" + suffix
@@ -348,6 +393,116 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 				monitoringv1alpha1.ManagedResourceReference{APIVersion: "apps/v1", Kind: "Deployment", Namespace: namespace, Name: resourceName},
 			)),
 		))
+	})
+
+	DescribeTable("IT-KSM-GH82-002 StatefulSetSharded 实例无需修改 CR 即收敛全部分片参数",
+		func(gitVersion, caseSuffix string) {
+			By("准备两分片 StatefulSetSharded 实例")
+			namespace := "it-ksm-gh82-stateful-" + caseSuffix + "-" + suffix
+			name := "gh82-stateful-" + caseSuffix + "-" + suffix
+			resourceName := "ksm-" + name
+			Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+			instance := gh82Instance(name, namespace, monitoringv1alpha1.DeploymentModeStatefulSetSharded)
+			Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+			By("验证实际 StatefulSet 同时保留过滤、分片身份与 cache 参数")
+			reconcile(name, gitVersion)
+			statefulSet := &appsv1.StatefulSet{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, statefulSet)).To(Succeed())
+			wantArgs := []string{
+				"--resources=pods,deployments", "--metric-allowlist=kube_.+_info", "--namespaces=" + namespace,
+				"--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)",
+				"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true",
+			}
+			Expect(statefulSet.Spec.Template.Spec.Containers[0].Args).To(Equal(wantArgs))
+			generation := instance.Generation
+			actual := &monitoringv1alpha1.KubeStateMetrics{}
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			Expect(actual.Status).To(SatisfyAll(
+				HaveField("ObservedGeneration", generation),
+				HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeStatefulSetSharded),
+				HaveField("DesiredPods", int32(2)),
+				HaveField("EffectiveCollectors", []string{"pods", "deployments"}),
+			))
+
+			By("模拟旧 StatefulSet 模板后验证无需修改 CR 即恢复全部参数")
+			statefulSet.Spec.Template.Spec.Containers[0].Args = withoutGH82Args(statefulSet.Spec.Template.Spec.Containers[0].Args)
+			Expect(testClient.Update(ctx, statefulSet)).To(Succeed())
+			reconcile(name, gitVersion)
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, statefulSet)).To(Succeed())
+			Expect(statefulSet.Spec.Template.Spec.Containers[0].Args).To(Equal(wantArgs))
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			Expect(actual.Generation).To(Equal(generation))
+			Expect(actual.Status.ObservedGeneration).To(Equal(generation))
+
+			By("重复调谐并确认已收敛模板不产生漂移")
+			resourceVersion := statefulSet.ResourceVersion
+			reconcile(name, gitVersion)
+			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, statefulSet)).To(Succeed())
+			Expect(statefulSet.ResourceVersion).To(Equal(resourceVersion))
+		},
+		Entry("Kubernetes 1.19 profile", "v1.19.16", "119"),
+		Entry("Kubernetes 1.28 profile", "v1.28.15", "128"),
+	)
+
+	It("IT-KSM-GH82-003 DaemonSetSharded 三角色无需修改 CR 即收敛分片 cache 参数", func() {
+		By("准备 Kubernetes 1.28 三角色分片实例")
+		namespace := "it-ksm-gh82-daemon-" + suffix
+		name := "gh82-daemon-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := gh82Instance(name, namespace, monitoringv1alpha1.DeploymentModeDaemonSetSharded)
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("验证 node、cluster 与 unscheduled 实际 workload 均启用日志、gzip 与 cache")
+		reconcile(name, "v1.28.15")
+		node := &appsv1.DaemonSet{}
+		cluster := &appsv1.Deployment{}
+		unscheduled := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, node)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, cluster)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-unscheduled"}, unscheduled)).To(Succeed())
+		shardedCapabilityArgs := []string{"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true"}
+		wantNode := append([]string{"--resources=pods", "--metric-allowlist=kube_.+_info", "--namespaces=" + namespace, "--node=$(NODE_NAME)"}, shardedCapabilityArgs...)
+		wantCluster := append([]string{"--resources=deployments", "--metric-allowlist=kube_.+_info", "--namespaces=" + namespace}, shardedCapabilityArgs...)
+		wantUnscheduled := append([]string{"--resources=pods", "--metric-allowlist=kube_.+_info", "--namespaces=" + namespace, `--node=""`}, shardedCapabilityArgs...)
+		Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal(wantNode))
+		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal(wantCluster))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(wantUnscheduled))
+		generation := instance.Generation
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status).To(SatisfyAll(
+			HaveField("ObservedGeneration", generation),
+			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDaemonSetSharded),
+			HaveField("EffectiveCollectors", []string{"pods", "deployments"}),
+		))
+
+		By("同时模拟三个旧 workload 模板，再以未变的 CR 调谐收敛")
+		node.Spec.Template.Spec.Containers[0].Args = withoutGH82Args(node.Spec.Template.Spec.Containers[0].Args)
+		cluster.Spec.Template.Spec.Containers[0].Args = withoutGH82Args(cluster.Spec.Template.Spec.Containers[0].Args)
+		unscheduled.Spec.Template.Spec.Containers[0].Args = withoutGH82Args(unscheduled.Spec.Template.Spec.Containers[0].Args)
+		Expect(testClient.Update(ctx, node)).To(Succeed())
+		Expect(testClient.Update(ctx, cluster)).To(Succeed())
+		Expect(testClient.Update(ctx, unscheduled)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, node)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, cluster)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-unscheduled"}, unscheduled)).To(Succeed())
+		Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal(wantNode))
+		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal(wantCluster))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(wantUnscheduled))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Generation).To(Equal(generation))
+		Expect(actual.Status.ObservedGeneration).To(Equal(generation))
+
+		By("重复调谐并确认三个已收敛模板都不被重写")
+		versions := []string{node.ResourceVersion, cluster.ResourceVersion, unscheduled.ResourceVersion}
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, node)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, cluster)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-unscheduled"}, unscheduled)).To(Succeed())
+		Expect([]string{node.ResourceVersion, cluster.ResourceVersion, unscheduled.ResourceVersion}).To(Equal(versions))
 	})
 
 	DescribeTable("IT-KSM-002 在前置条件失败时只更新 status 且零写入",
@@ -1882,6 +2037,59 @@ func expectStableManagedLabels(labels map[string]string, instanceID, version str
 		HaveKeyWithValue("monitor-in-hand/role", "collector"),
 		HaveKeyWithValue("monitor-in-hand/endpoint-group", "default"),
 	))
+}
+
+func gh82Instance(name, namespace string, mode monitoringv1alpha1.DeploymentMode) *monitoringv1alpha1.KubeStateMetrics {
+	deployment := monitoringv1alpha1.KubeStateMetricsDeploymentSpec{Mode: mode}
+	switch mode {
+	case monitoringv1alpha1.DeploymentModeStatefulSetSharded:
+		deployment.StatefulSetSharded = &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{Shards: 2}
+	case monitoringv1alpha1.DeploymentModeDaemonSetSharded:
+		deployment.DaemonSetSharded = &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{}
+	}
+	return &monitoringv1alpha1.KubeStateMetrics{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+			TargetNamespace: namespace,
+			Deployment:      deployment,
+			Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{
+				Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods", "deployments"},
+			},
+			MetricFilter: monitoringv1alpha1.KubeStateMetricsMetricFilter{
+				Mode: monitoringv1alpha1.MetricFilterModeAllow, Patterns: []string{"kube_.+_info"},
+			},
+			NamespaceFilter: monitoringv1alpha1.NamespaceFilter{
+				Mode: monitoringv1alpha1.NamespaceFilterModeInclude, Names: []string{namespace},
+			},
+		},
+	}
+}
+
+func gh82DeploymentArgs(namespace string) []string {
+	return []string{
+		"--resources=pods,deployments",
+		"--metric-allowlist=kube_.+_info",
+		"--namespaces=" + namespace,
+		"--logtostderr=true",
+		"--v=0",
+		"--enable-gzip-encoding=true",
+	}
+}
+
+func withoutGH82Args(args []string) []string {
+	removed := map[string]struct{}{
+		"--logtostderr=true":          {},
+		"--v=0":                       {},
+		"--enable-gzip-encoding=true": {},
+		"--use-apiserver-cache=true":  {},
+	}
+	result := make([]string, 0, len(args))
+	for _, arg := range args {
+		if _, found := removed[arg]; !found {
+			result = append(result, arg)
+		}
+	}
+	return result
 }
 
 func boolPointer(value bool) *bool { return &value }

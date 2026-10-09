@@ -88,6 +88,8 @@ spec:
 
 Kubernetes 1.19.x 固定选择 kube-state-metrics 2.3.0，Kubernetes 1.28.x 固定选择 2.11.0。其他 minor 或缺失目标 Namespace 只更新 CR status，不创建受管资源。
 
+两个固定 profile 的所有 kube-state-metrics 采集进程都显式使用 `--logtostderr=true`、`--v=0` 和 `--enable-gzip-encoding=true`。`v=0` 是受管实例的固定默认日志策略；gzip 仅在 metrics 请求声明 `Accept-Encoding: gzip` 时协商使用，普通请求仍返回未压缩的可读文本。`--use-apiserver-cache=true` 仅用于分片部署模式：覆盖 StatefulSetSharded 的所有 shard，以及 DaemonSetSharded 的 node、cluster 和 unscheduled 全部角色；普通 Deployment 不启用该参数。这些行为由版本 profile 与部署模式固定，不新增 CR 开关或原始参数透传。
+
 `StatefulSetSharded` 是 experimental 部署模式；它通过判别 union 的专属分支声明至少两个 shard，并用一个 headless Service 暴露所有 shard endpoints：
 
 ```yaml

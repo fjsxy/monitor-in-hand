@@ -70,10 +70,19 @@ type Problem struct {
 	Message string
 }
 
+// ArgumentCapabilities 记录固定 kube-state-metrics profile 已核实的 CLI 能力。
+type ArgumentCapabilities struct {
+	LogToStderr    bool
+	Verbosity      bool
+	GZIPEncoding   bool
+	APIServerCache bool
+}
+
 // Profile fixes every Kubernetes-version-dependent kube-state-metrics setting.
 type Profile struct {
 	Version                      string
 	Image                        string
+	ArgumentCapabilities         ArgumentCapabilities
 	Rules                        []rbacv1.PolicyRule
 	ServiceAccountAutomountToken *bool
 	PodAutomountToken            *bool
@@ -413,6 +422,7 @@ func profileFor(gitVersion string) (Profile, *Problem) {
 		return Profile{
 			Version:                  "2.3.0",
 			Image:                    "k8s.gcr.io/kube-state-metrics/kube-state-metrics:v2.3.0",
+			ArgumentCapabilities:     supportedArgumentCapabilities(),
 			Rules:                    rulesForKubernetes119(),
 			ContainerSecurityContext: &corev1.SecurityContext{RunAsUser: int64Pointer(65534)},
 		}, nil
@@ -420,6 +430,7 @@ func profileFor(gitVersion string) (Profile, *Problem) {
 		return Profile{
 			Version:                      "2.11.0",
 			Image:                        "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.11.0",
+			ArgumentCapabilities:         supportedArgumentCapabilities(),
 			Rules:                        rulesForKubernetes128(),
 			ServiceAccountAutomountToken: boolPointer(false),
 			PodAutomountToken:            boolPointer(true),
@@ -466,6 +477,7 @@ func stableInstanceID(name string) string {
 }
 
 func deploymentResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string) ([]client.Object, *appsv1.Deployment) {
+	containerArgs = appendCapabilityArgs(containerArgs, profile.ArgumentCapabilities)
 	nonWorkloads, deployment, _ := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, containerArgs, EndpointGroupDefault)
 	return nonWorkloads, deployment
 }
@@ -559,6 +571,7 @@ func deploymentResourcesForEndpointGroup(instance *monitoringv1alpha1.KubeStateM
 func statefulSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, profile Profile, instanceID, name string, containerArgs []string, shards int32) ([]client.Object, client.Object) {
 	// 先复用与 Deployment 一致的 Pod、ServiceAccount、Cluster RBAC 和 headless Service 契约，仅切换 endpoint-group。
 	shardingArgs := append(append([]string(nil), containerArgs...), "--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)")
+	shardingArgs = appendShardedCapabilityArgs(shardingArgs, profile.ArgumentCapabilities)
 	nonWorkloads, deployment, _ := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, shardingArgs, EndpointGroupSharded)
 	// 通过 Downward API 把每个 Pod 的唯一身份交给上游 automated sharding。
 	container := &deployment.Spec.Template.Spec.Containers[0]
@@ -599,6 +612,7 @@ func daemonSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, pr
 	// node 角色只负责已调度 Pod；Downward API 将所在节点交给上游 field selector 分片。
 	nodeArgs := append([]string{"--resources=pods"}, sharedFilterArgs...)
 	nodeArgs = append(nodeArgs, "--node=$(NODE_NAME)")
+	nodeArgs = appendShardedCapabilityArgs(nodeArgs, profile.ArgumentCapabilities)
 	nonWorkloads, nodeTemplate, nodeService := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name, nodeArgs, EndpointGroupNode)
 	setDeploymentRole(nodeTemplate, WorkloadRoleNode)
 	setContainerResources(&nodeTemplate.Spec.Template.Spec.Containers[0], daemonSpec.NodePodResources, instance.Spec.PodResources)
@@ -621,6 +635,7 @@ func daemonSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, pr
 		}
 	}
 	clusterArgs := append([]string{"--resources=" + strings.Join(clusterCollectors, ",")}, sharedFilterArgs...)
+	clusterArgs = appendShardedCapabilityArgs(clusterArgs, profile.ArgumentCapabilities)
 	_, cluster, _ := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name+"-cluster", clusterArgs, EndpointGroupControl)
 	cluster.Spec.Template.Spec.ServiceAccountName = name
 	setDeploymentRole(cluster, WorkloadRoleCluster)
@@ -629,6 +644,7 @@ func daemonSetShardedResources(instance *monitoringv1alpha1.KubeStateMetrics, pr
 	// unscheduled 角色使用 v2.11 官方的空 node 参数，只读取尚未绑定节点的 Pod。
 	unscheduledArgs := append([]string{"--resources=pods"}, sharedFilterArgs...)
 	unscheduledArgs = append(unscheduledArgs, `--node=""`)
+	unscheduledArgs = appendShardedCapabilityArgs(unscheduledArgs, profile.ArgumentCapabilities)
 	_, unscheduled, _ := deploymentResourcesForEndpointGroup(instance, profile, instanceID, name+"-unscheduled", unscheduledArgs, EndpointGroupControl)
 	unscheduled.Spec.Template.Spec.ServiceAccountName = name
 	setDeploymentRole(unscheduled, WorkloadRoleUnscheduled)
@@ -669,6 +685,35 @@ func setContainerResources(container *corev1.Container, override, inherited *cor
 	if selected != nil {
 		container.Resources = *selected.DeepCopy()
 	}
+}
+
+func supportedArgumentCapabilities() ArgumentCapabilities {
+	return ArgumentCapabilities{
+		LogToStderr: true, Verbosity: true, GZIPEncoding: true, APIServerCache: true,
+	}
+}
+
+func appendCapabilityArgs(args []string, capabilities ArgumentCapabilities) []string {
+	// 先保留 collector、filter 与角色参数，再按 profile 能力追加统一参数。
+	result := append([]string(nil), args...)
+	if capabilities.LogToStderr {
+		result = append(result, "--logtostderr=true")
+	}
+	if capabilities.Verbosity {
+		result = append(result, "--v=0")
+	}
+	if capabilities.GZIPEncoding {
+		result = append(result, "--enable-gzip-encoding=true")
+	}
+	return result
+}
+
+func appendShardedCapabilityArgs(args []string, capabilities ArgumentCapabilities) []string {
+	result := appendCapabilityArgs(args, capabilities)
+	if capabilities.APIServerCache {
+		result = append(result, "--use-apiserver-cache=true")
+	}
+	return result
 }
 
 func managedLabels(instanceID, version, endpointGroup string) map[string]string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -143,9 +144,10 @@ spec:
 		unscheduled, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", daemonShardedManagedName+"-unscheduled")
 		Expect(err).NotTo(HaveOccurred())
 		sharedArgs := []string{"--metric-allowlist=kube_(pod_info|deployment_created)", "--namespaces=" + targetNamespace}
-		Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal(append([]string{"--resources=pods"}, append(sharedArgs, "--node=$(NODE_NAME)")...)))
-		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal(append([]string{"--resources=deployments"}, sharedArgs...)))
-		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(append([]string{"--resources=pods"}, append(sharedArgs, `--node=""`)...)))
+		capabilityArgs := []string{"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true"}
+		Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal(append(append([]string{"--resources=pods"}, sharedArgs...), append([]string{"--node=$(NODE_NAME)"}, capabilityArgs...)...)))
+		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal(append(append([]string{"--resources=deployments"}, sharedArgs...), capabilityArgs...)))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(append(append([]string{"--resources=pods"}, sharedArgs...), append([]string{`--node=""`}, capabilityArgs...)...)))
 		Expect(node.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("72Mi")},
 		}))
@@ -370,6 +372,249 @@ spec:
 			})
 		}
 	}, SpecTimeout(20*time.Minute))
+
+	if os.Getenv("KUBERNETES_VERSION") == "1.28" {
+		It(fmt.Sprintf("[%s] DaemonSetSharded 三角色启用 gzip 与 API cache 并收敛旧模板", gh82ScenarioID("003")), func(ctx SpecContext) {
+			const gh82InstanceName = "gh82-daemonset-sharded"
+			const gh82ManagedName = "ksm-gh82-daemonset-sharded"
+			const gh82ProbeName = "gh82-unscheduled-probe"
+			By("提交显式过滤与三角色 resources 的 DaemonSetSharded 实例")
+			manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  deployment:
+    mode: DaemonSetSharded
+    daemonSetSharded:
+      nodePodResources:
+        limits:
+          memory: 80Mi
+      clusterPodResources:
+        requests:
+          cpu: 29m
+      unscheduledPodResources:
+        requests:
+          memory: 36Mi
+  collectors:
+    mode: Include
+    names: [pods, deployments]
+  metricFilter:
+    mode: Allow
+    patterns: ['kube_(pod_info|deployment_created)']
+  namespaceFilter:
+    mode: Include
+    names: [%s]
+`, gh82InstanceName, targetNamespace, targetNamespace)
+			runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+			pendingPod := fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  nodeSelector:
+    monitor-in-hand.example/never: scheduled
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.9
+`, gh82ProbeName, targetNamespace)
+			runWithInput(ctx, repoRoot, pendingPod, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+
+			By("等待 node、cluster、unscheduled 全部可用并记录 CR generation")
+			var desiredNodes int32
+			Eventually(func() error {
+				node, err := getObject[appsv1.DaemonSet](ctx, targetNamespace, "daemonset", gh82ManagedName)
+				if err != nil {
+					return err
+				}
+				desiredNodes = node.Status.DesiredNumberScheduled
+				if desiredNodes < 1 || node.Status.NumberAvailable != desiredNodes || node.Status.UpdatedNumberScheduled != desiredNodes {
+					return fmt.Errorf("node DaemonSet available=%d updated=%d desired=%d", node.Status.NumberAvailable, node.Status.UpdatedNumberScheduled, desiredNodes)
+				}
+				for _, name := range []string{gh82ManagedName + "-cluster", gh82ManagedName + "-unscheduled"} {
+					deployment, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", name)
+					if getErr != nil || deployment.Status.AvailableReplicas != 1 || deployment.Status.UpdatedReplicas != 1 {
+						return fmt.Errorf("Deployment %s 尚未可用: %v", name, getErr)
+					}
+				}
+				instance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", gh82InstanceName)
+				if getErr != nil {
+					return getErr
+				}
+				if instance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady ||
+					instance.Status.DesiredPods != desiredNodes+2 || instance.Status.AvailablePods != desiredNodes+2 {
+					return fmt.Errorf("DaemonSetSharded status 尚未收敛: %#v", instance.Status)
+				}
+				return nil
+			}, 5*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("验证三种 workload 模板按部署模式启用 cache，并保留角色职责与 resources")
+			shardedCapabilityArgs := []string{"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true"}
+			wantNode := append([]string{"--resources=pods", "--metric-allowlist=kube_(pod_info|deployment_created)", "--namespaces=" + targetNamespace, "--node=$(NODE_NAME)"}, shardedCapabilityArgs...)
+			wantCluster := append([]string{"--resources=deployments", "--metric-allowlist=kube_(pod_info|deployment_created)", "--namespaces=" + targetNamespace}, shardedCapabilityArgs...)
+			wantUnscheduled := append([]string{"--resources=pods", "--metric-allowlist=kube_(pod_info|deployment_created)", "--namespaces=" + targetNamespace, `--node=""`}, shardedCapabilityArgs...)
+			node, err := getObject[appsv1.DaemonSet](ctx, targetNamespace, "daemonset", gh82ManagedName)
+			Expect(err).NotTo(HaveOccurred())
+			cluster, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName+"-cluster")
+			Expect(err).NotTo(HaveOccurred())
+			unscheduled, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName+"-unscheduled")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal(wantNode))
+			Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal(wantCluster))
+			Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(wantUnscheduled))
+			for _, args := range [][]string{node.Spec.Template.Spec.Containers[0].Args, cluster.Spec.Template.Spec.Containers[0].Args, unscheduled.Spec.Template.Spec.Containers[0].Args} {
+				assertGH82Args(args, true)
+			}
+			Expect(node.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("80Mi")},
+			}))
+			Expect(cluster.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("29m")},
+			}))
+			Expect(unscheduled.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("36Mi")},
+			}))
+			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", gh82InstanceName)
+			Expect(err).NotTo(HaveOccurred())
+			generation := instance.Generation
+			Expect(instance.Status).To(SatisfyAll(
+				HaveField("ObservedGeneration", generation),
+				HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDaemonSetSharded),
+				HaveField("EffectiveCollectors", []string{"pods", "deployments"}),
+			))
+
+			nodePodNames := endpointPodNames(ctx, gh82ManagedName, int(desiredNodes))
+			controlPodNames := endpointPodNames(ctx, gh82ManagedName+"-control", 2,
+				gh82ManagedName+"-cluster-", gh82ManagedName+"-unscheduled-")
+			allInitialPods := append(append([]string(nil), nodePodNames...), controlPodNames...)
+			initialUIDs := podUIDs(ctx, allInitialPods)
+			expectedRoleArgs := func(podName string) []string {
+				switch {
+				case strings.HasPrefix(podName, gh82ManagedName+"-cluster-"):
+					return wantCluster
+				case strings.HasPrefix(podName, gh82ManagedName+"-unscheduled-"):
+					return wantUnscheduled
+				default:
+					return wantNode
+				}
+			}
+			verifyRoleMetrics := func(podName string) func([]byte) error {
+				return func(body []byte) error {
+					metrics := string(body)
+					switch {
+					case strings.HasPrefix(podName, gh82ManagedName+"-cluster-"):
+						if !strings.Contains(metrics, "kube_deployment_created") || strings.Contains(metrics, "kube_pod_info") {
+							return fmt.Errorf("cluster companion 指标族不符合职责")
+						}
+					case strings.HasPrefix(podName, gh82ManagedName+"-unscheduled-"):
+						if !strings.Contains(metrics, `pod="`+gh82ProbeName+`"`) || strings.Contains(metrics, "kube_deployment_created") {
+							return fmt.Errorf("unscheduled companion 未仅暴露未调度 Pod 指标")
+						}
+					default:
+						if !strings.Contains(metrics, "kube_pod_info") || strings.Contains(metrics, "kube_deployment_created") {
+							return fmt.Errorf("node 采集进程指标族不符合职责")
+						}
+					}
+					return nil
+				}
+			}
+			for _, podName := range allInitialPods {
+				pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+				Expect(getErr).NotTo(HaveOccurred())
+				Expect(pod.Spec.Containers[0].Args).To(Equal(expectedRoleArgs(podName)))
+				assertGH82Args(pod.Spec.Containers[0].Args, true)
+				assertPodMetricsNegotiation(ctx, podName, verifyRoleMetrics(podName))
+			}
+
+			By("暂停 Operator，同时构造三个缺少四个参数的升级前 workload 模板")
+			operatorPaused := false
+			DeferCleanup(func(cleanupCtx SpecContext) {
+				if operatorPaused {
+					resumeOperator(cleanupCtx)
+				}
+			}, NodeTimeout(5*time.Minute))
+			operatorPaused = true
+			pauseOperator(ctx)
+			node, err = getObject[appsv1.DaemonSet](ctx, targetNamespace, "daemonset", gh82ManagedName)
+			Expect(err).NotTo(HaveOccurred())
+			cluster, err = getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName+"-cluster")
+			Expect(err).NotTo(HaveOccurred())
+			unscheduled, err = getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName+"-unscheduled")
+			Expect(err).NotTo(HaveOccurred())
+			node.Spec.Template.Spec.Containers[0].Args = withoutGH82E2EArgs(node.Spec.Template.Spec.Containers[0].Args)
+			cluster.Spec.Template.Spec.Containers[0].Args = withoutGH82E2EArgs(cluster.Spec.Template.Spec.Containers[0].Args)
+			unscheduled.Spec.Template.Spec.Containers[0].Args = withoutGH82E2EArgs(unscheduled.Spec.Template.Spec.Containers[0].Args)
+			replaceObject(ctx, node)
+			replaceObject(ctx, cluster)
+			replaceObject(ctx, unscheduled)
+			for _, target := range []string{"daemonset/" + gh82ManagedName, "deployment/" + gh82ManagedName + "-cluster", "deployment/" + gh82ManagedName + "-unscheduled"} {
+				run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+					"rollout", "status", target, "--timeout=5m")
+			}
+			baselineNodePods := endpointPodNames(ctx, gh82ManagedName, int(desiredNodes))
+			baselineControlPods := endpointPodNames(ctx, gh82ManagedName+"-control", 2,
+				gh82ManagedName+"-cluster-", gh82ManagedName+"-unscheduled-")
+			baselinePods := append(append([]string(nil), baselineNodePods...), baselineControlPods...)
+			baselineUIDs := podUIDs(ctx, baselinePods)
+			Expect(baselineUIDs).NotTo(Equal(initialUIDs))
+			for _, podName := range baselinePods {
+				pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+				Expect(getErr).NotTo(HaveOccurred())
+				for _, removed := range []string{"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true"} {
+					Expect(pod.Spec.Containers[0].Args).NotTo(ContainElement(removed))
+				}
+			}
+
+			By("恢复 Operator，验证三个角色在 CR generation 不变时更新全部 Pod")
+			resumeOperator(ctx)
+			operatorPaused = false
+			Eventually(func() error {
+				currentNode, getErr := getObject[appsv1.DaemonSet](ctx, targetNamespace, "daemonset", gh82ManagedName)
+				if getErr != nil {
+					return getErr
+				}
+				currentCluster, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName+"-cluster")
+				if getErr != nil {
+					return getErr
+				}
+				currentUnscheduled, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName+"-unscheduled")
+				if getErr != nil {
+					return getErr
+				}
+				if !slices.Equal(currentNode.Spec.Template.Spec.Containers[0].Args, wantNode) || currentNode.Status.NumberAvailable != desiredNodes || currentNode.Status.UpdatedNumberScheduled != desiredNodes ||
+					!slices.Equal(currentCluster.Spec.Template.Spec.Containers[0].Args, wantCluster) || currentCluster.Status.AvailableReplicas != 1 || currentCluster.Status.UpdatedReplicas != 1 ||
+					!slices.Equal(currentUnscheduled.Spec.Template.Spec.Containers[0].Args, wantUnscheduled) || currentUnscheduled.Status.AvailableReplicas != 1 || currentUnscheduled.Status.UpdatedReplicas != 1 {
+					return fmt.Errorf("三角色 workload 尚未全部收敛")
+				}
+				currentInstance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", gh82InstanceName)
+				if getErr != nil {
+					return getErr
+				}
+				if currentInstance.Generation != generation || currentInstance.Status.ObservedGeneration != generation ||
+					currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || currentInstance.Status.AvailablePods != desiredNodes+2 ||
+					!slices.Equal(currentInstance.Status.EffectiveCollectors, []string{"pods", "deployments"}) ||
+					!conditionIsTrue(currentInstance.Status.Conditions, "Ready", generation) ||
+					!conditionIsTrue(currentInstance.Status.Conditions, "Available", generation) {
+					return fmt.Errorf("CR/status 尚未收敛: generation=%d status=%#v", currentInstance.Generation, currentInstance.Status)
+				}
+				return nil
+			}, 5*time.Minute, 2*time.Second).Should(Succeed())
+			currentNodePods := endpointPodNames(ctx, gh82ManagedName, int(desiredNodes))
+			currentControlPods := endpointPodNames(ctx, gh82ManagedName+"-control", 2,
+				gh82ManagedName+"-cluster-", gh82ManagedName+"-unscheduled-")
+			currentPods := append(append([]string(nil), currentNodePods...), currentControlPods...)
+			expectPodsReplaced(ctx, currentPods, baselineUIDs)
+			for _, podName := range currentPods {
+				pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+				Expect(getErr).NotTo(HaveOccurred())
+				Expect(pod.Spec.Containers[0].Args).To(Equal(expectedRoleArgs(podName)))
+				assertGH82Args(pod.Spec.Containers[0].Args, true)
+				assertPodMetricsNegotiation(ctx, podName, verifyRoleMetrics(podName))
+			}
+		}, SpecTimeout(30*time.Minute))
+	}
 })
 
 func daemonShardedScenarioID(sequence string) string {
