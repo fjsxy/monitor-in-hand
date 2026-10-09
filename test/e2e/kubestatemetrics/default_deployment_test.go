@@ -16,6 +16,7 @@ import (
 	"time"
 
 	monitoringv1alpha1 "github.com/fjsxy/monitor-in-hand/api/v1alpha1"
+	kubestatemetricssupport "github.com/fjsxy/monitor-in-hand/test/e2e/kubestatemetrics/support"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
@@ -699,8 +700,8 @@ spec:
 			if strings.Join(actual, ",") != literalName+","+firstMatch+","+secondMatch {
 				return fmt.Errorf("Namespace 展开列表尚未包含新增匹配项")
 			}
-			if deployment.Generation <= initialGeneration || deployment.Status.AvailableReplicas != 1 {
-				return fmt.Errorf("rollout 尚未完成: generation=%d available=%d", deployment.Generation, deployment.Status.AvailableReplicas)
+			if err := kubestatemetricssupport.SingleReplicaRolloutComplete(deployment, initialGeneration); err != nil {
+				return err
 			}
 			return nil
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
