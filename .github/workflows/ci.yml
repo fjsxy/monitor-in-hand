@@ -171,8 +171,8 @@ jobs:
         run: >-
           go run ./cmd/phase1-gate
           --reports artifacts
-          --expected-blocking-count 163
-          --expected-e2e-count 46
+          --expected-blocking-count 173
+          --expected-e2e-count 52
       - name: 校验全部上游 blocking job
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}

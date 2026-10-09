@@ -101,7 +101,7 @@ spec:
 
 只有 `mode: StatefulSetSharded` 可以携带 `statefulSetSharded`；`Deployment` 与 `StatefulSetSharded` 往返切换时会先确认旧 workload 消失，因此允许短暂采集空窗。
 
-默认 collector 是两个版本共同支持的固定 28 项 catalog。也可以选择其中的显式子集，并用 Go regexp 的未锚定 `MatchString` 语义过滤指标；`podResources` 直接使用 Kubernetes `ResourceRequirements`，省略时不注入 requests/limits：
+默认 collector 的有效范围是两个固定版本共同支持的 28 项 catalog。`Deployment` 和 `StatefulSetSharded` 会省略 `--resources`，由 kube-state-metrics 的上游默认集合决定采集范围；`DaemonSetSharded` 例外，它会为 node、unscheduled 和 cluster 三个角色显式下发互不重叠的 `--resources`。也可以选择 catalog 中的显式子集，并用 Go regexp 的未锚定 `MatchString` 语义过滤指标；`podResources` 直接使用 Kubernetes `ResourceRequirements`，省略时不注入 requests/limits：
 
 ```yaml
 spec:
@@ -121,7 +121,7 @@ spec:
       memory: 256Mi
 ```
 
-`collectors.mode` 仅支持 `Default`（`names` 必须为空）和 `Include`（非空、无重复且只能使用共同 catalog）；`metricFilter.mode` 仅支持 `All`、`Allow`、`Deny`。Allow/Deny pattern 必须非空、是合法 Go regexp 且不含逗号。解析后的 collector 列表通过 `status.effectiveCollectors` 报告。`podResources` 的 requests/limits 会完整下发；由于稳定 API 不开放 Pod `resourceClaims` 来源声明，非空 `podResources.claims` 会返回 `InvalidSpec`。
+`collectors.mode` 仅支持 `Default`（`names` 必须为空）和 `Include`（非空、无重复且只能使用共同 catalog）；`Include` 会按声明顺序通过 `--resources` 显式下发。`metricFilter.mode` 仅支持 `All`、`Allow`、`Deny`。Allow/Deny pattern 必须非空、是合法 Go regexp 且不含逗号。`status.effectiveCollectors` 始终报告受管实例整体的有效 collector 集合，不从单个角色的启动参数反推。`podResources` 的 requests/limits 会完整下发；由于稳定 API 不开放 Pod `resourceClaims` 来源声明，非空 `podResources.claims` 会返回 `InvalidSpec`。
 
 ## 部署预检
 

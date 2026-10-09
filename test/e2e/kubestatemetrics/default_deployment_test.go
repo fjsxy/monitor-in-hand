@@ -27,12 +27,14 @@ import (
 )
 
 const (
-	operatorNamespace = "monitor-in-hand-system"
-	targetNamespace   = "monitor-in-hand-test"
-	instanceName      = "default-deployment"
-	managedName       = "ksm-default-deployment"
-	lifecycleName     = "lifecycle"
-	lifecycleManaged  = "ksm-lifecycle"
+	operatorNamespace   = "monitor-in-hand-system"
+	targetNamespace     = "monitor-in-hand-test"
+	instanceName        = "default-deployment"
+	managedName         = "ksm-default-deployment"
+	convergenceName     = "default-convergence"
+	convergenceWorkload = "ksm-default-convergence"
+	lifecycleName       = "lifecycle"
+	lifecycleManaged    = "ksm-lifecycle"
 )
 
 type scenario struct {
@@ -145,7 +147,7 @@ spec:
 		Expect(podSpec.Containers).To(HaveLen(1))
 		container := podSpec.Containers[0]
 		Expect(container.Image).To(Equal(active.image))
-		Expect(container.Args).To(ContainElement("--resources=" + strings.Join(sharedCollectorCatalog(), ",")))
+		Expect(container.Args).NotTo(ContainElement(HavePrefix("--resources")))
 		effectiveNamespaces, err := namespacesFromArgs(container.Args)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(effectiveNamespaces).To(ContainElement(targetNamespace))
@@ -201,6 +203,89 @@ spec:
 
 		By("通过真实 Service 端口读取指标，确认 kube-state-metrics 可用")
 		assertMetrics(ctx, managedName, []string{"kube_pod_info"}, nil)
+	}, SpecTimeout(15*time.Minute))
+
+	It(fmt.Sprintf("[%s] 已有 Default 实例不修改 CR 即收敛到上游默认参数", defaultConvergenceScenarioID()), func(ctx SpecContext) {
+		By("提交显式 Default 实例并记录 CR generation、Pod UID 与所有权")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  collectors:
+    mode: Default
+`, convergenceName, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		waitForInstanceReady(ctx, convergenceName, convergenceWorkload)
+		instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", convergenceName)
+		Expect(err).NotTo(HaveOccurred())
+		generation := instance.Generation
+		ownerUID := instance.UID
+		managedResources := append([]monitoringv1alpha1.ManagedResourceReference(nil), instance.Status.ManagedResources...)
+		initialPodName := endpointPodNames(ctx, convergenceWorkload, 1)[0]
+		initialPod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", initialPodName)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("不修改 CR，将已拥有 Deployment 改成旧式显式 28 项 resources 参数")
+		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
+		Expect(err).NotTo(HaveOccurred())
+		initialDeploymentGeneration := deployment.Generation
+		driftedArgs := append([]string{"--resources=" + strings.Join(sharedCollectorCatalog(), ",")}, deployment.Spec.Template.Spec.Containers[0].Args...)
+		patch, err := json.Marshal([]map[string]any{{
+			"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": driftedArgs,
+		}})
+		Expect(err).NotTo(HaveOccurred())
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+			"patch", "deployment/"+convergenceWorkload, "--type=json", "--patch", string(patch))
+		drifted, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(drifted.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--resources=" + strings.Join(sharedCollectorCatalog(), ",")))
+		Expect(drifted.Generation).To(BeNumerically(">", initialDeploymentGeneration))
+		driftedGeneration := drifted.Generation
+
+		By("等待 Operator 恢复期望 Pod template，并验证 Pod 更新、可用性和实例不变量")
+		Eventually(func() error {
+			current, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
+			if getErr != nil {
+				return getErr
+			}
+			if current.Generation <= driftedGeneration || current.Status.AvailableReplicas != 1 {
+				return fmt.Errorf("Deployment 尚未在漂移后恢复: generation=%d drifted=%d available=%d", current.Generation, driftedGeneration, current.Status.AvailableReplicas)
+			}
+			for _, argument := range current.Spec.Template.Spec.Containers[0].Args {
+				if strings.HasPrefix(argument, "--resources") {
+					return fmt.Errorf("Deployment 仍包含 resources 参数: %v", current.Spec.Template.Spec.Containers[0].Args)
+				}
+			}
+			currentInstance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", convergenceName)
+			if getErr != nil {
+				return getErr
+			}
+			if currentInstance.Generation != generation || currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady ||
+				currentInstance.Status.ObservedGeneration != generation || currentInstance.Status.AvailablePods != 1 {
+				return fmt.Errorf("CR 未在原 generation 上收敛: generation=%d observed=%d phase=%s available=%d",
+					currentInstance.Generation, currentInstance.Status.ObservedGeneration, currentInstance.Status.Phase, currentInstance.Status.AvailablePods)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+		finalPodName := endpointPodNames(ctx, convergenceWorkload, 1)[0]
+		finalPod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", finalPodName)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(finalPod.UID).NotTo(Equal(initialPod.UID))
+		instance, err = getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", convergenceName)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(instance.Status.KubeStateMetricsVersion).To(Equal(active.version))
+		Expect(instance.Status.EffectiveCollectors).To(Equal(sharedCollectorCatalog()))
+		Expect(instance.Status.ManagedResources).To(Equal(managedResources))
+		deployment, err = getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
+		effectiveNamespaces, err := namespacesFromArgs(deployment.Spec.Template.Spec.Containers[0].Args)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(effectiveNamespaces).To(ContainElement(targetNamespace))
+		assertOwnerReference(deployment, string(ownerUID))
+		assertMetrics(ctx, convergenceWorkload, []string{"kube_pod_info"}, nil)
 	}, SpecTimeout(15*time.Minute))
 
 	It(fmt.Sprintf("[%s] 覆盖停用、挂起、恢复与 finalizer 删除阻塞", lifecycleScenarioID()), func(ctx SpecContext) {
@@ -294,6 +379,11 @@ spec:
 			}
 			if deployment.Status.AvailableReplicas != 1 {
 				return fmt.Errorf("恢复后的 Deployment availableReplicas=%d", deployment.Status.AvailableReplicas)
+			}
+			for _, argument := range deployment.Spec.Template.Spec.Containers[0].Args {
+				if strings.HasPrefix(argument, "--resources") {
+					return fmt.Errorf("恢复后的 Default Deployment 仍包含 resources 参数: %v", deployment.Spec.Template.Spec.Containers[0].Args)
+				}
 			}
 			return nil
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
@@ -903,6 +993,16 @@ func lifecycleScenarioID() string {
 	return "E2E-UNSUPPORTED-KSM-002"
 }
 
+func defaultConvergenceScenarioID() string {
+	if os.Getenv("KUBERNETES_VERSION") == "1.19" {
+		return "E2E-119-KSM-GH81-001"
+	}
+	if os.Getenv("KUBERNETES_VERSION") == "1.28" {
+		return "E2E-128-KSM-GH81-001"
+	}
+	return "E2E-UNSUPPORTED-KSM-GH81-001"
+}
+
 func dynamicNamespaceScenarioID() string {
 	if os.Getenv("KUBERNETES_VERSION") == "1.19" {
 		return "E2E-119-KSM-006"
@@ -1025,6 +1125,10 @@ func assertVersionSecurity(podSpec corev1.PodSpec, security *corev1.SecurityCont
 
 func assertManagedMetadata(object metav1.Object, ownerUID string) {
 	assertStableLabels(object, instanceName)
+	assertOwnerReference(object, ownerUID)
+}
+
+func assertOwnerReference(object metav1.Object, ownerUID string) {
 	owners := object.GetOwnerReferences()
 	Expect(owners).To(HaveLen(1))
 	Expect(string(owners[0].UID)).To(Equal(ownerUID))

@@ -3,6 +3,7 @@ package controller_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -121,8 +122,8 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		deployment := &appsv1.Deployment{}
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
 		Expect(*deployment.Spec.Replicas).To(Equal(int32(1)))
-		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElements(
-			HavePrefix("--resources="),
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).NotTo(ContainElement(HavePrefix("--resources")))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElement(
 			SatisfyAll(HavePrefix("--namespaces="), ContainSubstring(namespace)),
 		))
 		Expect(deployment.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{}))
@@ -197,6 +198,132 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Entry("Kubernetes 1.19 profile", "v1.19.16", "2.3.0", "119"),
 		Entry("Kubernetes 1.28 profile", "v1.28.15", "2.11.0", "128"),
 	)
+
+	DescribeTable("IT-KSM-GH81-001 Default StatefulSetSharded 落地上游默认参数并保留完整有效集合", func(gitVersion, caseSuffix string) {
+		By("准备显式 Default 的两分片受管实例")
+		namespace := "it-gh81-stateful-" + caseSuffix + "-" + suffix
+		name := "gh81-stateful-" + caseSuffix + "-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode: monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+					StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{
+						Shards: 2,
+					},
+				},
+				Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{Mode: monitoringv1alpha1.CollectorModeDefault},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("调谐并读取实际 StatefulSet 与 status")
+		reconcile(name, gitVersion)
+		statefulSet := &appsv1.StatefulSet{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, statefulSet)).To(Succeed())
+		args := statefulSet.Spec.Template.Spec.Containers[0].Args
+		Expect(args).NotTo(ContainElement(HavePrefix("--resources")))
+		Expect(args).To(ContainElements("--pod=$(POD_NAME)", "--pod-namespace=$(POD_NAMESPACE)"))
+		Expect(args).To(ContainElement(SatisfyAll(HavePrefix("--namespaces="), ContainSubstring(namespace))))
+
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.EffectiveCollectors).To(Equal(defaultCollectorCatalog()))
+		Expect(actual.Status).To(SatisfyAll(
+			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeStatefulSetSharded),
+			HaveField("DesiredPods", int32(2)),
+			HaveField("ManagedResources", HaveLen(7)),
+		))
+	},
+		Entry("Kubernetes 1.19 profile", "v1.19.16", "119"),
+		Entry("Kubernetes 1.28 profile", "v1.28.15", "128"),
+	)
+
+	It("IT-KSM-GH81-002 Default DaemonSetSharded 保持三角色显式资源边界", func() {
+		By("准备 Kubernetes 1.28 支持的 Default DaemonSetSharded 受管实例")
+		namespace := "it-gh81-daemon-" + suffix
+		name := "gh81-daemon-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode:             monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+					DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+				},
+				Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{Mode: monitoringv1alpha1.CollectorModeDefault},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+
+		By("调谐并验证 node、cluster、unscheduled 三角色参数")
+		reconcile(name, "v1.28.15")
+		node := &appsv1.DaemonSet{}
+		cluster := &appsv1.Deployment{}
+		unscheduled := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, node)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, cluster)).To(Succeed())
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-unscheduled"}, unscheduled)).To(Succeed())
+		Expect(node.Spec.Template.Spec.Containers[0].Args).To(ContainElements("--resources=pods", "--node=$(NODE_NAME)"))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(ContainElements("--resources=pods", `--node=""`))
+		clusterCollectors := defaultCollectorCatalogWithoutPods()
+		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--resources=" + strings.Join(clusterCollectors, ",")))
+
+		By("验证实例 status 报告三角色联合覆盖的完整集合")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Status.EffectiveCollectors).To(Equal(defaultCollectorCatalog()))
+		Expect(actual.Status).To(SatisfyAll(
+			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDaemonSetSharded),
+			HaveField("DesiredPods", int32(2)),
+			HaveField("ManagedResources", HaveLen(8)),
+		))
+	})
+
+	It("IT-KSM-GH81-003 已有 Default Deployment 不修改 CR 即收敛到省略 resources 参数", func() {
+		By("准备显式 Default 实例并记录 CR generation 与所有权")
+		namespace := "it-gh81-converge-" + suffix
+		name := "gh81-converge-" + suffix
+		resourceName := "ksm-" + name
+		Expect(testClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: namespace,
+				Collectors:      monitoringv1alpha1.KubeStateMetricsCollectors{Mode: monitoringv1alpha1.CollectorModeDefault},
+			},
+		}
+		Expect(testClient.Create(ctx, instance)).To(Succeed())
+		reconcile(name, "v1.28.15")
+		actual := &monitoringv1alpha1.KubeStateMetrics{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		generation := actual.Generation
+
+		By("将已拥有 workload 改成旧式显式 28 项参数，不改动 CR")
+		deployment := &appsv1.Deployment{}
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		deployment.Spec.Template.Spec.Containers[0].Args = append(
+			[]string{"--resources=" + strings.Join(defaultCollectorCatalog(), ",")},
+			deployment.Spec.Template.Spec.Containers[0].Args...,
+		)
+		Expect(testClient.Update(ctx, deployment)).To(Succeed())
+		driftedResourceVersion := deployment.ResourceVersion
+
+		By("重新调谐并验证 workload 参数、所有权与 status 在原 generation 上收敛")
+		reconcile(name, "v1.28.15")
+		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
+		Expect(deployment.ResourceVersion).NotTo(Equal(driftedResourceVersion))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).NotTo(ContainElement(HavePrefix("--resources")))
+		Expect(deployment.OwnerReferences).To(ContainElement(HaveField("UID", actual.UID)))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.Generation).To(Equal(generation))
+		Expect(actual.Status.EffectiveCollectors).To(Equal(defaultCollectorCatalog()))
+	})
 
 	DescribeTable("IT-KSM-002 在前置条件失败时只更新 status 且零写入",
 		func(gitVersion string, createNamespace bool, wantReason string) {
@@ -1733,6 +1860,26 @@ func expectStableManagedLabels(labels map[string]string, instanceID, version str
 }
 
 func boolPointer(value bool) *bool { return &value }
+
+func defaultCollectorCatalog() []string {
+	return []string{
+		"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
+		"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
+		"namespaces", "networkpolicies", "nodes", "persistentvolumeclaims", "persistentvolumes", "poddisruptionbudgets",
+		"pods", "replicasets", "replicationcontrollers", "resourcequotas", "secrets", "services", "statefulsets",
+		"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
+	}
+}
+
+func defaultCollectorCatalogWithoutPods() []string {
+	collectors := make([]string, 0, len(defaultCollectorCatalog())-1)
+	for _, collector := range defaultCollectorCatalog() {
+		if collector != "pods" {
+			collectors = append(collectors, collector)
+		}
+	}
+	return collectors
+}
 
 func deleteNamespaceInEnvtest(ctx context.Context, name string) {
 	namespace := &corev1.Namespace{}
