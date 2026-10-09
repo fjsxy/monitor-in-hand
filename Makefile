@@ -96,6 +96,7 @@ test-unit: ## Run control-plane unit tests and enforce phase-one statement cover
 		--junit-report=junit.xml --output-dir="$(UNIT_REPORT_DIR)/collection-support" ./test/e2e/collection/support
 	$(GINKGO) --fail-on-pending --fail-on-empty \
 		--junit-report=junit.xml --output-dir="$(UNIT_REPORT_DIR)/kubestatemetrics-support" ./test/e2e/kubestatemetrics/support
+	go test ./test/e2e/kubestatemetrics -run '^TestPatchObjectReturnsPatchedServerRepresentation$$'
 	go run ./cmd/phase1-gate --coverage-profile "$(UNIT_COVERAGE_PROFILE)" \
 		--aggregate-coverage 80 --package-coverage 70
 

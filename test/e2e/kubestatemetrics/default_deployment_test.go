@@ -236,9 +236,8 @@ spec:
 			"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": driftedArgs,
 		}})
 		Expect(err).NotTo(HaveOccurred())
-		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
-			"patch", "deployment/"+convergenceWorkload, "--type=json", "--patch", string(patch))
-		drifted, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
+		// 直接校验 PATCH 响应中的服务端对象，避免 owner watch 在后续 GET 前已恢复期望状态造成竞态。
+		drifted, err := patchObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload, patch)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(drifted.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--resources=" + strings.Join(sharedCollectorCatalog(), ",")))
 		Expect(drifted.Generation).To(BeNumerically(">", initialDeploymentGeneration))
@@ -1386,6 +1385,25 @@ func getObject[T any](ctx context.Context, namespace, kind, name string) (*T, er
 	object := new(T)
 	if err := json.Unmarshal(output, object); err != nil {
 		return nil, fmt.Errorf("解析 %s/%s: %w", kind, name, err)
+	}
+	return object, nil
+}
+
+func patchObject[T any](ctx context.Context, namespace, kind, name string, patch []byte) (*T, error) {
+	args := []string{"--context", kubeContext}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+	args = append(args, "patch", kind+"/"+name, "--type=json", "--patch", string(patch), "--output=json")
+	command := exec.CommandContext(ctx, kubectlBin, args...)
+	output, err := command.CombinedOutput()
+	_, _ = fmt.Fprintf(GinkgoWriter, "$ %s %s\n%s", kubectlBin, strings.Join(args, " "), output)
+	if err != nil {
+		return nil, fmt.Errorf("kubectl patch %s/%s: %w: %s", kind, name, err, output)
+	}
+	object := new(T)
+	if err := json.Unmarshal(output, object); err != nil {
+		return nil, fmt.Errorf("解析 patch %s/%s 响应: %w", kind, name, err)
 	}
 	return object, nil
 }
