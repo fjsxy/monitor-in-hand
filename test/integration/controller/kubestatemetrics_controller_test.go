@@ -266,6 +266,7 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 				HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDeployment),
 				HaveField("EffectiveCollectors", []string{"pods", "deployments"}),
 			))
+			expectedStatus := actual.Status.DeepCopy()
 
 			By("模拟缺少本 Issue 参数的旧模板，再以未变的 CR 调谐收敛")
 			deployment.Spec.Template.Spec.Containers[0].Args = withoutGH82Args(deployment.Spec.Template.Spec.Containers[0].Args)
@@ -275,13 +276,17 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 			Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal(wantArgs))
 			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 			Expect(actual.Generation).To(Equal(generation))
-			Expect(actual.Status.ObservedGeneration).To(Equal(generation))
+			Expect(actual.Status).To(Equal(*expectedStatus))
 
-			By("重复调谐并确认已收敛模板不产生漂移")
-			resourceVersion := deployment.ResourceVersion
+			By("重复调谐并确认已收敛模板与 status 都不产生漂移")
+			workloadResourceVersion := deployment.ResourceVersion
+			instanceResourceVersion := actual.ResourceVersion
 			reconcile(name, gitVersion)
 			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, deployment)).To(Succeed())
-			Expect(deployment.ResourceVersion).To(Equal(resourceVersion))
+			Expect(deployment.ResourceVersion).To(Equal(workloadResourceVersion))
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			Expect(actual.ResourceVersion).To(Equal(instanceResourceVersion))
+			Expect(actual.Status).To(Equal(*expectedStatus))
 		},
 		Entry("Kubernetes 1.19 profile", "v1.19.16", "119"),
 		Entry("Kubernetes 1.28 profile", "v1.28.15", "128"),
@@ -424,6 +429,7 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 				HaveField("DesiredPods", int32(2)),
 				HaveField("EffectiveCollectors", []string{"pods", "deployments"}),
 			))
+			expectedStatus := actual.Status.DeepCopy()
 
 			By("模拟旧 StatefulSet 模板后验证无需修改 CR 即恢复全部参数")
 			statefulSet.Spec.Template.Spec.Containers[0].Args = withoutGH82Args(statefulSet.Spec.Template.Spec.Containers[0].Args)
@@ -433,13 +439,17 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 			Expect(statefulSet.Spec.Template.Spec.Containers[0].Args).To(Equal(wantArgs))
 			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 			Expect(actual.Generation).To(Equal(generation))
-			Expect(actual.Status.ObservedGeneration).To(Equal(generation))
+			Expect(actual.Status).To(Equal(*expectedStatus))
 
-			By("重复调谐并确认已收敛模板不产生漂移")
-			resourceVersion := statefulSet.ResourceVersion
+			By("重复调谐并确认已收敛模板与 status 都不产生漂移")
+			workloadResourceVersion := statefulSet.ResourceVersion
+			instanceResourceVersion := actual.ResourceVersion
 			reconcile(name, gitVersion)
 			Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, statefulSet)).To(Succeed())
-			Expect(statefulSet.ResourceVersion).To(Equal(resourceVersion))
+			Expect(statefulSet.ResourceVersion).To(Equal(workloadResourceVersion))
+			Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+			Expect(actual.ResourceVersion).To(Equal(instanceResourceVersion))
+			Expect(actual.Status).To(Equal(*expectedStatus))
 		},
 		Entry("Kubernetes 1.19 profile", "v1.19.16", "119"),
 		Entry("Kubernetes 1.28 profile", "v1.28.15", "128"),
@@ -477,6 +487,7 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDaemonSetSharded),
 			HaveField("EffectiveCollectors", []string{"pods", "deployments"}),
 		))
+		expectedStatus := actual.Status.DeepCopy()
 
 		By("同时模拟三个旧 workload 模板，再以未变的 CR 调谐收敛")
 		node.Spec.Template.Spec.Containers[0].Args = withoutGH82Args(node.Spec.Template.Spec.Containers[0].Args)
@@ -494,15 +505,19 @@ var _ = Describe("KubeStateMetrics reconciliation", func() {
 		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(wantUnscheduled))
 		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
 		Expect(actual.Generation).To(Equal(generation))
-		Expect(actual.Status.ObservedGeneration).To(Equal(generation))
+		Expect(actual.Status).To(Equal(*expectedStatus))
 
-		By("重复调谐并确认三个已收敛模板都不被重写")
+		By("重复调谐并确认三个已收敛模板与 status 都不被重写")
 		versions := []string{node.ResourceVersion, cluster.ResourceVersion, unscheduled.ResourceVersion}
+		instanceResourceVersion := actual.ResourceVersion
 		reconcile(name, "v1.28.15")
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName}, node)).To(Succeed())
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-cluster"}, cluster)).To(Succeed())
 		Expect(testClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: resourceName + "-unscheduled"}, unscheduled)).To(Succeed())
 		Expect([]string{node.ResourceVersion, cluster.ResourceVersion, unscheduled.ResourceVersion}).To(Equal(versions))
+		Expect(testClient.Get(ctx, client.ObjectKey{Name: name}, actual)).To(Succeed())
+		Expect(actual.ResourceVersion).To(Equal(instanceResourceVersion))
+		Expect(actual.Status).To(Equal(*expectedStatus))
 	})
 
 	DescribeTable("IT-KSM-002 在前置条件失败时只更新 status 且零写入",

@@ -467,15 +467,18 @@ spec:
 			for _, args := range [][]string{node.Spec.Template.Spec.Containers[0].Args, cluster.Spec.Template.Spec.Containers[0].Args, unscheduled.Spec.Template.Spec.Containers[0].Args} {
 				assertGH82Args(args, true)
 			}
-			Expect(node.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{
+			wantNodeResources := corev1.ResourceRequirements{
 				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("80Mi")},
-			}))
-			Expect(cluster.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{
+			}
+			wantClusterResources := corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("29m")},
-			}))
-			Expect(unscheduled.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{
+			}
+			wantUnscheduledResources := corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("36Mi")},
-			}))
+			}
+			Expect(node.Spec.Template.Spec.Containers[0].Resources).To(Equal(wantNodeResources))
+			Expect(cluster.Spec.Template.Spec.Containers[0].Resources).To(Equal(wantClusterResources))
+			Expect(unscheduled.Spec.Template.Spec.Containers[0].Resources).To(Equal(wantUnscheduledResources))
 			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", gh82InstanceName)
 			Expect(err).NotTo(HaveOccurred())
 			generation := instance.Generation
@@ -593,7 +596,8 @@ spec:
 					return getErr
 				}
 				if currentInstance.Generation != generation || currentInstance.Status.ObservedGeneration != generation ||
-					currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || currentInstance.Status.AvailablePods != desiredNodes+2 ||
+					currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || currentInstance.Status.DesiredPods != desiredNodes+2 ||
+					currentInstance.Status.AvailablePods != desiredNodes+2 ||
 					!slices.Equal(currentInstance.Status.EffectiveCollectors, []string{"pods", "deployments"}) ||
 					!conditionIsTrue(currentInstance.Status.Conditions, "Ready", generation) ||
 					!conditionIsTrue(currentInstance.Status.Conditions, "Available", generation) {
@@ -611,6 +615,14 @@ spec:
 				Expect(getErr).NotTo(HaveOccurred())
 				Expect(pod.Spec.Containers[0].Args).To(Equal(expectedRoleArgs(podName)))
 				assertGH82Args(pod.Spec.Containers[0].Args, true)
+				switch {
+				case strings.HasPrefix(podName, gh82ManagedName+"-cluster-"):
+					Expect(pod.Spec.Containers[0].Resources).To(Equal(wantClusterResources))
+				case strings.HasPrefix(podName, gh82ManagedName+"-unscheduled-"):
+					Expect(pod.Spec.Containers[0].Resources).To(Equal(wantUnscheduledResources))
+				default:
+					Expect(pod.Spec.Containers[0].Resources).To(Equal(wantNodeResources))
+				}
 				assertPodMetricsNegotiation(ctx, podName, verifyRoleMetrics(podName))
 			}
 		}, SpecTimeout(30*time.Minute))
