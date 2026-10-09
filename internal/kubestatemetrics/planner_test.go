@@ -130,7 +130,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
 			container := deployment.Spec.Template.Spec.Containers[0]
 			Expect(container.Image).To(Equal(wantImage))
-			Expect(container.Args).To(Equal([]string{"--namespaces=monitoring"}))
+			Expect(container.Args).To(Equal(defaultCapabilityArgs("--namespaces=monitoring")))
 			Expect(container.Ports).To(ConsistOf(
 				corev1.ContainerPort{Name: "http-metrics", ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
 				corev1.ContainerPort{Name: "telemetry", ContainerPort: 8081, Protocol: corev1.ProtocolTCP},
@@ -213,7 +213,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		Expect(problem).To(BeNil())
 		Expect(plan.EffectiveCollectors).To(Equal(expectedDefaultCollectors()))
 		deployment := deploymentFrom(plan)
-		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--namespaces=monitoring"}))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal(defaultCapabilityArgs("--namespaces=monitoring")))
 		Expect(deployment.Spec.Template.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{}))
 	},
 		Entry("Kubernetes 1.19", "v1.19.16"),
@@ -232,7 +232,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		deploymentPlan, problem := ksm.BuildPlan(newInstance(), facts)
 		Expect(problem).To(BeNil())
 		Expect(deploymentPlan.EffectiveCollectors).To(Equal(wantDefaultCollectors))
-		Expect(deploymentFrom(deploymentPlan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--namespaces=monitoring"}))
+		Expect(deploymentFrom(deploymentPlan).Spec.Template.Spec.Containers[0].Args).To(Equal(defaultCapabilityArgs("--namespaces=monitoring")))
 
 		By("验证显式 Default 的 StatefulSetSharded 也省略 resources，但保留自动分片参数")
 		statefulInstance := newInstance()
@@ -246,11 +246,11 @@ var _ = Describe("默认 Deployment 规划", func() {
 		statefulPlan, problem := ksm.BuildPlan(statefulInstance, facts)
 		Expect(problem).To(BeNil())
 		Expect(statefulPlan.EffectiveCollectors).To(Equal(wantDefaultCollectors))
-		Expect(statefulSetFrom(statefulPlan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+		Expect(statefulSetFrom(statefulPlan).Spec.Template.Spec.Containers[0].Args).To(Equal(shardedCapabilityArgs(
 			"--namespaces=monitoring",
 			"--pod=$(POD_NAME)",
 			"--pod-namespace=$(POD_NAMESPACE)",
-		}))
+		)))
 
 		By("验证 Default DaemonSetSharded 保持版本边界与受支持版本的三角色 collector 划分")
 		daemonInstance := newInstance()
@@ -268,9 +268,9 @@ var _ = Describe("默认 Deployment 规划", func() {
 			unscheduled := plannedDeploymentNamed(daemonPlan, "ksm-primary-unscheduled")
 			podIndex := slices.Index(wantDefaultCollectors, "pods")
 			clusterCollectors := slices.Delete(append([]string(nil), wantDefaultCollectors...), podIndex, podIndex+1)
-			Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods", "--namespaces=monitoring", "--node=$(NODE_NAME)"}))
-			Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=" + strings.Join(clusterCollectors, ","), "--namespaces=monitoring"}))
-			Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods", "--namespaces=monitoring", `--node=""`}))
+			Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal(shardedCapabilityArgs("--resources=pods", "--namespaces=monitoring", "--node=$(NODE_NAME)")))
+			Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal(shardedCapabilityArgs("--resources="+strings.Join(clusterCollectors, ","), "--namespaces=monitoring")))
+			Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(shardedCapabilityArgs("--resources=pods", "--namespaces=monitoring", `--node=""`)))
 		} else {
 			Expect(daemonPlan).To(BeNil())
 			Expect(problem).To(SatisfyAll(
@@ -288,7 +288,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		includePlan, problem := ksm.BuildPlan(includeInstance, facts)
 		Expect(problem).To(BeNil())
 		Expect(includePlan.EffectiveCollectors).To(Equal([]string{"deployments", "pods"}))
-		Expect(deploymentFrom(includePlan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=deployments,pods", "--namespaces=monitoring"}))
+		Expect(deploymentFrom(includePlan).Spec.Template.Spec.Containers[0].Args).To(Equal(defaultCapabilityArgs("--resources=deployments,pods", "--namespaces=monitoring")))
 	},
 		Entry("Kubernetes 1.19", "v1.19.16", false),
 		Entry("Kubernetes 1.28", "v1.28.15", true),
@@ -312,7 +312,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		By("验证实际参数和 effective collectors 来自同一解析结果")
 		Expect(problem).To(BeNil())
 		Expect(plan.EffectiveCollectors).To(Equal([]string{"pods", "deployments"}))
-		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods,deployments", "--namespaces=monitoring"}))
+		Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal(defaultCapabilityArgs("--resources=pods,deployments", "--namespaces=monitoring")))
 	},
 		Entry("Kubernetes 1.19", "v1.19.16"),
 		Entry("Kubernetes 1.28", "v1.28.15"),
@@ -357,11 +357,11 @@ var _ = Describe("默认 Deployment 规划", func() {
 
 			By("验证 filter 被原样映射到对应参数")
 			Expect(problem).To(BeNil())
-			Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+			Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal(defaultCapabilityArgs(
 				"--resources=pods",
 				wantFilterArg,
 				"--namespaces=monitoring",
-			}))
+			)))
 		},
 		Entry("Kubernetes 1.19 Allow 保留未锚定和合法零命中 pattern", "v1.19.16", monitoringv1alpha1.MetricFilterModeAllow,
 			[]string{"pod_info", "^definitely_no_metric$"}, "--metric-allowlist=pod_info,^definitely_no_metric$"),
@@ -602,13 +602,13 @@ var _ = Describe("StatefulSetSharded 判别 union", func() {
 			Expect(*statefulSet.Spec.Replicas).To(Equal(int32(3)))
 			Expect(statefulSet.Spec.ServiceName).To(Equal("ksm-sharded"))
 			container := statefulSet.Spec.Template.Spec.Containers[0]
-			Expect(container.Args).To(Equal([]string{
+			Expect(container.Args).To(Equal(shardedCapabilityArgs(
 				"--resources=pods,deployments",
 				"--metric-allowlist=kube_pod_info",
 				"--namespaces=team-a,team-b",
 				"--pod=$(POD_NAME)",
 				"--pod-namespace=$(POD_NAMESPACE)",
-			}))
+			)))
 			Expect(container.Env).To(ConsistOf(
 				corev1.EnvVar{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 				corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
@@ -720,18 +720,18 @@ var _ = Describe("DaemonSetSharded 版本能力", func() {
 		cluster := plannedDeploymentNamed(plan, "ksm-daemon-sharded-cluster")
 		unscheduled := plannedDeploymentNamed(plan, "ksm-daemon-sharded-unscheduled")
 		Expect(node.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
-			HaveField("Args", []string{"--resources=pods", "--metric-allowlist=kube_.+_info", "--namespaces=team-a", "--node=$(NODE_NAME)"}),
+			HaveField("Args", shardedCapabilityArgs("--resources=pods", "--metric-allowlist=kube_.+_info", "--namespaces=team-a", "--node=$(NODE_NAME)")),
 			HaveField("Resources", *nodeResources),
 		))
 		Expect(node.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(corev1.EnvVar{
 			Name: "NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}},
 		}))
 		Expect(cluster.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
-			HaveField("Args", []string{"--resources=deployments", "--metric-allowlist=kube_.+_info", "--namespaces=team-a"}),
+			HaveField("Args", shardedCapabilityArgs("--resources=deployments", "--metric-allowlist=kube_.+_info", "--namespaces=team-a")),
 			HaveField("Resources", *clusterResources),
 		))
 		Expect(unscheduled.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
-			HaveField("Args", []string{"--resources=pods", "--metric-allowlist=kube_.+_info", "--namespaces=team-a", `--node=""`}),
+			HaveField("Args", shardedCapabilityArgs("--resources=pods", "--metric-allowlist=kube_.+_info", "--namespaces=team-a", `--node=""`)),
 			HaveField("Resources", *commonResources),
 		))
 
@@ -806,6 +806,98 @@ var _ = Describe("DaemonSetSharded 版本能力", func() {
 			},
 		}, []string{"pods", "deployments"}, "unscheduledPodResources.claims"),
 	)
+})
+
+var _ = Describe("kube-state-metrics 版本能力参数", func() {
+	DescribeTable("UT-KSM-GH82-001 两个 profile 为 Deployment 与 StatefulSetSharded 生成精确参数",
+		func(kubernetesVersion string) {
+			By("准备显式 collector 与过滤条件，使新参数与已有参数同时可观察")
+			instance := &monitoringv1alpha1.KubeStateMetrics{
+				ObjectMeta: metav1.ObjectMeta{Name: "capability-args", UID: types.UID("uid-82-args")},
+				Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+					TargetNamespace: "monitoring",
+					Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{
+						Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods", "deployments"},
+					},
+					MetricFilter: monitoringv1alpha1.KubeStateMetricsMetricFilter{
+						Mode: monitoringv1alpha1.MetricFilterModeAllow, Patterns: []string{"kube_.+_info"},
+					},
+				},
+			}
+			facts := ksm.ClusterFacts{
+				KubernetesVersion: kubernetesVersion, TargetNamespaceExists: true, NamespaceNames: []string{"monitoring"},
+			}
+
+			By("验证普通 Deployment 启用日志与 gzip，但不启用 API server cache")
+			plan, problem := ksm.BuildPlan(instance, facts)
+			Expect(problem).To(BeNil())
+			Expect(deploymentFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+				"--resources=pods,deployments",
+				"--metric-allowlist=kube_.+_info",
+				"--namespaces=monitoring",
+				"--logtostderr=true",
+				"--v=0",
+				"--enable-gzip-encoding=true",
+			}))
+
+			By("验证 StatefulSetSharded 保留自动分片身份并启用 API server cache")
+			instance.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+				Mode:               monitoringv1alpha1.DeploymentModeStatefulSetSharded,
+				StatefulSetSharded: &monitoringv1alpha1.KubeStateMetricsStatefulSetShardedSpec{Shards: 2},
+			}
+			plan, problem = ksm.BuildPlan(instance, facts)
+			Expect(problem).To(BeNil())
+			Expect(statefulSetFrom(plan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+				"--resources=pods,deployments",
+				"--metric-allowlist=kube_.+_info",
+				"--namespaces=monitoring",
+				"--pod=$(POD_NAME)",
+				"--pod-namespace=$(POD_NAMESPACE)",
+				"--logtostderr=true",
+				"--v=0",
+				"--enable-gzip-encoding=true",
+				"--use-apiserver-cache=true",
+			}))
+		},
+		Entry("Kubernetes 1.19 / kube-state-metrics 2.3.0", "v1.19.16"),
+		Entry("Kubernetes 1.28 / kube-state-metrics 2.11.0", "v1.28.15"),
+	)
+
+	It("UT-KSM-GH82-002 DaemonSetSharded 三个角色都按分片拓扑启用 API server cache", func() {
+		By("准备 Kubernetes 1.28 支持的三角色分片声明")
+		instance := &monitoringv1alpha1.KubeStateMetrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "daemon-capability-args", UID: types.UID("uid-82-daemon-args")},
+			Spec: monitoringv1alpha1.KubeStateMetricsSpec{
+				TargetNamespace: "monitoring",
+				Deployment: monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
+					Mode:             monitoringv1alpha1.DeploymentModeDaemonSetSharded,
+					DaemonSetSharded: &monitoringv1alpha1.KubeStateMetricsDaemonSetShardedSpec{},
+				},
+				Collectors: monitoringv1alpha1.KubeStateMetricsCollectors{
+					Mode: monitoringv1alpha1.CollectorModeInclude, Names: []string{"pods", "deployments"},
+				},
+			},
+		}
+
+		By("执行纯规划并精确验证 node、cluster 与 unscheduled 的参数")
+		plan, problem := ksm.BuildPlan(instance, ksm.ClusterFacts{
+			KubernetesVersion: "v1.28.15", TargetNamespaceExists: true, NamespaceNames: []string{"monitoring"},
+		})
+		Expect(problem).To(BeNil())
+		node := resourceOfType[*appsv1.DaemonSet](plan)
+		cluster := plannedDeploymentNamed(plan, "ksm-daemon-capability-args-cluster")
+		unscheduled := plannedDeploymentNamed(plan, "ksm-daemon-capability-args-unscheduled")
+		commonArgs := []string{"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true"}
+		Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal(append(
+			[]string{"--resources=pods", "--namespaces=monitoring", "--node=$(NODE_NAME)"}, commonArgs...,
+		)))
+		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal(append(
+			[]string{"--resources=deployments", "--namespaces=monitoring"}, commonArgs...,
+		)))
+		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal(append(
+			[]string{"--resources=pods", "--namespaces=monitoring", `--node=""`}, commonArgs...,
+		)))
+	})
 })
 
 var _ = Describe("受管实例 phase 推导", func() {
@@ -1053,6 +1145,14 @@ func resourceOfType[T client.Object](plan *ksm.ResourcePlan) T {
 	Fail(fmt.Sprintf("resource %T not found in resource plan", *new(T)))
 	var zero T
 	return zero
+}
+
+func defaultCapabilityArgs(args ...string) []string {
+	return append(args, "--logtostderr=true", "--v=0", "--enable-gzip-encoding=true")
+}
+
+func shardedCapabilityArgs(args ...string) []string {
+	return append(defaultCapabilityArgs(args...), "--use-apiserver-cache=true")
 }
 
 func expectInvalidSpecAcrossProfiles(instance *monitoringv1alpha1.KubeStateMetrics, wantMessage string) {

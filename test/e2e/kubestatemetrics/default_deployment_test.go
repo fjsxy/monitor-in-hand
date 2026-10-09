@@ -2,6 +2,7 @@ package kubestatemetrics_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -366,6 +368,123 @@ spec:
 		By("通过真实 Service 端口读取指标，确认更新后的默认采集仍可用")
 		assertMetrics(ctx, convergenceWorkload, []string{"kube_pod_info"}, nil)
 	}, SpecTimeout(15*time.Minute))
+
+	It(fmt.Sprintf("[%s] Deployment 按 profile 启用日志与 gzip 并收敛旧模板", gh82ScenarioID("001")), func(ctx SpecContext) {
+		const gh82InstanceName = "gh82-deployment"
+		const gh82ManagedName = "ksm-gh82-deployment"
+		By("提交显式 collector、metric 与 namespace filter 的 Deployment 实例")
+		manifest := fmt.Sprintf(`apiVersion: monitoring.fjsxy.github.io/v1alpha1
+kind: KubeStateMetrics
+metadata:
+  name: %s
+spec:
+  targetNamespace: %s
+  collectors:
+    mode: Include
+    names: [pods]
+  metricFilter:
+    mode: Allow
+    patterns: [kube_pod_info]
+  namespaceFilter:
+    mode: Include
+    names: [%s]
+`, gh82InstanceName, targetNamespace, targetNamespace)
+		runWithInput(ctx, repoRoot, manifest, kubectlBin, "--context", kubeContext, "apply", "--filename", "-")
+		waitForDeploymentTopology(ctx, gh82InstanceName, gh82ManagedName)
+
+		By("验证实际采集进程的精确参数、status 与 gzip 协商")
+		wantArgs := []string{
+			"--resources=pods", "--metric-allowlist=kube_pod_info", "--namespaces=" + targetNamespace,
+			"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true",
+		}
+		deployment, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(Equal(wantArgs))
+		assertGH82Args(deployment.Spec.Template.Spec.Containers[0].Args, false)
+		instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", gh82InstanceName)
+		Expect(err).NotTo(HaveOccurred())
+		generation := instance.Generation
+		Expect(instance.Status).To(SatisfyAll(
+			HaveField("ObservedGeneration", generation),
+			HaveField("KubeStateMetricsVersion", active.version),
+			HaveField("DeploymentMode", monitoringv1alpha1.DeploymentModeDeployment),
+			HaveField("EffectiveCollectors", []string{"pods"}),
+			HaveField("AvailablePods", int32(1)),
+		))
+		initialPodNames := endpointPodNames(ctx, gh82ManagedName, 1)
+		initialUIDs := podUIDs(ctx, initialPodNames)
+		initialPod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", initialPodNames[0])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(initialPod.Spec.Containers[0].Args).To(Equal(wantArgs))
+		assertGH82Args(initialPod.Spec.Containers[0].Args, false)
+		assertPodMetricsNegotiation(ctx, initialPodNames[0], func(body []byte) error {
+			if !strings.Contains(string(body), "kube_pod_info") {
+				return fmt.Errorf("metrics 缺少 kube_pod_info")
+			}
+			return nil
+		})
+
+		By("暂停 Operator 并构造缺少本 Issue 参数的升级前 Deployment 模板")
+		operatorPaused := false
+		DeferCleanup(func(cleanupCtx SpecContext) {
+			if operatorPaused {
+				resumeOperator(cleanupCtx)
+			}
+		}, NodeTimeout(5*time.Minute))
+		operatorPaused = true
+		pauseOperator(ctx)
+		deployment, err = getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName)
+		Expect(err).NotTo(HaveOccurred())
+		deployment.Spec.Template.Spec.Containers[0].Args = withoutGH82E2EArgs(deployment.Spec.Template.Spec.Containers[0].Args)
+		replaceObject(ctx, deployment)
+		run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+			"rollout", "status", "deployment/"+gh82ManagedName, "--timeout=5m")
+		baselinePodNames := endpointPodNames(ctx, gh82ManagedName, 1)
+		baselineUIDs := podUIDs(ctx, baselinePodNames)
+		Expect(baselineUIDs).NotTo(Equal(initialUIDs))
+		baselinePod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", baselinePodNames[0])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(baselinePod.Spec.Containers[0].Args).To(Equal([]string{
+			"--resources=pods", "--metric-allowlist=kube_pod_info", "--namespaces=" + targetNamespace,
+		}))
+
+		By("恢复当前 Operator，验证 CR generation 不变时 workload、Pod 与 status 自动收敛")
+		resumeOperator(ctx)
+		operatorPaused = false
+		Eventually(func() error {
+			current, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName)
+			if getErr != nil {
+				return getErr
+			}
+			if !slices.Equal(current.Spec.Template.Spec.Containers[0].Args, wantArgs) || current.Status.AvailableReplicas != 1 || current.Status.UpdatedReplicas != 1 {
+				return fmt.Errorf("Deployment 尚未收敛: args=%v available=%d updated=%d", current.Spec.Template.Spec.Containers[0].Args, current.Status.AvailableReplicas, current.Status.UpdatedReplicas)
+			}
+			currentInstance, getErr := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", gh82InstanceName)
+			if getErr != nil {
+				return getErr
+			}
+			if currentInstance.Generation != generation || currentInstance.Status.ObservedGeneration != generation ||
+				currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || currentInstance.Status.AvailablePods != 1 ||
+				!slices.Equal(currentInstance.Status.EffectiveCollectors, []string{"pods"}) ||
+				!conditionIsTrue(currentInstance.Status.Conditions, "Ready", generation) ||
+				!conditionIsTrue(currentInstance.Status.Conditions, "Available", generation) {
+				return fmt.Errorf("CR/status 尚未收敛: generation=%d status=%#v", currentInstance.Generation, currentInstance.Status)
+			}
+			return nil
+		}, 5*time.Minute, 2*time.Second).Should(Succeed())
+		currentPodNames := endpointPodNames(ctx, gh82ManagedName, 1)
+		expectPodsReplaced(ctx, currentPodNames, baselineUIDs)
+		currentPod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", currentPodNames[0])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(currentPod.Spec.Containers[0].Args).To(Equal(wantArgs))
+		assertGH82Args(currentPod.Spec.Containers[0].Args, false)
+		assertPodMetricsNegotiation(ctx, currentPodNames[0], func(body []byte) error {
+			if !strings.Contains(string(body), "kube_pod_info") {
+				return fmt.Errorf("收敛后 metrics 缺少 kube_pod_info")
+			}
+			return nil
+		})
+	}, SpecTimeout(20*time.Minute))
 
 	It(fmt.Sprintf("[%s] 覆盖停用、挂起、恢复与 finalizer 删除阻塞", lifecycleScenarioID()), func(ctx SpecContext) {
 		By("创建独立的生命周期受管实例并等待其就绪")
@@ -1519,6 +1638,227 @@ func assertTargetMetricsBody(ctx SpecContext, target string, remotePort int, ver
 		}
 		return verify(body)
 	}, time.Minute, time.Second).Should(Succeed())
+}
+
+func assertPodMetricsNegotiation(ctx SpecContext, podName string, verify func([]byte) error) {
+	GinkgoHelper()
+	// 为当前实际 Pod 建立独立转发，避免 Service 负载均衡掩盖某个采集进程的行为。
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	Expect(err).NotTo(HaveOccurred())
+	port := listener.Addr().(*net.TCPAddr).Port
+	Expect(listener.Close()).To(Succeed())
+
+	logBuffer := &bytes.Buffer{}
+	command := exec.CommandContext(ctx, kubectlBin, "--context", kubeContext, "--namespace", targetNamespace,
+		"port-forward", "pod/"+podName, fmt.Sprintf("%d:%d", port, 8080))
+	command.Stdout = logBuffer
+	command.Stderr = logBuffer
+	Expect(command.Start()).To(Succeed())
+	defer func() {
+		if command.Process != nil {
+			_ = command.Process.Kill()
+			_, _ = command.Process.Wait()
+		}
+	}()
+
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{DisableCompression: true},
+	}
+	requestMetrics := func(acceptGZIP bool) (*http.Response, []byte, error) {
+		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/metrics", port), nil)
+		if requestErr != nil {
+			return nil, nil, requestErr
+		}
+		if acceptGZIP {
+			request.Header.Set("Accept-Encoding", "gzip")
+		}
+		response, requestErr := client.Do(request)
+		if requestErr != nil {
+			return nil, nil, fmt.Errorf("metrics 尚不可用: %w; port-forward=%s", requestErr, logBuffer.String())
+		}
+		defer response.Body.Close()
+		body, readErr := io.ReadAll(response.Body)
+		return response, body, readErr
+	}
+
+	By(fmt.Sprintf("验证 Pod %s 的普通 metrics 响应未压缩且可读", podName))
+	Eventually(func() error {
+		response, body, requestErr := requestMetrics(false)
+		if requestErr != nil {
+			return requestErr
+		}
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("metrics HTTP status=%d", response.StatusCode)
+		}
+		if response.Header.Get("Content-Encoding") != "" {
+			return fmt.Errorf("普通请求 Content-Encoding=%q，期望为空", response.Header.Get("Content-Encoding"))
+		}
+		return verify(body)
+	}, time.Minute, time.Second).Should(Succeed())
+
+	By(fmt.Sprintf("验证 Pod %s 按 Accept-Encoding 返回可解压的 gzip metrics", podName))
+	Eventually(func() error {
+		response, body, requestErr := requestMetrics(true)
+		if requestErr != nil {
+			return requestErr
+		}
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("gzip metrics HTTP status=%d", response.StatusCode)
+		}
+		if response.Header.Get("Content-Encoding") != "gzip" {
+			return fmt.Errorf("gzip 请求 Content-Encoding=%q，期望 gzip", response.Header.Get("Content-Encoding"))
+		}
+		reader, gzipErr := gzip.NewReader(bytes.NewReader(body))
+		if gzipErr != nil {
+			return fmt.Errorf("原始响应不是有效 gzip: %w", gzipErr)
+		}
+		decompressed, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return verify(decompressed)
+	}, time.Minute, time.Second).Should(Succeed())
+}
+
+func assertGH82Args(args []string, useAPIServerCache bool) {
+	GinkgoHelper()
+	for _, expected := range []string{"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true"} {
+		Expect(countString(args, expected)).To(Equal(1), "%s 必须恰好出现一次: %v", expected, args)
+	}
+	wantCacheCount := 0
+	if useAPIServerCache {
+		wantCacheCount = 1
+	}
+	Expect(countString(args, "--use-apiserver-cache=true")).To(Equal(wantCacheCount), "API server cache 必须由部署拓扑决定: %v", args)
+}
+
+func countString(values []string, target string) int {
+	count := 0
+	for _, value := range values {
+		if value == target {
+			count++
+		}
+	}
+	return count
+}
+
+func withoutGH82E2EArgs(args []string) []string {
+	result := make([]string, 0, len(args))
+	for _, arg := range args {
+		switch arg {
+		case "--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true":
+			continue
+		default:
+			result = append(result, arg)
+		}
+	}
+	return result
+}
+
+func replaceObject(ctx SpecContext, object any) {
+	GinkgoHelper()
+	manifest, err := json.Marshal(object)
+	Expect(err).NotTo(HaveOccurred())
+	runWithInput(ctx, repoRoot, string(manifest), kubectlBin, "--context", kubeContext, "replace", "--filename", "-")
+}
+
+func pauseOperator(ctx SpecContext) {
+	GinkgoHelper()
+	run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", operatorNamespace,
+		"scale", "deployment/monitor-in-hand-monitor-in-hand", "--replicas=0")
+	Eventually(func() error {
+		operator, err := getObject[appsv1.Deployment](ctx, operatorNamespace, "deployment", "monitor-in-hand-monitor-in-hand")
+		if err != nil {
+			return err
+		}
+		if operator.Status.Replicas != 0 {
+			return fmt.Errorf("Operator replicas=%d，期望 0", operator.Status.Replicas)
+		}
+		pods, err := listPods(ctx, operatorNamespace, "app.kubernetes.io/name=monitor-in-hand,app.kubernetes.io/instance=monitor-in-hand")
+		if err != nil {
+			return err
+		}
+		if len(pods.Items) != 0 {
+			return fmt.Errorf("Operator Pod 仍在运行: %d", len(pods.Items))
+		}
+		return nil
+	}, 2*time.Minute, time.Second).Should(Succeed())
+}
+
+func resumeOperator(ctx SpecContext) {
+	GinkgoHelper()
+	run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", operatorNamespace,
+		"scale", "deployment/monitor-in-hand-monitor-in-hand", "--replicas=1")
+	Eventually(func() error {
+		operator, err := getObject[appsv1.Deployment](ctx, operatorNamespace, "deployment", "monitor-in-hand-monitor-in-hand")
+		if err != nil {
+			return err
+		}
+		if operator.Status.AvailableReplicas != 1 {
+			return fmt.Errorf("Operator availableReplicas=%d，期望 1", operator.Status.AvailableReplicas)
+		}
+		return nil
+	}, 3*time.Minute, 2*time.Second).Should(Succeed())
+}
+
+func podUIDs(ctx SpecContext, podNames []string) map[types.UID]struct{} {
+	GinkgoHelper()
+	result := make(map[types.UID]struct{}, len(podNames))
+	for _, podName := range podNames {
+		pod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+		Expect(err).NotTo(HaveOccurred())
+		result[pod.UID] = struct{}{}
+	}
+	return result
+}
+
+func expectPodsReplaced(ctx SpecContext, podNames []string, oldUIDs map[types.UID]struct{}) {
+	GinkgoHelper()
+	for _, podName := range podNames {
+		pod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+		Expect(err).NotTo(HaveOccurred())
+		_, found := oldUIDs[pod.UID]
+		Expect(found).To(BeFalse(), "Pod %s 仍使用升级前 UID %s", podName, pod.UID)
+	}
+}
+
+func listPods(ctx context.Context, namespace, selector string) (*corev1.PodList, error) {
+	command := exec.CommandContext(ctx, kubectlBin, "--context", kubeContext, "--namespace", namespace,
+		"get", "pods", "--selector", selector, "--output", "json")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("kubectl list pods selector=%q: %w: %s", selector, err, output)
+	}
+	pods := &corev1.PodList{}
+	if err := json.Unmarshal(output, pods); err != nil {
+		return nil, fmt.Errorf("解析 PodList: %w", err)
+	}
+	return pods, nil
+}
+
+func gh82ScenarioID(sequence string) string {
+	ids := map[string]map[string]string{
+		"1.19": {
+			"001": "E2E-119-KSM-GH82-001",
+			"002": "E2E-119-KSM-GH82-002",
+		},
+		"1.28": {
+			"001": "E2E-128-KSM-GH82-001",
+			"002": "E2E-128-KSM-GH82-002",
+			"003": "E2E-128-KSM-GH82-003",
+		},
+	}
+	if versionIDs, supported := ids[os.Getenv("KUBERNETES_VERSION")]; supported {
+		if id, found := versionIDs[sequence]; found {
+			return id
+		}
+	}
+	return "E2E-UNSUPPORTED-KSM-GH82-" + sequence
 }
 
 func getObject[T any](ctx context.Context, namespace, kind, name string) (*T, error) {

@@ -174,7 +174,7 @@ e2e-collection: e2e-operator-install ## Verify native PrometheusAgent collection
 e2e-kubestatemetrics: e2e-image ## Verify KubeStateMetrics deployment modes against real managed workloads.
 	mkdir -p "$(E2E_REPORT_DIR)/kubestatemetrics"
 	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
-		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=20m \
+		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=35m \
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/kubestatemetrics" \
 		./test/e2e/kubestatemetrics
 
