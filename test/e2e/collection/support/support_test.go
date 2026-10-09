@@ -18,6 +18,32 @@ import (
 )
 
 var _ = Describe("collection helpers", func() {
+	It("[UT-COLLECTION-GH81-001] 在删除 namespace 前先收敛其中的外部控制器对象", func() {
+		type deletion struct {
+			resource  string
+			name      string
+			namespace string
+		}
+		var deletions []deletion
+
+		By("记录跨 namespace Agent fixture 的清理顺序")
+		collectionsupport.DeleteNamespacedResourceBeforeNamespace(
+			context.Background(),
+			"prometheusagent",
+			"gh60-a",
+			"gh60-agent-other",
+			func(_ context.Context, resource, name, namespace string) {
+				deletions = append(deletions, deletion{resource: resource, name: name, namespace: namespace})
+			},
+		)
+
+		By("验证先等待 Agent 删除，再删除承载它的 namespace")
+		Expect(deletions).To(Equal([]deletion{
+			{resource: "prometheusagent", name: "gh60-a", namespace: "gh60-agent-other"},
+			{resource: "namespace", name: "gh60-agent-other"},
+		}))
+	})
+
 	It("[UT-COLLECTION-GH59-001] 将 kubectl 警告与授权结果分流", func() {
 		By("重放 kubectl auth can-i 拒绝请求时分离的 stdout 与 stderr")
 		command := exec.Command(os.Args[0], "-test.run=TestCollectionCommandFixture")

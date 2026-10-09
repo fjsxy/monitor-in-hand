@@ -25,6 +25,16 @@ type Evidence struct {
 	Body string
 }
 
+// DeleteNamespacedResourceBeforeNamespace 先等待外部控制器对象删除，再回收承载它的 namespace。
+func DeleteNamespacedResourceBeforeNamespace(
+	ctx context.Context,
+	resource, name, namespace string,
+	deleteResource func(context.Context, string, string, string),
+) {
+	deleteResource(ctx, resource, name, namespace)
+	deleteResource(ctx, "namespace", namespace, "")
+}
+
 // DecodeGeneratedConfig 解码 Operator Secret 中的压缩配置，明确报告缺失或损坏的内容。
 func DecodeGeneratedConfig(encoded string) (string, error) {
 	if strings.TrimSpace(encoded) == "" {

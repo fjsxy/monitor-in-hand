@@ -16,6 +16,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	collectionsupport "github.com/fjsxy/monitor-in-hand/test/e2e/collection/support"
 )
 
 const gh60OtherNamespace = "gh60-agent-other"
@@ -61,7 +63,13 @@ var _ = Describe("原生 PrometheusAgent 多实例与资源身份", Serial, func
 		DeferCleanup(func(cleanupCtx SpecContext) {
 			deleteResource(cleanupCtx, "prometheusagent", "gh60-a", testNamespace)
 			deleteResource(cleanupCtx, "prometheusagent", "gh60-b", testNamespace)
-			deleteResource(cleanupCtx, "namespace", gh60OtherNamespace, "")
+			collectionsupport.DeleteNamespacedResourceBeforeNamespace(
+				cleanupCtx,
+				"prometheusagent",
+				"gh60-a",
+				gh60OtherNamespace,
+				deleteResource,
+			)
 			deleteResource(cleanupCtx, "scrapeconfig", "gh60-shared", testNamespace)
 			for index := 0; index < 12; index++ {
 				deleteResource(cleanupCtx, "service", fmt.Sprintf("gh60-target-%02d", index), testNamespace)
