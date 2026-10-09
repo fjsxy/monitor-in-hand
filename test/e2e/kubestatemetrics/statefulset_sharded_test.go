@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -223,6 +224,7 @@ spec:
 
 		By("验证所有 shard 完全省略 resources，同时保留分片参数和固定有效集合")
 		effectiveCollectorSets := make([][]string, 0, len(manifests))
+		actualMetricFamilies := make([][]string, 0, len(manifests))
 		for _, current := range manifests {
 			managedName := "ksm-" + current.name
 			var combinedMetrics strings.Builder
@@ -239,7 +241,6 @@ spec:
 
 			instance, err := getObject[monitoringv1alpha1.KubeStateMetrics](ctx, "", "kubestatemetrics", current.name)
 			Expect(err).NotTo(HaveOccurred())
-			assertOwnerReference(statefulSet, string(instance.UID))
 			Expect(instance.Status.KubeStateMetricsVersion).To(Equal(active.version))
 			Expect(instance.Status.EffectiveCollectors).To(Equal(sharedCollectorCatalog()))
 			Expect(instance.Status.ManagedResources).To(ConsistOf(
@@ -252,6 +253,25 @@ spec:
 				monitoringv1alpha1.ManagedResourceReference{APIVersion: "apps/v1", Kind: "StatefulSet", Namespace: targetNamespace, Name: managedName},
 			))
 			effectiveCollectorSets = append(effectiveCollectorSets, append([]string(nil), instance.Status.EffectiveCollectors...))
+
+			By("读取七类直接受管资源并验证稳定身份与当前 CR 所有权")
+			serviceAccount, err := getObject[corev1.ServiceAccount](ctx, targetNamespace, "serviceaccount", managedName)
+			Expect(err).NotTo(HaveOccurred())
+			clusterRole, err := getObject[rbacv1.ClusterRole](ctx, "", "clusterrole", managedName)
+			Expect(err).NotTo(HaveOccurred())
+			clusterRoleBinding, err := getObject[rbacv1.ClusterRoleBinding](ctx, "", "clusterrolebinding", managedName)
+			Expect(err).NotTo(HaveOccurred())
+			service, err := getObject[corev1.Service](ctx, targetNamespace, "service", managedName)
+			Expect(err).NotTo(HaveOccurred())
+			role, err := getObject[rbacv1.Role](ctx, targetNamespace, "role", managedName)
+			Expect(err).NotTo(HaveOccurred())
+			roleBinding, err := getObject[rbacv1.RoleBinding](ctx, targetNamespace, "rolebinding", managedName)
+			Expect(err).NotTo(HaveOccurred())
+			for _, object := range []metav1.Object{
+				serviceAccount, clusterRole, clusterRoleBinding, service, role, roleBinding, statefulSet,
+			} {
+				assertOwnerReference(object, string(instance.UID))
+			}
 
 			podNames := endpointPodNames(ctx, managedName, 2, managedName+"-0", managedName+"-1")
 			for ordinal, podName := range podNames {
@@ -272,9 +292,12 @@ spec:
 			}
 			Expect(combinedMetrics.String()).To(ContainSubstring("kube_pod_info"))
 			Expect(combinedMetrics.String()).To(ContainSubstring("kube_deployment_created"))
+			actualMetricFamilies = append(actualMetricFamilies, metricFamilyNames(combinedMetrics.String()))
 		}
 		Expect(effectiveCollectorSets).To(HaveLen(2))
 		Expect(effectiveCollectorSets[0]).To(Equal(effectiveCollectorSets[1]))
+		Expect(actualMetricFamilies).To(HaveLen(2))
+		Expect(actualMetricFamilies[0]).To(Equal(actualMetricFamilies[1]))
 	}, SpecTimeout(20*time.Minute))
 
 	It(fmt.Sprintf("[%s] 非法 shards 仅产生 InvalidSpec", statefulShardedScenarioID("002")), func(ctx SpecContext) {
@@ -338,6 +361,27 @@ func defaultStatefulScenarioID() string {
 		return "E2E-128-KSM-GH81-002"
 	}
 	return "E2E-UNSUPPORTED-KSM-GH81-002"
+}
+
+func metricFamilyNames(metrics string) []string {
+	families := make(map[string]struct{})
+	for _, line := range strings.Split(metrics, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name := strings.Fields(line)[0]
+		if labelStart := strings.IndexByte(name, '{'); labelStart >= 0 {
+			name = name[:labelStart]
+		}
+		families[name] = struct{}{}
+	}
+	result := make([]string, 0, len(families))
+	for family := range families {
+		result = append(result, family)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func waitForShardedTopology(ctx SpecContext, instanceName, managedName string, shards int32) {
