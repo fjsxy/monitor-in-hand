@@ -451,7 +451,8 @@ spec:
 				return getErr
 			}
 			if currentInstance.Generation != generation || currentInstance.Status.ObservedGeneration != generation ||
-				currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || currentInstance.Status.AvailablePods != 2 ||
+				currentInstance.Status.Phase != monitoringv1alpha1.KubeStateMetricsPhaseReady || currentInstance.Status.DesiredPods != 2 ||
+				currentInstance.Status.AvailablePods != 2 ||
 				!slices.Equal(currentInstance.Status.EffectiveCollectors, []string{"pods"}) ||
 				!conditionIsTrue(currentInstance.Status.Conditions, "Ready", generation) ||
 				!conditionIsTrue(currentInstance.Status.Conditions, "Available", generation) {
