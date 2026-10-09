@@ -226,7 +226,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 		Entry("Kubernetes 1.28", "v1.28.15"),
 	)
 
-	It("UT-KSM-GH81-001 按 collector 模式和部署拓扑保持 resources 参数边界", func() {
+	DescribeTable("UT-KSM-GH81-001 按 collector 模式和部署拓扑保持 resources 参数边界", func(kubernetesVersion string, daemonSetShardedSupported bool) {
 		wantDefaultCollectors := []string{
 			"certificatesigningrequests", "configmaps", "cronjobs", "daemonsets", "deployments", "endpoints",
 			"horizontalpodautoscalers", "ingresses", "jobs", "leases", "limitranges", "mutatingwebhookconfigurations",
@@ -235,7 +235,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			"storageclasses", "validatingwebhookconfigurations", "volumeattachments",
 		}
 		facts := ksm.ClusterFacts{
-			KubernetesVersion:     "v1.28.15",
+			KubernetesVersion:     kubernetesVersion,
 			TargetNamespaceExists: true,
 			NamespaceNames:        []string{"monitoring"},
 		}
@@ -264,7 +264,7 @@ var _ = Describe("默认 Deployment 规划", func() {
 			"--pod-namespace=$(POD_NAMESPACE)",
 		}))
 
-		By("验证 Default DaemonSetSharded 仍为三角色显式划分完整 collector 集合")
+		By("验证 Default DaemonSetSharded 保持版本边界与受支持版本的三角色 collector 划分")
 		daemonInstance := newInstance()
 		daemonInstance.Spec.Deployment = monitoringv1alpha1.KubeStateMetricsDeploymentSpec{
 			Mode:             monitoringv1alpha1.DeploymentModeDaemonSetSharded,
@@ -272,16 +272,24 @@ var _ = Describe("默认 Deployment 规划", func() {
 		}
 		daemonInstance.Spec.Collectors.Mode = monitoringv1alpha1.CollectorModeDefault
 		daemonPlan, problem := ksm.BuildPlan(daemonInstance, facts)
-		Expect(problem).To(BeNil())
-		Expect(daemonPlan.EffectiveCollectors).To(Equal(wantDefaultCollectors))
-		node := resourceOfType[*appsv1.DaemonSet](daemonPlan)
-		cluster := plannedDeploymentNamed(daemonPlan, "ksm-primary-cluster")
-		unscheduled := plannedDeploymentNamed(daemonPlan, "ksm-primary-unscheduled")
-		podIndex := slices.Index(wantDefaultCollectors, "pods")
-		clusterCollectors := slices.Delete(append([]string(nil), wantDefaultCollectors...), podIndex, podIndex+1)
-		Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods", "--namespaces=monitoring", "--node=$(NODE_NAME)"}))
-		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=" + strings.Join(clusterCollectors, ","), "--namespaces=monitoring"}))
-		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods", "--namespaces=monitoring", `--node=""`}))
+		if daemonSetShardedSupported {
+			Expect(problem).To(BeNil())
+			Expect(daemonPlan.EffectiveCollectors).To(Equal(wantDefaultCollectors))
+			node := resourceOfType[*appsv1.DaemonSet](daemonPlan)
+			cluster := plannedDeploymentNamed(daemonPlan, "ksm-primary-cluster")
+			unscheduled := plannedDeploymentNamed(daemonPlan, "ksm-primary-unscheduled")
+			podIndex := slices.Index(wantDefaultCollectors, "pods")
+			clusterCollectors := slices.Delete(append([]string(nil), wantDefaultCollectors...), podIndex, podIndex+1)
+			Expect(node.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods", "--namespaces=monitoring", "--node=$(NODE_NAME)"}))
+			Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=" + strings.Join(clusterCollectors, ","), "--namespaces=monitoring"}))
+			Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=pods", "--namespaces=monitoring", `--node=""`}))
+		} else {
+			Expect(daemonPlan).To(BeNil())
+			Expect(problem).To(SatisfyAll(
+				HaveField("Reason", ksm.ReasonUnsupportedMode),
+				HaveField("Message", ContainSubstring("DaemonSetSharded")),
+			))
+		}
 
 		By("验证 Include 按声明顺序显式下发，不受 Default 参数策略影响")
 		includeInstance := newInstance()
@@ -293,7 +301,10 @@ var _ = Describe("默认 Deployment 规划", func() {
 		Expect(problem).To(BeNil())
 		Expect(includePlan.EffectiveCollectors).To(Equal([]string{"deployments", "pods"}))
 		Expect(deploymentFrom(includePlan).Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"--resources=deployments,pods", "--namespaces=monitoring"}))
-	})
+	},
+		Entry("Kubernetes 1.19", "v1.19.16", false),
+		Entry("Kubernetes 1.28", "v1.28.15", true),
+	)
 
 	DescribeTable("UT-KSM-008 Include collectors 成为实际参数和 effective collectors", func(kubernetesVersion string) {
 		By("准备显式 Include collector 声明")
