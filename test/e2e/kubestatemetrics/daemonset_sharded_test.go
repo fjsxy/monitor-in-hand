@@ -15,6 +15,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -470,6 +471,10 @@ spec:
 			wantNodeResources := corev1.ResourceRequirements{
 				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("80Mi")},
 			}
+			wantNodePodResources := corev1.ResourceRequirements{
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("80Mi")},
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("80Mi")},
+			}
 			wantClusterResources := corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("29m")},
 			}
@@ -605,11 +610,11 @@ spec:
 				}
 				return nil
 			}, 5*time.Minute, 2*time.Second).Should(Succeed())
-			currentNodePods := endpointPodNames(ctx, gh82ManagedName, int(desiredNodes))
-			currentControlPods := endpointPodNames(ctx, gh82ManagedName+"-control", 2,
+			currentNodePods := replacedEndpointPodNames(ctx, gh82ManagedName, int(desiredNodes), baselineUIDs)
+			currentControlPods := replacedEndpointPodNames(ctx, gh82ManagedName+"-control", 2, baselineUIDs,
 				gh82ManagedName+"-cluster-", gh82ManagedName+"-unscheduled-")
 			currentPods := append(append([]string(nil), currentNodePods...), currentControlPods...)
-			expectPodsReplaced(ctx, currentPods, baselineUIDs)
+			By("验证实际 Pod 保留角色资源，并接受 Kubernetes 对只声明 limit 的 request 默认化")
 			for _, podName := range currentPods {
 				pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
 				Expect(getErr).NotTo(HaveOccurred())
@@ -621,7 +626,7 @@ spec:
 				case strings.HasPrefix(podName, gh82ManagedName+"-unscheduled-"):
 					Expect(pod.Spec.Containers[0].Resources).To(Equal(wantUnscheduledResources))
 				default:
-					Expect(pod.Spec.Containers[0].Resources).To(Equal(wantNodeResources))
+					Expect(pod.Spec.Containers[0].Resources).To(Equal(wantNodePodResources))
 				}
 				assertPodMetricsNegotiation(ctx, podName, verifyRoleMetrics(podName))
 			}
@@ -667,6 +672,15 @@ func sharedCollectorCatalogWithoutPods() []string {
 }
 
 func endpointPodNames(ctx SpecContext, serviceName string, expectedCount int, expectedPrefixes ...string) []string {
+	return endpointPodNamesWithoutUIDs(ctx, serviceName, expectedCount, nil, expectedPrefixes...)
+}
+
+func replacedEndpointPodNames(ctx SpecContext, serviceName string, expectedCount int, oldUIDs map[types.UID]struct{}, expectedPrefixes ...string) []string {
+	return endpointPodNamesWithoutUIDs(ctx, serviceName, expectedCount, oldUIDs, expectedPrefixes...)
+}
+
+func endpointPodNamesWithoutUIDs(ctx SpecContext, serviceName string, expectedCount int, oldUIDs map[types.UID]struct{}, expectedPrefixes ...string) []string {
+	GinkgoHelper()
 	var podNames []string
 	Eventually(func() error {
 		var err error
@@ -687,6 +701,16 @@ func endpointPodNames(ctx SpecContext, serviceName string, expectedCount int, ex
 			}
 			if !found {
 				return fmt.Errorf("Service %s ready Pod endpoints=%v，缺少前缀 %q", serviceName, podNames, prefix)
+			}
+		}
+		// Endpoint 数量可能在滚动更新中先恢复，继续等待它们全部指向新 Pod UID。
+		for _, podName := range podNames {
+			pod, getErr := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
+			if getErr != nil {
+				return getErr
+			}
+			if _, found := oldUIDs[pod.UID]; found {
+				return fmt.Errorf("Pod %s 仍使用升级前 UID %s", podName, pod.UID)
 			}
 		}
 		return nil

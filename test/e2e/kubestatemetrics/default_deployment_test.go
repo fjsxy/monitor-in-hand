@@ -472,8 +472,7 @@ spec:
 			}
 			return nil
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
-		currentPodNames := endpointPodNames(ctx, gh82ManagedName, 1)
-		expectPodsReplaced(ctx, currentPodNames, baselineUIDs)
+		currentPodNames := replacedEndpointPodNames(ctx, gh82ManagedName, 1, baselineUIDs)
 		currentPod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", currentPodNames[0])
 		Expect(err).NotTo(HaveOccurred())
 		Expect(currentPod.Spec.Containers[0].Args).To(Equal(wantArgs))
@@ -1815,16 +1814,6 @@ func podUIDs(ctx SpecContext, podNames []string) map[types.UID]struct{} {
 		result[pod.UID] = struct{}{}
 	}
 	return result
-}
-
-func expectPodsReplaced(ctx SpecContext, podNames []string, oldUIDs map[types.UID]struct{}) {
-	GinkgoHelper()
-	for _, podName := range podNames {
-		pod, err := getObject[corev1.Pod](ctx, targetNamespace, "pod", podName)
-		Expect(err).NotTo(HaveOccurred())
-		_, found := oldUIDs[pod.UID]
-		Expect(found).To(BeFalse(), "Pod %s 仍使用升级前 UID %s", podName, pod.UID)
-	}
 }
 
 func listPods(ctx context.Context, namespace, selector string) (*corev1.PodList, error) {
