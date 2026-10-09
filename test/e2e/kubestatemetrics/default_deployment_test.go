@@ -1761,9 +1761,24 @@ func withoutGH82E2EArgs(args []string) []string {
 
 func replaceObject(ctx SpecContext, object any) {
 	GinkgoHelper()
-	manifest, err := json.Marshal(object)
+	manifest, err := replaceObjectManifest(object)
 	Expect(err).NotTo(HaveOccurred())
 	runWithInput(ctx, repoRoot, string(manifest), kubectlBin, "--context", kubeContext, "replace", "--filename", "-")
+}
+
+func replaceObjectManifest(object any) ([]byte, error) {
+	manifest, err := json.Marshal(object)
+	if err != nil {
+		return nil, err
+	}
+
+	// replace 只提交调用方修改的声明字段，避免把新客户端识别的 status 字段回写给旧版本 API。
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(manifest, &fields); err != nil {
+		return nil, fmt.Errorf("解析 replace 对象: %w", err)
+	}
+	delete(fields, "status")
+	return json.Marshal(fields)
 }
 
 func pauseOperator(ctx SpecContext) {
