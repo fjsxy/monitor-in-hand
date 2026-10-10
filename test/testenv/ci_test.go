@@ -45,13 +45,13 @@ var _ = Describe("双版本一期验收门禁", func() {
 			)),
 		)))
 
-		By("验证矩阵全部 185 个 ID 与其中 57 个版本化 E2E 都受本次结果门禁约束")
+		By("验证矩阵全部 186 个 ID 与其中 57 个版本化 E2E 都受本次结果门禁约束")
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "校验一期全部 blocking JUnit"),
 			HaveKeyWithValue("run", And(
 				ContainSubstring("go run ./cmd/phase1-gate"),
 				ContainSubstring("--reports artifacts"),
-				ContainSubstring("--expected-blocking-count 185"),
+				ContainSubstring("--expected-blocking-count 186"),
 				ContainSubstring("--expected-e2e-count 57"),
 			)),
 		)))
