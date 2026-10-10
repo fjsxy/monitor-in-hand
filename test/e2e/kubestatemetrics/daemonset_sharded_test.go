@@ -300,7 +300,7 @@ spec:
 			return nil
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
 
-		By("验证 node 与 unscheduled 只显式选择 pods，cluster 精确选择其余 27 项")
+		By("验证三角色精确保留 collector、namespace、node 与分片能力参数")
 		node, err := getObject[appsv1.DaemonSet](ctx, targetNamespace, "daemonset", defaultDaemonManagedName)
 		Expect(err).NotTo(HaveOccurred())
 		cluster, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", defaultDaemonManagedName+"-cluster")
@@ -311,13 +311,22 @@ spec:
 		Expect(cluster.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
 		Expect(unscheduled.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
 		Expect(node.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
-			HaveLen(3), HaveExactElements("--resources=pods", HavePrefix("--namespaces="), "--node=$(NODE_NAME)"),
+			HaveLen(7), HaveExactElements(
+				"--resources=pods", HavePrefix("--namespaces="), "--node=$(NODE_NAME)",
+				"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true",
+			),
 		))
 		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
-			HaveLen(2), HaveExactElements("--resources="+strings.Join(sharedCollectorCatalogWithoutPods(), ","), HavePrefix("--namespaces=")),
+			HaveLen(6), HaveExactElements(
+				"--resources="+strings.Join(sharedCollectorCatalogWithoutPods(), ","), HavePrefix("--namespaces="),
+				"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true",
+			),
 		))
 		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
-			HaveLen(3), HaveExactElements("--resources=pods", HavePrefix("--namespaces="), `--node=""`),
+			HaveLen(7), HaveExactElements(
+				"--resources=pods", HavePrefix("--namespaces="), `--node=""`,
+				"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true",
+			),
 		))
 		var sharedNamespaces []string
 		for _, args := range [][]string{
