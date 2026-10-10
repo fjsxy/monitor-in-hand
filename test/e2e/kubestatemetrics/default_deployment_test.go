@@ -430,7 +430,7 @@ spec:
 		operatorPaused := false
 		DeferCleanup(func(cleanupCtx SpecContext) {
 			if operatorPaused {
-				resumeOperator(cleanupCtx)
+				restoreOperator(cleanupCtx)
 			}
 		}, NodeTimeout(5*time.Minute))
 		operatorPaused = true
@@ -451,7 +451,7 @@ spec:
 		}))
 
 		By("恢复当前 Operator，验证 CR generation 不变时 workload、Pod 与 status 自动收敛")
-		resumeOperator(ctx)
+		restoreOperator(ctx)
 		operatorPaused = false
 		Eventually(func() error {
 			current, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", gh82ManagedName)
@@ -1793,22 +1793,6 @@ func pauseOperator(ctx SpecContext) {
 		}
 		return nil
 	}, 2*time.Minute, time.Second).Should(Succeed())
-}
-
-func resumeOperator(ctx SpecContext) {
-	GinkgoHelper()
-	run(ctx, repoRoot, nil, kubectlBin, "--context", kubeContext, "--namespace", operatorNamespace,
-		"scale", "deployment/monitor-in-hand-monitor-in-hand", "--replicas=1")
-	Eventually(func() error {
-		operator, err := getObject[appsv1.Deployment](ctx, operatorNamespace, "deployment", "monitor-in-hand-monitor-in-hand")
-		if err != nil {
-			return err
-		}
-		if operator.Status.AvailableReplicas != 1 {
-			return fmt.Errorf("Operator availableReplicas=%d，期望 1", operator.Status.AvailableReplicas)
-		}
-		return nil
-	}, 3*time.Minute, 2*time.Second).Should(Succeed())
 }
 
 func podUIDs(ctx SpecContext, podNames []string) map[types.UID]struct{} {

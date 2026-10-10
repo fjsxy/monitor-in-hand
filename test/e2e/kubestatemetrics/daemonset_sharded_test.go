@@ -557,7 +557,7 @@ spec:
 			operatorPaused := false
 			DeferCleanup(func(cleanupCtx SpecContext) {
 				if operatorPaused {
-					resumeOperator(cleanupCtx)
+					restoreOperator(cleanupCtx)
 				}
 			}, NodeTimeout(5*time.Minute))
 			operatorPaused = true
@@ -593,7 +593,7 @@ spec:
 			}
 
 			By("恢复 Operator，验证三个角色在 CR generation 不变时更新全部 Pod")
-			resumeOperator(ctx)
+			restoreOperator(ctx)
 			operatorPaused = false
 			Eventually(func() error {
 				currentNode, getErr := getObject[appsv1.DaemonSet](ctx, targetNamespace, "daemonset", gh82ManagedName)
