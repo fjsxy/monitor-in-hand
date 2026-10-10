@@ -410,7 +410,7 @@ spec:
 		operatorPaused := false
 		DeferCleanup(func(cleanupCtx SpecContext) {
 			if operatorPaused {
-				resumeOperator(cleanupCtx)
+				restoreOperator(cleanupCtx)
 			}
 		}, NodeTimeout(5*time.Minute))
 		operatorPaused = true
@@ -434,7 +434,7 @@ spec:
 		}
 
 		By("恢复 Operator，验证两个 shard 在 CR generation 不变时全部更新")
-		resumeOperator(ctx)
+		restoreOperator(ctx)
 		operatorPaused = false
 		Eventually(func() error {
 			current, getErr := getObject[appsv1.StatefulSet](ctx, targetNamespace, "statefulset", gh82ManagedName)
