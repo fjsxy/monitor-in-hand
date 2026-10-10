@@ -38,5 +38,11 @@ var _ = Describe("workload replace manifest", func() {
 		Expect(replaced.TypeMeta).To(Equal(statefulSet.TypeMeta))
 		Expect(replaced.ObjectMeta).To(Equal(statefulSet.ObjectMeta))
 		Expect(replaced.Spec).To(Equal(statefulSet.Spec))
+
+		By("验证不可编码输入保留 replace 构造阶段的错误上下文")
+		_, err = kubestatemetricssupport.ReplaceObjectManifest(struct {
+			Channel chan int `json:"channel"`
+		}{Channel: make(chan int)})
+		Expect(err).To(MatchError(ContainSubstring("编码 replace 对象")))
 	})
 })
