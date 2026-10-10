@@ -1,3 +1,5 @@
+import { reportMilestone, type MilestoneSink, type Milestone } from "./notifications.mts";
+
 export interface ReviewedPullRequest {
   issue: number;
   number: number;
@@ -68,6 +70,7 @@ export interface MergeOperations {
     checkedHeadOid: string,
   ): Promise<void>;
   verifyMerged(pr: ReviewedPullRequest): Promise<void>;
+  synchronizeBase?(pr: ReviewedPullRequest): Promise<void>;
 }
 
 export interface MergeResult {
@@ -159,6 +162,7 @@ async function waitForCIWithRepair(
 export async function mergeReviewedPullRequests(
   pullRequests: ReviewedPullRequest[],
   operations: MergeOperations,
+  notify?: MilestoneSink,
 ): Promise<MergeResult[]> {
   const ordered = [...pullRequests].sort(
     (left, right) => left.issue - right.issue,
@@ -166,6 +170,9 @@ export async function mergeReviewedPullRequests(
   const results: MergeResult[] = [];
 
   for (const [index, pr] of ordered.entries()) {
+    let notificationStage: Milestone | undefined = "pr-ci";
+    const ciStarted = Date.now();
+    let mergeStarted = ciStarted;
     try {
       const repairBudget = { attempts: 0 };
       const checkedHeadOid = await waitForCIWithRepair(
@@ -173,12 +180,15 @@ export async function mergeReviewedPullRequests(
         operations,
         repairBudget,
       );
+      // rebase 不是通知节点；只有最终待合并 head 的 CI 才产生一次成功通知。
+      notificationStage = undefined;
       const rebasedHeadOid = await operations.rebaseOntoLatestBase(
         pr,
         checkedHeadOid,
       );
       let mergeHeadOid = checkedHeadOid;
       if (rebasedHeadOid !== checkedHeadOid) {
+        notificationStage = "pr-ci";
         mergeHeadOid = await waitForCIWithRepair(
           pr,
           operations,
@@ -186,10 +196,22 @@ export async function mergeReviewedPullRequests(
           rebasedHeadOid,
         );
       }
+      reportMilestone(notify, { issue: pr.issue, stage: "pr-ci", status: "succeeded", durationMs: Date.now() - ciStarted, headOid: mergeHeadOid, url: pr.url });
+      notificationStage = "merge";
+      mergeStarted = Date.now();
       await operations.mergeWithRebase(pr, mergeHeadOid);
       await operations.verifyMerged(pr);
+      reportMilestone(notify, { issue: pr.issue, stage: "merge", status: "succeeded", durationMs: Date.now() - mergeStarted, headOid: mergeHeadOid, url: pr.url });
+      // 远端已合并就是合并节点成功；之后的本地同步失败不能把它误报为合并失败。
+      notificationStage = undefined;
+      await operations.synchronizeBase?.(pr);
       results.push({ issue: pr.issue, pr: pr.number, status: "merged" });
     } catch (error) {
+      if (notificationStage) reportMilestone(notify, {
+        issue: pr.issue, stage: notificationStage, status: "failed",
+        durationMs: Date.now() - (notificationStage === "merge" ? mergeStarted : ciStarted),
+        detail: String(error), url: pr.url,
+      });
       results.push({
         issue: pr.issue,
         pr: pr.number,

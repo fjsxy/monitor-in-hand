@@ -602,6 +602,9 @@ export function createGitHubMergeOperations(
       if (snapshot.state !== "MERGED") {
         throw new Error(`PR #${pr.number} merge 后状态为 ${snapshot.state}。`);
       }
+    },
+
+    async synchronizeBase(pr) {
       command("git", ["fetch", "origin", options.baseBranch]);
       command("git", ["merge", "--ff-only", `origin/${options.baseBranch}`]);
       console.log(

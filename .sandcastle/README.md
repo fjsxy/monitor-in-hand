@@ -58,6 +58,54 @@ npm run sandcastle
 
 ## 可选参数
 
+### 飞书节点通知
+
+链路为 `Sandcastle → 飞书群自定义机器人 Webhook → 群消息`。直接调用飞书接口，不经过第三方推送平台，不需要购买推送会员、注册开发者应用或为推送另行办理实名认证。消息发送到机器人所在的群。
+
+按[飞书官方指南](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)完成一次配置：
+
+1. 在飞书中准备一个用于接收通知的群，并开启该群的消息提醒。
+2. 使用 **Mac/Windows 飞书桌面客户端**打开该群，进入群设置 → 群机器人 → 添加机器人 → 自定义机器人，名称填写 `Sandcastle`，复制生成的 Webhook 地址。手机 App 只能添加应用机器人，不能创建自定义机器人；机器人创建后，手机可正常接收群通知。客户端支持范围见[飞书帮助中心](https://www.feishu.cn/hc/zh-CN/articles/360024984973-在群组中使用机器人)。
+3. 推荐在机器人安全设置中开启签名校验，复制签名密钥并保存；若使用关键词校验，关键词设置为 `Sandcastle`（每条通知都包含）。
+4. 将以下配置加入被 Git 忽略的 `.sandcastle/.env`。已有文件只追加或修改这两项，保留其余设置；若文件不存在，可先复制 `.sandcastle/.env.example`。
+
+```dotenv
+SANDCASTLE_FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/你的机器人令牌
+# 仅当机器人开启签名校验时填写，否则留空。
+SANDCASTLE_FEISHU_SECRET=你的签名密钥
+```
+
+也可通过进程环境设置同名变量，进程环境优先。未配置 Webhook 时不发送通知，也不生成通知日志。仅允许官方 HTTPS v2 hook 地址。Webhook 和签名密钥仅由宿主调度器使用，不传入 sandbox，不打印或提交到 Git。此前的 `SANDCASTLE_PUSHPLUS_TOKEN` 不再使用。
+
+自动通知只覆盖以下六类节点的最终成功或失败：
+
+自动化验证范围见[节点通知验收矩阵](acceptance-matrix.md)。
+
+| 节点 | 成功判定 |
+| --- | --- |
+| E2E 计划发布 | 评论发布或复用后，正文、URL 和场景格式已完整回读验证 |
+| 实现完成 | implementer 发出完成信号且产生 commit |
+| 本地 E2E | 现有串行 gate 及有界修复流程最终通过 |
+| PR 创建完成 | push/create 或复用后，远端 PR 回读为正确分支、目标分支且 OPEN、非 draft |
+| PR CI | 修复和 rebase 结束后，待合并 head 的全部 CI checks 通过 |
+| 完成合并 | rebase merge 后，远端 PR 回读为 MERGED |
+
+领取、评审、repair、rebase、本地 main 同步与整轮汇总不单独通知，未执行的节点也不发送结果。中间的 CI/本地 E2E 失败由既有有界修复流程处理，只通知最终结果。若 rebase 本身失败，流程停止，不虚构最终 CI 或合并结果。实现完成消息只表示实现节点结束；合并消息依据 PR 状态，不推测 Issue 是否关闭。
+
+每条消息包含 Issue 编号、节点、成功/失败、时间、耗时，以及可用的结果摘要、评论/PR 链接和 head。同一轮、同一 Issue、同一节点只入队一次；恢复已有 PR 时仅通知本轮实际执行的 CI/合并节点。
+
+并行 Issue 共用一个发送队列，所有请求（包括重试）间隔至少 1 秒。单次请求超时 10 秒，最多尝试 3 次；推送失败只记录日志，不改变任务、E2E gate 或合并队列的结果。退出前等待当前通知队列结束。发送记录位于 `.sandcastle/logs/notifications-<runId>.jsonl`，其中 `queued` 表示排队，`accepted` 表示飞书接受请求，`retry`/`failed` 表示发送故障；异常终止留下的记录不会自动重放。
+
+飞书的 `code=0`（兼容旧响应 `StatusCode=0`）仅表示接受请求，不能证明手机收到。首次配置后单独运行：
+
+```bash
+npm run sandcastle:notify:test
+```
+
+该命令只发送一条明确标记为测试的消息，请在机器人所在的飞书群确认收到。任务通知内容只发送脱敏后的短摘要和链接，不附原始 agent stdout，也不把结果中的 at 标签解释成群提醒。HTTP 响应不确定时重试可能造成重复消息，入队去重不代表飞书端严格一次送达。
+
+根据[飞书官方限制](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)，单租户单自定义机器人最多 100 次/分钟、5 次/秒，请求体不能超过 20 KB；发送摘要的截断和队列限速按此设置。不要让其他脚本共用该机器人大量发送消息。
+
 可在 `.sandcastle/.env` 或进程环境中覆盖：
 
 - `SANDCASTLE_MODEL`：默认 `gpt-5.6-sol`；reasoning effort 固定为 `high`。

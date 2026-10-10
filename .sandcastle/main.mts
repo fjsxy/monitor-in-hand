@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as sandcastle from "@ai-hero/sandcastle";
 import { resolveCodexAuthFile, stageCodexAuth } from "./auth.mts";
@@ -24,8 +24,11 @@ import {
   assertE2EPlanningReadOnly,
   createGitHubE2EPlanOperations,
   extractE2EPlan,
-  runWithE2EPlan,
 } from "./e2e-plan.mts";
+import { readLocalEnv } from "./env.mts";
+import { publishNotifiedPullRequest } from "./github-pr.mts";
+import { runNotifiedImplementation } from "./milestones.mts";
+import { createFeishuNotifications, observeMilestone, resolveFeishuConfig, type MilestoneSink } from "./notifications.mts";
 import {
   createSerialE2EGate,
   ensureLocalE2E,
@@ -49,24 +52,6 @@ function command(commandName: string, args: string[]): string {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
-}
-
-function readLocalEnv(): Record<string, string> {
-  const envPath = resolve(repoRoot, ".sandcastle/.env");
-  if (!existsSync(envPath)) return {};
-
-  return Object.fromEntries(
-    readFileSync(envPath, "utf8")
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#") && line.includes("="))
-      .map((line) => {
-        const separator = line.indexOf("=");
-        const key = line.slice(0, separator).trim();
-        const value = line.slice(separator + 1).trim().replace(/^(['"])(.*)\1$/, "$2");
-        return [key, value];
-      }),
-  );
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {
@@ -210,66 +195,6 @@ function claimIssue(issue: IssueRecord, currentUser: string): void {
   }
 }
 
-function publishPullRequest(
-  issue: IssueRecord,
-  branch: string,
-  baseBranch: string,
-): ReviewedPullRequest {
-  command("git", ["push", "--set-upstream", "origin", branch]);
-
-  const existing = existingPullRequest(branch);
-  if (!existing) {
-    command("gh", [
-      "pr",
-      "create",
-      "--base",
-      baseBranch,
-      "--head",
-      branch,
-      "--title",
-      issue.title,
-      "--body",
-      [
-        `Closes #${issue.number}`,
-        "",
-        "由 Sandcastle 在隔离 worktree/sandbox 中实现并复核。",
-        "Issue 仅在 PR 通过 CI 并由串行 merge 流程以 rebase 方式合并后关闭。",
-      ].join("\n"),
-    ]);
-  }
-
-  const published = JSON.parse(
-    command("gh", [
-      "pr",
-      "view",
-      branch,
-      "--json",
-      "number,url,headRefName,baseRefName,state,isDraft",
-    ]),
-  ) as {
-    number: number;
-    url: string;
-    headRefName: string;
-    baseRefName: string;
-    state: string;
-    isDraft: boolean;
-  };
-  if (
-    published.state !== "OPEN" ||
-    published.isDraft ||
-    published.headRefName !== branch ||
-    published.baseRefName !== baseBranch
-  ) {
-    throw new Error(`PR #${published.number} 状态或分支与 merge 前置条件不符。`);
-  }
-  return {
-    issue: issue.number,
-    number: published.number,
-    branch,
-    url: published.url,
-  };
-}
-
 async function executeIssue(
   issue: IssueRecord,
   baseBranch: string,
@@ -280,6 +205,7 @@ async function executeIssue(
   idleTimeoutSeconds: number,
   localE2EGate: SerialE2EGate,
   maxLocalE2ERepairAttempts: number,
+  notify?: MilestoneSink,
 ): Promise<{
   issue: number;
   status: string;
@@ -318,7 +244,7 @@ async function executeIssue(
         throw new Error(`#${issue.number} 已退出 ready-for-agent 实现范围或领取已被撤销。`);
       }
       const matrix = readFileSync(resolve(sandbox.worktreePath, "docs/testing/phase1-acceptance-matrix.md"), "utf8");
-      const implementation = await runWithE2EPlan(
+      const implementation = await runNotifiedImplementation(
         claimedIssue,
         matrix,
         createGitHubE2EPlanOperations(issue.number, repoRoot, async () => {
@@ -359,6 +285,7 @@ async function executeIssue(
             promptArgs,
           }));
         },
+        notify,
       );
 
       if (!implementation.completionSignal) {
@@ -396,7 +323,7 @@ async function executeIssue(
       }
 
       // agent 只在 sandbox 内实现和评审；宿主串行运行 Docker/kind E2E，避免向 sandbox 暴露容器控制面。
-      await localE2EGate.run(() =>
+      await observeMilestone(notify, issue.number, "local-e2e", () => localE2EGate.run(() =>
         ensureLocalE2E(
           {
             runGate: () =>
@@ -452,7 +379,7 @@ async function executeIssue(
           },
           maxLocalE2ERepairAttempts,
         ),
-      );
+      ));
     } finally {
       const closeResult = await sandbox.close();
       if (closeResult.preservedWorktreePath) {
@@ -465,7 +392,9 @@ async function executeIssue(
     stagedAuth.cleanup();
   }
 
-  const pullRequest = publishPullRequest(issue, branch, baseBranch);
+  const pullRequest = await publishNotifiedPullRequest(
+    issue, branch, baseBranch, { command, existingPullRequest }, notify,
+  );
   return {
     issue: issue.number,
     status: "pull-request",
@@ -474,7 +403,7 @@ async function executeIssue(
   };
 }
 
-async function main(): Promise<void> {
+async function main(notify?: MilestoneSink): Promise<void> {
   const { baseBranch, codexAuthFile, currentUser, ghToken } = assertPreconditions();
   const localEnv = readLocalEnv();
   const model =
@@ -571,6 +500,7 @@ async function main(): Promise<void> {
         idleTimeoutSeconds,
         localE2EGate,
         maxLocalE2ERepairAttempts,
+        notify,
       ),
     ),
   );
@@ -624,6 +554,7 @@ async function main(): Promise<void> {
         ciPollMs: ciPollSeconds * 1_000,
         issuesByNumber: new Map(issues.map((issue) => [issue.number, issue])),
       }),
+      notify,
     );
     for (const result of mergeResults) {
       if (result.status !== "merged") failed = true;
@@ -638,4 +569,15 @@ async function main(): Promise<void> {
   if (failed) process.exitCode = 1;
 }
 
-await main();
+// 宿主统一发送通知；正常结束和未捕获错误退出前均等待有界发送队列，凭据不传入 sandbox。
+const localNotificationEnv = readLocalEnv();
+const notifications = createFeishuNotifications({
+  ...resolveFeishuConfig(process.env, localNotificationEnv),
+  logDirectory: resolve(repoRoot, ".sandcastle/logs"),
+  secrets: [process.env.GH_TOKEN || localNotificationEnv.GH_TOKEN || ""],
+});
+try {
+  await main(notifications.notify);
+} finally {
+  await notifications.flush();
+}

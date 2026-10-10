@@ -6,6 +6,7 @@
     "sandcastle": "tsx .sandcastle/main.mts",
     "sandcastle:build": "sandcastle docker build-image --image-name sandcastle:monitor-op",
     "sandcastle:smoke": "tsx .sandcastle/smoke.mts",
+    "sandcastle:notify:test": "tsx .sandcastle/notify-smoke.mts",
     "sandcastle:test": "tsx --test .sandcastle/*.test.mts",
     "sandcastle:check": "npm run sandcastle:test && tsc -p .sandcastle/tsconfig.json"
   },
