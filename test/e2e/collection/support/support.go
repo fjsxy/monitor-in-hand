@@ -11,6 +11,14 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 )
 
 // Observation 描述一个可独立采集的 E2E 证据源。
@@ -23,6 +31,40 @@ type Observation struct {
 type Evidence struct {
 	Name string
 	Body string
+}
+
+// DeletePrometheusAgent 通过 Kubernetes API 删除原生采集实例并等待对象消失。
+func DeletePrometheusAgent(ctx context.Context, restConfig *rest.Config, name, namespace string) error {
+	client, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("创建 Kubernetes dynamic client: %w", err)
+	}
+	resource := client.Resource(schema.GroupVersionResource{
+		Group: "monitoring.coreos.com", Version: "v1alpha1", Resource: "prometheusagents",
+	}).Namespace(namespace)
+	foreground := metav1.DeletePropagationForeground
+	if err := resource.Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &foreground}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("foreground 删除 PrometheusAgent %s/%s: %w", namespace, name, err)
+	}
+
+	// 删除请求成功后持续读取对象，避免外部生成资源仍在回收时提前清理 Namespace。
+	if err := wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		_, err := resource.Get(ctx, name, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			return true, nil
+		case err != nil:
+			return false, err
+		default:
+			return false, nil
+		}
+	}); err != nil {
+		return fmt.Errorf("等待 PrometheusAgent %s/%s 删除: %w", namespace, name, err)
+	}
+	return nil
 }
 
 // DeleteNamespacedResourceBeforeNamespace 先等待外部控制器对象删除，再回收承载它的 namespace。

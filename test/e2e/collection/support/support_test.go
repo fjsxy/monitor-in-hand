@@ -5,19 +5,149 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
 
 	collectionsupport "github.com/fjsxy/monitor-in-hand/test/e2e/collection/support"
 )
 
 var _ = Describe("collection helpers", func() {
+	It("[UT-COLLECTION-GH82-004] 通过 API foreground 删除原生 Agent 并等待对象消失", func() {
+		const agentPath = "/apis/monitoring.coreos.com/v1alpha1/namespaces/monitor-in-hand-test/prometheusagents/gh82"
+		type observedRequest struct {
+			method string
+			path   string
+			body   []byte
+		}
+
+		By("验证目标 API 路径、Foreground DeleteOptions，并在 GET 仍存在时继续等待到 NotFound")
+		var requests []observedRequest
+		getCount := 0
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			body, _ := io.ReadAll(request.Body)
+			requests = append(requests, observedRequest{method: request.Method, path: request.URL.Path, body: body})
+			writer.Header().Set("Content-Type", "application/json")
+			if request.Method == http.MethodDelete {
+				_, _ = writer.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Success","code":200}`))
+				return
+			}
+			getCount++
+			if getCount == 1 {
+				_, _ = writer.Write([]byte(`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"gh82","namespace":"monitor-in-hand-test"}}`))
+				return
+			}
+			writeAPIError(writer, http.StatusNotFound, "NotFound", "prometheusagents.monitoring.coreos.com \"gh82\" not found")
+		}))
+		DeferCleanup(server.Close)
+
+		err := collectionsupport.DeletePrometheusAgent(
+			context.Background(),
+			&rest.Config{Host: server.URL},
+			"gh82",
+			"monitor-in-hand-test",
+		)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(requests).To(HaveLen(3))
+		Expect(requests[0].method).To(Equal(http.MethodDelete))
+		Expect(requests[0].path).To(Equal(agentPath))
+		Expect(requests[1].method).To(Equal(http.MethodGet))
+		Expect(requests[1].path).To(Equal(agentPath))
+		Expect(requests[2].method).To(Equal(http.MethodGet))
+		Expect(requests[2].path).To(Equal(agentPath))
+		deleteOptions := metav1.DeleteOptions{}
+		Expect(json.Unmarshal(requests[0].body, &deleteOptions)).To(Succeed())
+		Expect(deleteOptions.PropagationPolicy).NotTo(BeNil())
+		Expect(*deleteOptions.PropagationPolicy).To(Equal(metav1.DeletePropagationForeground))
+
+		By("验证 DELETE 返回 NotFound 时幂等成功")
+		var notFoundRequest observedRequest
+		notFoundServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			notFoundRequest = observedRequest{method: request.Method, path: request.URL.Path}
+			writeAPIError(writer, http.StatusNotFound, "NotFound", "already absent")
+		}))
+		DeferCleanup(notFoundServer.Close)
+		Expect(collectionsupport.DeletePrometheusAgent(
+			context.Background(), &rest.Config{Host: notFoundServer.URL}, "gh82", "monitor-in-hand-test",
+		)).To(Succeed())
+		Expect(notFoundRequest.method).To(Equal(http.MethodDelete))
+		Expect(notFoundRequest.path).To(Equal(agentPath))
+
+		By("验证 403 等非 NotFound API 错误原样传播")
+		forbiddenServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writeAPIError(writer, http.StatusForbidden, "Forbidden", "deletion forbidden")
+		}))
+		DeferCleanup(forbiddenServer.Close)
+		err = collectionsupport.DeletePrometheusAgent(
+			context.Background(), &rest.Config{Host: forbiddenServer.URL}, "gh82", "monitor-in-hand-test",
+		)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsForbidden(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("deletion forbidden"))
+
+		By("验证等待 GET 的非 NotFound API 错误也立即传播")
+		readForbiddenServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			if request.Method == http.MethodDelete {
+				_, _ = writer.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Success","code":200}`))
+				return
+			}
+			writeAPIError(writer, http.StatusForbidden, "Forbidden", "read forbidden")
+		}))
+		DeferCleanup(readForbiddenServer.Close)
+		err = collectionsupport.DeletePrometheusAgent(
+			context.Background(), &rest.Config{Host: readForbiddenServer.URL}, "gh82", "monitor-in-hand-test",
+		)
+		Expect(apierrors.IsForbidden(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("read forbidden"))
+
+		By("验证等待期间的 context 取消与超时均传播给调用者")
+		cancelledContext, cancel := context.WithCancel(context.Background())
+		cancellationServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			if request.Method == http.MethodDelete {
+				_, _ = writer.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Success","code":200}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"gh82","namespace":"monitor-in-hand-test"}}`))
+			cancel()
+		}))
+		DeferCleanup(cancellationServer.Close)
+		err = collectionsupport.DeletePrometheusAgent(
+			cancelledContext, &rest.Config{Host: cancellationServer.URL}, "gh82", "monitor-in-hand-test",
+		)
+		Expect(errors.Is(err, context.Canceled)).To(BeTrue())
+
+		waitingServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			if request.Method == http.MethodDelete {
+				_, _ = writer.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Success","code":200}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"apiVersion":"monitoring.coreos.com/v1alpha1","kind":"PrometheusAgent","metadata":{"name":"gh82","namespace":"monitor-in-hand-test"}}`))
+		}))
+		DeferCleanup(waitingServer.Close)
+		timedContext, stopTimeout := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		DeferCleanup(stopTimeout)
+		err = collectionsupport.DeletePrometheusAgent(
+			timedContext, &rest.Config{Host: waitingServer.URL}, "gh82", "monitor-in-hand-test",
+		)
+		Expect(errors.Is(err, context.DeadlineExceeded)).To(BeTrue())
+	})
+
 	It("[UT-COLLECTION-GH81-001] 在删除 namespace 前先收敛其中的外部控制器对象", func() {
 		type deletion struct {
 			resource  string
@@ -144,6 +274,13 @@ vm_http_requests_total{path="/insert/{}/prometheus/", protocol="promremotewrite"
 		Expect(order).To(Equal([]string{"evidence", "cleanup"}))
 	})
 })
+
+func writeAPIError(writer http.ResponseWriter, statusCode int, reason, message string) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(statusCode)
+	_, _ = fmt.Fprintf(writer, `{"kind":"Status","apiVersion":"v1","status":"Failure","message":%q,"reason":%q,"code":%d}`,
+		message, reason, statusCode)
+}
 
 func TestCollectionCommandFixture(t *testing.T) {
 	if os.Getenv("GO_WANT_COLLECTION_COMMAND_FIXTURE") != "1" {

@@ -19,6 +19,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/yaml"
 
 	collectionsupport "github.com/fjsxy/monitor-in-hand/test/e2e/collection/support"
@@ -244,15 +245,25 @@ func applyManifest(ctx context.Context, manifest string) {
 
 func deleteResource(ctx context.Context, resource, name, namespace string) {
 	GinkgoHelper()
+	if resource == "prometheusagent" {
+		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+		clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			loadingRules,
+			&clientcmd.ConfigOverrides{CurrentContext: config.kubeContext},
+		)
+		restConfig, err := clientConfig.ClientConfig()
+		Expect(err).NotTo(HaveOccurred())
+		deleteCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		Expect(collectionsupport.DeletePrometheusAgent(deleteCtx, restConfig, name, namespace)).To(Succeed())
+		return
+	}
+
 	args := []string{"--context", config.kubeContext}
 	if namespace != "" {
 		args = append(args, "--namespace", namespace)
 	}
 	args = append(args, "delete", resource, name, "--ignore-not-found", "--wait=true", "--timeout=2m")
-	// 等待原生 Agent 的外部生成资源图完成级联删除，再允许后续 Namespace 清理。
-	if resource == "prometheusagent" {
-		args = append(args, "--cascade=foreground")
-	}
 	command := exec.CommandContext(ctx, "kubectl", args...)
 	output, err := command.CombinedOutput()
 	if err != nil && resource == "namespace" {
