@@ -301,6 +301,7 @@ spec:
 		operatorNeedsRestore = false
 
 		By("等待新参数模板和真实 Ready Pod 同时收敛，并验证实例不变量")
+		var finalReadyPodName string
 		Eventually(func() error {
 			current, getErr := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", convergenceWorkload)
 			if getErr != nil {
@@ -362,11 +363,12 @@ spec:
 					currentInstance.Status.AvailablePods, currentInstance.Status.KubeStateMetricsVersion,
 					currentInstance.Status.EffectiveCollectors, currentInstance.Status.ManagedResources)
 			}
+			finalReadyPodName = finalPod.Name
 			return nil
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
 
-		By("通过真实 Service 端口读取指标，确认更新后的默认采集仍可用")
-		assertMetrics(ctx, convergenceWorkload, []string{"kube_pod_info"}, nil)
+		By("从同一已验证的新 Ready endpoint Pod 读取指标，确认更新后的默认采集仍可用")
+		assertTargetMetrics(ctx, "pod/"+finalReadyPodName, []string{"kube_pod_info"}, nil)
 	}, SpecTimeout(15*time.Minute))
 
 	It(fmt.Sprintf("[%s] Deployment 按 profile 启用日志与 gzip 并收敛旧模板", gh82ScenarioID("001")), func(ctx SpecContext) {
@@ -1536,7 +1538,11 @@ func canonicalRules(rules []rbacv1.PolicyRule) []string {
 }
 
 func assertMetrics(ctx SpecContext, serviceName string, present, absent []string) {
-	assertMetricsBody(ctx, serviceName, func(body []byte) error {
+	assertTargetMetrics(ctx, "service/"+serviceName, present, absent)
+}
+
+func assertTargetMetrics(ctx SpecContext, target string, present, absent []string) {
+	assertTargetMetricsBody(ctx, target, 8080, func(body []byte) error {
 		for _, metric := range present {
 			if !bytes.Contains(body, []byte("\n"+metric)) {
 				return fmt.Errorf("metrics 未包含 %s", metric)
