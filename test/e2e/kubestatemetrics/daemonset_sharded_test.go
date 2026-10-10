@@ -307,24 +307,32 @@ spec:
 		Expect(err).NotTo(HaveOccurred())
 		unscheduled, err := getObject[appsv1.Deployment](ctx, targetNamespace, "deployment", defaultDaemonManagedName+"-unscheduled")
 		Expect(err).NotTo(HaveOccurred())
+		namespaceList, err := getObjects[corev1.NamespaceList](ctx, "", "namespaces", "")
+		Expect(err).NotTo(HaveOccurred())
+		expectedNamespaces := make([]string, 0, len(namespaceList.Items))
+		for index := range namespaceList.Items {
+			expectedNamespaces = append(expectedNamespaces, namespaceList.Items[index].Name)
+		}
+		sort.Strings(expectedNamespaces)
+		expectedNamespaceArg := "--namespaces=" + strings.Join(expectedNamespaces, ",")
 		Expect(node.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
 		Expect(cluster.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
 		Expect(unscheduled.Spec.Template.Spec.Containers[0].Image).To(Equal(active.image))
 		Expect(node.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
 			HaveLen(7), HaveExactElements(
-				"--resources=pods", HavePrefix("--namespaces="), "--node=$(NODE_NAME)",
+				"--resources=pods", expectedNamespaceArg, "--node=$(NODE_NAME)",
 				"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true",
 			),
 		))
 		Expect(cluster.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
 			HaveLen(6), HaveExactElements(
-				"--resources="+strings.Join(sharedCollectorCatalogWithoutPods(), ","), HavePrefix("--namespaces="),
+				"--resources="+strings.Join(sharedCollectorCatalogWithoutPods(), ","), expectedNamespaceArg,
 				"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true",
 			),
 		))
 		Expect(unscheduled.Spec.Template.Spec.Containers[0].Args).To(SatisfyAll(
 			HaveLen(7), HaveExactElements(
-				"--resources=pods", HavePrefix("--namespaces="), `--node=""`,
+				"--resources=pods", expectedNamespaceArg, `--node=""`,
 				"--logtostderr=true", "--v=0", "--enable-gzip-encoding=true", "--use-apiserver-cache=true",
 			),
 		))
