@@ -249,9 +249,42 @@ func deleteResource(ctx context.Context, resource, name, namespace string) {
 		args = append(args, "--namespace", namespace)
 	}
 	args = append(args, "delete", resource, name, "--ignore-not-found", "--wait=true", "--timeout=2m")
+	// 等待原生 Agent 的外部生成资源图完成级联删除，再允许后续 Namespace 清理。
+	if resource == "prometheusagent" {
+		args = append(args, "--cascade=foreground")
+	}
 	command := exec.CommandContext(ctx, "kubectl", args...)
 	output, err := command.CombinedOutput()
+	if err != nil && resource == "namespace" {
+		collectNamespaceDeletionEvidence(ctx, name)
+	}
 	Expect(err).NotTo(HaveOccurred(), string(output))
+}
+
+func collectNamespaceDeletionEvidence(ctx context.Context, namespace string) {
+	GinkgoHelper()
+	observations := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "namespace-delete-state-" + namespace,
+			args: []string{"get", "namespace", namespace, "--output", `jsonpath={.metadata.name}{"\n"}deletionTimestamp={.metadata.deletionTimestamp}{"\n"}finalizers={.spec.finalizers}{"\n"}phase={.status.phase}{"\n"}{range .status.conditions[*]}{.type}={.status} reason={.reason} message={.message}{"\n"}{end}`},
+		},
+		{
+			name: "namespace-delete-remaining-pods-" + namespace,
+			args: []string{"--namespace", namespace, "get", "pods", "--output", "custom-columns=NAME:.metadata.name,PHASE:.status.phase,DELETION_TIMESTAMP:.metadata.deletionTimestamp,DELETION_GRACE_PERIOD_SECONDS:.metadata.deletionGracePeriodSeconds,OWNER_KINDS:.metadata.ownerReferences[*].kind,OWNER_NAMES:.metadata.ownerReferences[*].name"},
+		},
+	}
+
+	// 失败取证仅保留 Namespace 状态和 Pod 元数据，不读取 Pod spec 或任何 Secret 数据。
+	for _, observation := range observations {
+		body, evidenceErr := kubectlResult(ctx, observation.args...)
+		if evidenceErr != nil {
+			body = fmt.Sprintf("evidence collection failed: %v\n%s", evidenceErr, body)
+		}
+		AddReportEntry(observation.name, body, ReportEntryVisibilityFailureOrVerbose)
+	}
 }
 
 func kubectl(ctx context.Context, args ...string) string {
