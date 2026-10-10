@@ -171,7 +171,7 @@ jobs:
         run: >-
           go run ./cmd/phase1-gate
           --reports artifacts
-          --expected-blocking-count 186
+          --expected-blocking-count 187
           --expected-e2e-count 57
       - name: 校验全部上游 blocking job
         env:
