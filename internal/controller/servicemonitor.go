@@ -34,7 +34,7 @@ func monitorReference(obj *unstructured.Unstructured) *api.ServiceMonitorReferen
 
 // observeServiceMonitor 只更新配套资源观察，workload Ready/Available 仍由原逻辑计算。
 func (r *KubeStateMetricsReconciler) observeServiceMonitor(ctx context.Context, instance *api.KubeStateMetrics, desired *unstructured.Unstructured) error {
-	if r.DynamicClient == nil && desired == nil {
+	if r.DynamicClient == nil && desired == nil && (instance.Status.ServiceMonitor == nil || instance.Status.ServiceMonitor.Resource == nil) {
 		return nil
 	}
 	before := instance.Status.DeepCopy()
@@ -56,6 +56,11 @@ func (r *KubeStateMetricsReconciler) observeServiceMonitor(ctx context.Context, 
 			observation.Resource = monitorReference(obj)
 		}
 		if err != nil {
+			// 关键：读取失败不是删除证据，保留已记录身份才能在关闭采集后继续重试清理。
+			if previous := instance.Status.ServiceMonitor; previous != nil && previous.Resource != nil && (obj == nil || obj.GetUID() == "") {
+				reference := *previous.Resource
+				observation.Resource = &reference
+			}
 			observation.State = "Degraded"
 			observation.Reason = "ApplyFailed"
 			observation.Message = err.Error()
@@ -70,14 +75,7 @@ func (r *KubeStateMetricsReconciler) observeServiceMonitor(ctx context.Context, 
 				observation.Reason = "ResourceConflict"
 			}
 		} else if desired == nil {
-			observation.State = "Disabled"
-			observation.Reason = "Disabled"
-			observation.Message = "配套配置已清理"
-			if obj != nil {
-				observation.State = "Deleting"
-				observation.Reason = "WaitingForDeletion"
-				observation.Message = "等待原配套对象消失"
-			}
+			observation = monitorCleanupObservation(instance, obj)
 		}
 	}
 	instance.Status.ServiceMonitor = observation
@@ -87,6 +85,18 @@ func (r *KubeStateMetricsReconciler) observeServiceMonitor(ctx context.Context, 
 	}
 	setCondition(&instance.Status, instance.Generation, "ServiceMonitorReady", status, observation.Reason, observation.Message)
 	return r.writeStatusIfChanged(ctx, instance, *before)
+}
+
+// monitorCleanupObservation 统一关闭采集和 finalizer 的删除完成判定。
+func monitorCleanupObservation(instance *api.KubeStateMetrics, pending *unstructured.Unstructured) *api.ServiceMonitorObservation {
+	observation := &api.ServiceMonitorObservation{ObservedGeneration: instance.Generation, State: "Disabled", Reason: "Disabled", Message: "配套配置已清理"}
+	if pending != nil {
+		observation.State = "Deleting"
+		observation.Reason = "WaitingForDeletion"
+		observation.Message = "等待原配套对象消失"
+		observation.Resource = monitorReference(pending)
+	}
+	return observation
 }
 
 // syncServiceMonitor 只修改 owner 精确匹配的对象；每次写入均携带实际 UID/RV。
@@ -146,7 +156,7 @@ func (r *KubeStateMetricsReconciler) deleteCompanion(ctx context.Context, instan
 		return nil, nil
 	}
 	if r.DynamicClient == nil {
-		return nil, nil
+		return nil, fmt.Errorf("配套 API client 不可用，无法确认清理完成")
 	}
 	obj, err := r.syncServiceMonitor(ctx, instance, nil)
 	var conflict *ownershipConflictError
@@ -155,22 +165,13 @@ func (r *KubeStateMetricsReconciler) deleteCompanion(ctx context.Context, instan
 		err = nil
 	}
 	if err == nil {
-		state, reason, message := "Disabled", "Disabled", "配套资源已清理"
-		if obj != nil {
-			state = "Deleting"
-			reason = "WaitingForDeletion"
-			message = "等待原配套资源消失"
-		}
-		observation := &api.ServiceMonitorObservation{ObservedGeneration: instance.Generation, State: state, Reason: reason, Message: message}
-		if obj != nil {
-			observation.Resource = monitorReference(obj)
-		}
+		observation := monitorCleanupObservation(instance, obj)
 		instance.Status.ServiceMonitor = observation
 		condition := metav1.ConditionTrue
 		if obj != nil {
 			condition = metav1.ConditionFalse
 		}
-		setCondition(&instance.Status, instance.Generation, "ServiceMonitorReady", condition, reason, message)
+		setCondition(&instance.Status, instance.Generation, "ServiceMonitorReady", condition, observation.Reason, observation.Message)
 	}
 	if obj == nil {
 		return nil, err
