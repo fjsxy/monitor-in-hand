@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -92,6 +93,7 @@ type Profile struct {
 
 // ResourcePlan contains the complete desired state for one reconcile.
 type ResourcePlan struct {
+	ServiceMonitor      *unstructured.Unstructured
 	Profile             Profile
 	InstanceID          string
 	Name                string
@@ -113,6 +115,11 @@ var collectorCatalog = []string{
 
 // BuildPlan validates all known inputs before returning any writable resources.
 func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts) (*ResourcePlan, *Problem) {
+	monitor, monitorProblem := PlanServiceMonitor(instance)
+	if monitorProblem != nil {
+		return nil, monitorProblem
+	}
+
 	// 先完成全部纯 spec 校验，使配置错误稳定返回 InvalidSpec，而不被集群依赖状态掩盖。
 	if instance.Spec.TargetNamespace == "" {
 		return nil, &Problem{Reason: ReasonInvalidSpec, Message: "spec.targetNamespace 必填"}
@@ -247,6 +254,7 @@ func BuildPlan(instance *monitoringv1alpha1.KubeStateMetrics, facts ClusterFacts
 		desiredPods = 0
 	}
 	return &ResourcePlan{
+		ServiceMonitor:      monitor,
 		Profile:             profile,
 		InstanceID:          instanceID,
 		Name:                name,

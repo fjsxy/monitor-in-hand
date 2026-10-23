@@ -49,8 +49,8 @@ _Avoid_：高可用副本、完整副本
 _Avoid_：自动接管、强制覆盖
 
 **采集配置**：
-由集群管理员创建、用于描述采集目标的 Prometheus Operator 资源；采集实例通过 selector 选择它们，双方均不由可观测组件管控 Operator 拥有。
-_Avoid_：受管采集配置、内置采集配置
+描述采集目标及方式的配置；既可由管理员独立声明，也可作为 exporter 配套配置由 Operator 维护。采集实例的 selector 选择不产生所有权。
+_Avoid_：采集实例、抓取目标
 
 **采集配置选择范围**：
 采集实例针对每类采集配置，分别以对象 selector 与 namespace selector 共同确定的配置集合；它不等于这些配置最终发现的抓取目标，也不产生所有权。
@@ -91,3 +91,7 @@ _Avoid_：Operator Pod Running、数据面健康、组件 workload Ready
 **安全卸载**：
 在移除可观测组件管控 Operator 前，先删除全部受管实例并等待其 finalizer 完成资源清理的卸载流程。
 _Avoid_：直接 helm uninstall、批量移除 finalizer、卸载即级联删除
+
+**配套采集配置**：
+由可观测组件管控 Operator 随 exporter 受管实例生命周期维护的采集配置；管理员独立声明的其他采集配置仍属外部资源。
+_Avoid_：外部配置接管

@@ -166,3 +166,26 @@ Chart 只开放以下配置：
 - `logLevel`
 
 Operator 镜像、单副本、leader election、滚动升级策略、安全上下文与 probe 时序均为固定运行契约。
+
+## exporter 配套 ServiceMonitor
+
+KubeStateMetrics 可通过以下可选声明，由本 Operator 管理配套采集配置：
+
+```yaml
+spec:
+  targetNamespace: monitoring
+  serviceMonitor:
+    enabled: true
+    labels:
+      monitor-mgr.io/user-id: example-user
+    interval: 30s
+    scrapeTimeout: 10s
+```
+
+省略或关闭时不创建配套对象，历史 CR 升级不会自动启用。时长必须为正且 timeout 不大于 interval；附加标签不能覆盖 `app.kubernetes.io/*` 或 `monitor-in-hand/*`。Operator 不理解平台账号或角色，平台负责生成可信归属标签。
+
+一个实例配套一个 ServiceMonitor，名称为本实例的 `ksm-<instance-id>`，位于 `spec.targetNamespace`，controller ownerReference 指向 cluster-scoped KSM CR 的实际 UID；只采集本实例必要 Service 的 `http-metrics` 端口和 `/metrics`。不接管同名外部对象，也不管理原生 Agent 或管理员独立声明的其他采集配置。
+
+可选 API 使用动态直读和 5s 周期重查，不建立依赖 CRD 的 informer。未安装 ServiceMonitor CRD 不阻断 Operator 启动；启用但 API/权限缺失时，通过 `status.serviceMonitor` 和 `ServiceMonitorReady` 报告故障，已运行的 exporter 保留。依赖恢复后自动收敛。该观察与原有 workload Ready/Available 独立，不代表实际采集成功。
+
+挂起保留配套配置；关闭采集只清理本实例配套对象；停用和删除清理全部受管资源。完整声明、状态和实施前计划见 `docs/testing/issue-86-plan.md`。Helm 同步包含新 schema/RBAC；本功能 schema 摘要单独记录在 `config/crd/baselines/servicemonitor-v1.sha256`，保留旧 `v0.1.0.sha256` 历史基线。正式可安装版本与既有 CRD 的升级发布由 Issue #87 交付。

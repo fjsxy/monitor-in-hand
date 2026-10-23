@@ -15,6 +15,7 @@ import (
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,10 +41,12 @@ type ServerVersioner interface {
 // KubeStateMetricsReconciler reconciles one cluster-scoped KubeStateMetrics declaration.
 type KubeStateMetricsReconciler struct {
 	client.Client
+	DynamicClient dynamic.Interface
 	ServerVersion ServerVersioner
 	Recorder      record.EventRecorder
 }
 
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.fjsxy.github.io,resources=kubestatemetrics,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=monitoring.fjsxy.github.io,resources=kubestatemetrics/finalizers,verbs=update
 // +kubebuilder:rbac:groups=monitoring.fjsxy.github.io,resources=kubestatemetrics/status,verbs=get;update;patch
@@ -67,7 +70,7 @@ type KubeStateMetricsReconciler struct {
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 
-func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, reconcileErr error) {
 	instance := &monitoringv1alpha1.KubeStateMetrics{}
 	if err := r.Get(ctx, request.NamespacedName, instance); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -191,6 +194,21 @@ func (r *KubeStateMetricsReconciler) Reconcile(ctx context.Context, request ctrl
 			return ctrl.Result{}, r.updateWriteProblem(ctx, instance, "写入", desired, err)
 		}
 	}
+	// 关键：配套 API 失败不撤销已经正确运行的 workload；正常收敛后独立观察，周期重查支持晚装 CRD。
+	defer func() {
+		if reconcileErr != nil {
+			return
+		}
+		if err := r.observeServiceMonitor(ctx, instance, plan.ServiceMonitor); err != nil {
+			reconcileErr = err
+			return
+		}
+		if plan.ServiceMonitor != nil || (instance.Status.ServiceMonitor != nil && instance.Status.ServiceMonitor.Resource != nil) {
+			if result.RequeueAfter == 0 || result.RequeueAfter > monitorRetryInterval {
+				result.RequeueAfter = monitorRetryInterval
+			}
+		}
+	}()
 	if suspended {
 		return r.reconcileSuspended(ctx, instance, plan)
 	}
@@ -518,7 +536,9 @@ func (r *KubeStateMetricsReconciler) deleteModeSpecificResources(ctx context.Con
 
 // deleteManagedResources 只按稳定身份查找资源，并再次核对 controller owner，避免删除同名非受管对象。
 func (r *KubeStateMetricsReconciler) deleteManagedResources(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics) ([]monitoringv1alpha1.ManagedResourceReference, error) {
-	return r.deleteOwnedResources(ctx, instance, directManagedResources(instance))
+	resources, coreErr := r.deleteOwnedResources(ctx, instance, directManagedResources(instance))
+	companion, monitorErr := r.deleteCompanion(ctx, instance)
+	return append(resources, companion...), errors.Join(coreErr, monitorErr)
 }
 
 func (r *KubeStateMetricsReconciler) deleteOwnedResources(ctx context.Context, instance *monitoringv1alpha1.KubeStateMetrics, resources []client.Object) ([]monitoringv1alpha1.ManagedResourceReference, error) {

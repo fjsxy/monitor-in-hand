@@ -134,8 +134,50 @@ type KubeStateMetricsDeploymentSpec struct {
 	DaemonSetSharded *KubeStateMetricsDaemonSetShardedSpec `json:"daemonSetSharded,omitempty"`
 }
 
+// KubeStateMetricsServiceMonitor 声明可选配套采集意图，不允许覆盖实例的采集目标。
+type KubeStateMetricsServiceMonitor struct {
+	// Enabled 默认关闭，升级不自动为历史实例创建资源。
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// Labels 附加采集分组标签，不得覆盖 Operator 身份标签。
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+	// Interval 省略时使用 30s。
+	// +optional
+	Interval string `json:"interval,omitempty"`
+	// ScrapeTimeout 省略时使用 10s，不能大于 Interval。
+	// +optional
+	ScrapeTimeout string `json:"scrapeTimeout,omitempty"`
+}
+
+// ServiceMonitorObservation 区分配套对象收敛与 workload 可用性，不代表数据面健康。
+type ServiceMonitorObservation struct {
+	ObservedGeneration int64 `json:"observedGeneration"`
+	// +kubebuilder:validation:Enum=Unknown;Disabled;Ready;Degraded;Deleting
+	State   string `json:"state"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+	// +optional
+	Resource *ServiceMonitorReference `json:"resource,omitempty"`
+}
+
+// ServiceMonitorReference 记录本次真实观察到的对象身份；UID 不代表父实例身份。
+type ServiceMonitorReference struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Namespace  string `json:"namespace"`
+	Name       string `json:"name"`
+	// +optional
+	UID string `json:"uid,omitempty"`
+}
+
 // KubeStateMetricsSpec declares one managed kube-state-metrics instance.
 type KubeStateMetricsSpec struct {
+	// ServiceMonitor 仅声明本实例的配套采集配置。
+	// +optional
+	ServiceMonitor *KubeStateMetricsServiceMonitor `json:"serviceMonitor,omitempty"`
+
 	// TargetNamespace must name an existing Namespace. The Operator never creates it.
 	// +kubebuilder:validation:MinLength=1
 	TargetNamespace string `json:"targetNamespace"`
@@ -188,6 +230,10 @@ type ManagedResourceReference struct {
 
 // KubeStateMetricsStatus reports the observed managed-instance state.
 type KubeStateMetricsStatus struct {
+	// ServiceMonitor 是配套资源的独立观察结果。
+	// +optional
+	ServiceMonitor *ServiceMonitorObservation `json:"serviceMonitor,omitempty"`
+
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// +optional

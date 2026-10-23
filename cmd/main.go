@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/klog/v2"
@@ -110,8 +111,14 @@ func run(ctx context.Context, healthProbeBindAddress, logLevelText string) error
 	if err != nil {
 		return fmt.Errorf("创建 Kubernetes discovery client: %w", err)
 	}
+	// 可选采集 API 使用动态直读，缺 CRD 不注册 informer，也不阻止 manager 启动。
+	monitorClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("创建可选采集 API client: %w", err)
+	}
 	if err := (&ksmcontroller.KubeStateMetricsReconciler{
 		Client:        mgr.GetClient(),
+		DynamicClient: monitorClient,
 		ServerVersion: apiDiscovery,
 		Recorder:      mgr.GetEventRecorderFor("kubestatemetrics-controller"),
 	}).SetupWithManager(mgr); err != nil {

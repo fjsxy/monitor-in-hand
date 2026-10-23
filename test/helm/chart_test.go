@@ -89,7 +89,7 @@ var _ = Describe("Operator Helm chart", func() {
 			HaveKeyWithValue("name", "test-release-monitor-in-hand"),
 			HaveKeyWithValue("namespace", "monitor-system"),
 		)))
-		Expect(string(mustRenderChart())).NotTo(ContainSubstring("monitoring.coreos.com"))
+		Expect(string(mustRenderChart())).NotTo(ContainSubstring("prometheusagents"))
 	})
 
 	It("HELM-003 健康监听、container port 与 probes 共用一个端口", func() {
@@ -186,8 +186,8 @@ var _ = Describe("Operator Helm chart", func() {
 		}
 		sort.Strings(specKeys)
 		Expect(specKeys).To(Equal([]string{
-			"collectors", "deployment", "enabled", "metricFilter", "namespaceFilter", "podResources", "suspended", "targetNamespace",
-		}), "CRD 不得暴露 image、version、extraArgs、opt-in metrics 或原始 allow/deny 参数")
+			"collectors", "deployment", "enabled", "metricFilter", "namespaceFilter", "podResources", "serviceMonitor", "suspended", "targetNamespace",
+		}), "CRD 不得暴露 image、version、extraArgs 或原始 allow/deny 参数")
 		Expect(nested(crd, "spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "status", "properties", "phase", "enum")).To(ConsistOf(
 			"Pending", "Deleting", "Disabling", "Disabled", "Reconciling", "Ready", "Degraded",
 		))
@@ -222,7 +222,7 @@ var _ = Describe("Operator Helm chart", func() {
 			HaveKeyWithValue("resources", ConsistOf("clusterrolebindings", "clusterroles", "rolebindings", "roles")),
 			HaveKeyWithValue("verbs", ConsistOf("create", "delete", "get", "list", "patch", "update", "watch")),
 		)))
-		Expect(string(mustRenderChart())).NotTo(ContainSubstring("monitoring.coreos.com"))
+		Expect(string(mustRenderChart())).NotTo(ContainSubstring("prometheusagents"))
 	})
 
 	It("HELM-GH57-001 DaemonSetSharded 判别分支和三角色 resources 覆盖进入发布 CRD", func() {
@@ -244,12 +244,12 @@ var _ = Describe("Operator Helm chart", func() {
 		}
 	})
 
-	It("HELM-GH65-001 patch 发布 CRD 与 v0.1.0 版本基线零漂移", func() {
+	It("HELM-GH65-001 当前 CRD 与对应能力基线保持一致", func() {
 		By("读取生成 CRD 和已冻结的 patch 版本基线摘要")
 		root := repositoryRoot()
 		generated, err := os.ReadFile(filepath.Join(root, "config", "crd", "bases", "monitoring.fjsxy.github.io_kubestatemetrics.yaml"))
 		Expect(err).NotTo(HaveOccurred())
-		baseline, err := os.ReadFile(filepath.Join(root, "config", "crd", "baselines", "v0.1.0.sha256"))
+		baseline, err := os.ReadFile(filepath.Join(root, "config", "crd", "baselines", "servicemonitor-v1.sha256"))
 		Expect(err).NotTo(HaveOccurred())
 		fields := strings.Fields(string(baseline))
 		Expect(fields).To(HaveLen(2))
@@ -259,6 +259,33 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(hex.EncodeToString(digest[:])).To(Equal(fields[0]))
 		Expect(fields[1]).To(Equal("config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml"))
 	})
+	It("HELM-GH86-001 配套 API schema 与最小 SM 管理权限可识别", func() {
+		By("实际渲染 Chart 并确认仅管理配套 SM")
+		role := objectByKind(renderChart(), "ClusterRole")
+		var found bool
+		for _, rule := range nested(role, "rules").([]interface{}) {
+			r := rule.(map[string]interface{})
+			groups, _ := r["apiGroups"].([]interface{})
+			if len(groups) == 1 && groups[0] == "monitoring.coreos.com" {
+				found = true
+				Expect(r["resources"]).To(ConsistOf("servicemonitors"))
+				Expect(r["verbs"]).To(ConsistOf("get", "list", "watch", "create", "update", "patch", "delete"))
+			}
+		}
+		Expect(found).To(BeTrue())
+		By("对新 schema 字段进行能力发现，不依赖字段被静默裁剪后的假成功")
+		raw, err := os.ReadFile(filepath.Join(repositoryRoot(), "config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml"))
+		Expect(err).NotTo(HaveOccurred())
+		decoder := kyaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), 4096)
+		crd := &unstructured.Unstructured{}
+		Expect(decoder.Decode(crd)).To(Succeed())
+		versions := nested(crd.Object, "spec", "versions").([]interface{})
+		properties := versions[0].(map[string]interface{})["schema"].(map[string]interface{})["openAPIV3Schema"].(map[string]interface{})["properties"].(map[string]interface{})
+		monitor := properties["spec"].(map[string]interface{})["properties"].(map[string]interface{})["serviceMonitor"].(map[string]interface{})["properties"].(map[string]interface{})
+		Expect(monitor).To(HaveKey("labels"))
+		Expect(monitor["enabled"].(map[string]interface{})["default"]).To(BeFalse())
+	})
+
 })
 
 func renderChart(extraArgs ...string) []*unstructured.Unstructured {
