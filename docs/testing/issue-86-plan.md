@@ -47,8 +47,13 @@ Issue：https://github.com/fjsxy/monitor-in-hand/issues/86
 | IT-SM-GH86-001 | #86 | envtest/schema | 1.28 API | 新字段不被裁剪且旧对象兼容 | 创建真实 CR并回读默认值、spec/status结构；非法输入经schema或planner拒绝 | 能按schema识别能力，旧字段/UID保留 | API响应、JUnit | make test-integration |
 | IT-SM-GH86-002 | #86 | envtest/Reconcile | 1.28 API | 配套生命周期及故障隔离 | 使用真实 API执行创建、漂移、删除、冲突、关闭、停用和finalizer | owner/资源UID、观察generation和清理可核对；workload可用性独立 | API对象、JUnit | make test-integration |
 | IT-SM-GH86-003 | #86 | envtest/可选API | 1.28 API | 缺失API延迟安装后收敛 | 在同一控制器生命周期中先无SM API，再安装官方CRD并恢复 | manager未被可选informer阻塞，无需重发CR即可收敛 | API/状态、JUnit | make test-integration |
+| UT-GATE-GH65-002（复用） | #65 / #86 | Ginkgo/JUnit 门禁 | 1.19 / 1.28 | 新增 SM lane 的报告归属可核对 | 向公共 VerifyJUnitResults 提交两个版本 sm lane 的通过报告及错误 lane 反例 | 正确来源计入通过，跨版本或 lane 结果拒绝；不新增稳定 ID | Ginkgo报告、完整 CI 报告集 | make test-unit |
 | HELM-GH86-001 | #86 | Helm/生成物 | 通用 | CRD与最小RBAC同步 | 实际render并比较generated schema/RBAC，检查历史和新增schema基线 | 仅新增配套SM权限，不带外部CRD/Agent管理；旧摘要保留 | render/diff、JUnit | make test-helm、verify-generated |
 
 ## 实际结果
 
 未执行。后续证据绑定 testedCommit，列明成功、失败、环境失败和未执行，不混合不同版本、提交或CI尝试。新增案例必须进入对应UT/HELM/IT/E2E验收表，逐例和全局清理均需验证。
+
+## 2026-10-23 门禁接线补充
+
+六个真实 E2E lane 均通过后，最终汇总发现原有 lane 白名单尚未接纳 SM 领域。复用既有 `UT-GATE-GH65-002` 验证新增 sm lane 的双版本归属及错误来源拒绝；保留该 ID 和 #65 来源，矩阵追加 #86 来源。此补充只修复既定 CI 接线，不改变产品契约、测试总 ID 数或验收门槛。补充发布并回读后再修改门禁代码。此前运行的单项成功不替代修复后新提交的完整 CI。

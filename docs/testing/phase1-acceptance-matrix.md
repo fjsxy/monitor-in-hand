@@ -86,7 +86,7 @@
 | `UT-PREFLIGHT-GH61-002` | #61 | 预检 CLI/兼容边界 | 通用 | Go 1.22.12；无外部集群 | 固定产生其他标签或带非保护前缀的动态 `labelmap` 保持可用，不被 `mih_cluster_id` 保护扫描误拒绝 | NDJSON diagnostics | `go test ./test/testenv` |
 | `UT-COLLECTION-GH61-001` | #61 | E2E 证据解析 | 通用 | Go 1.22.12；无外部集群 | 从 Prometheus text exposition 中按 metric family 与 remote name 精确读取 sample，容忍标签顺序和科学计数法且不误命中其他 remote | Ginkgo failure、metrics 文本 | `make test-unit` |
 | `UT-GATE-GH65-001` | #65 | 验收矩阵门禁 | 通用 | Go 1.22.12；无外部集群 | 从版本化验收矩阵提取唯一的 UT、IT、HELM 和双版本 E2E blocking ID，拒绝空集合与重复登记，并可单独得到 E2E 子集 | Ginkgo failure、矩阵 ID | `go test ./internal/phase1gate` |
-| `UT-GATE-GH65-002` | #65 | JUnit 发布门禁 | 通用 | Go 1.22.12；无外部集群 | 本次 JUnit 为每个 blocking ID 提供来自对应 quality 层或 E2E 版本/lane 的成功 testcase，且每个版本化 E2E ID 恰好一次出现时放行 | Ginkgo failure、JUnit 汇总 | `go test ./internal/phase1gate` |
+| `UT-GATE-GH65-002` | #65 / #86 | JUnit 发布门禁 | 通用 | Go 1.22.12；无外部集群 | 本次 JUnit 为每个 blocking ID 提供来自对应 quality 层或 E2E 版本/lane 的成功 testcase，且每个版本化 E2E ID 恰好一次出现时放行；包含新增 SM 领域的 sm lane，跨 lane 结果仍拒绝 | Ginkgo failure、JUnit 汇总 | `go test ./internal/phase1gate` |
 | `UT-GATE-GH65-003` | #65 | JUnit 发布门禁 | 通用 | Go 1.22.12；无外部集群 | 任一层的 blocking ID 缺失、failure、error、skip 或 artifact 来源错误均非零拒绝；E2E 额外拒绝重复，矩阵外 deferred/optional 诊断不计入通过率 | Ginkgo failure、JUnit 汇总 | `go test ./internal/phase1gate` |
 | `UT-GATE-GH65-004` | #65 | unit coverage 门禁 | 通用 | Go 1.22.12；无外部集群 | 只聚合核心包 unit statement coverage，并同时阻断总体低于 80% 或任一核心包低于 70% | Ginkgo failure、coverage profile | `make test-unit` |
 | `UT-GATE-GH65-005` | #65 | CI 发布门禁 | PR、main、版本 tag | Go 1.22.12；无外部集群 | PR、main 与版本 tag 均上传本次 UT、IT、Helm 及四个双版本 lane 的 JUnit；最终 job 阻断任一上游失败、187 个 blocking ID 不完整或其中 57 个 E2E 结果不唯一 | Ginkgo failure、workflow、JUnit artifacts、CI job 状态 | `make test-testenv` |
