@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sync/atomic"
+	"time"
 )
 
 var _ = Describe("可选配套 API 调谐", func() {
@@ -164,7 +165,8 @@ var _ = Describe("可选配套 API 调谐", func() {
 		r.DynamicClient, e = dynamic.NewForConfig(&rest.Config{Host: server.URL})
 		Expect(e).NotTo(HaveOccurred())
 		reconcile()
-		options := <-deletes
+		options := metav1.DeleteOptions{}
+		Eventually(deletes, time.Second).Should(Receive(&options), "Reconcile 必须发送条件删除请求")
 		Expect(options.Preconditions).NotTo(BeNil())
 		Expect(*options.Preconditions.UID).To(Equal(types.UID("observed-child-uid")))
 		Expect(*options.Preconditions.ResourceVersion).To(Equal("42"))

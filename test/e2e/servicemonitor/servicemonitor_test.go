@@ -238,6 +238,8 @@ var _ = Describe("配套采集配置", Ordered, func() {
 		})
 		waitWorkload(ctx, "gh86-main")
 		restore()
+		By("先证明恢复权限后无需重启或重发 CR 即自动收敛，再独立验证重启恢复")
+		waitMonitor(ctx, "gh86-main")
 		By("重启当前 Operator 后不重发 CR 即收敛")
 		deployment, err := kc.AppsV1().Deployments("monitor-in-hand-system").Get(ctx, "monitor-in-hand-monitor-in-hand", metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
@@ -314,8 +316,35 @@ var _ = Describe("配套采集配置", Ordered, func() {
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		update(ctx, "gh86-life", func(c *api.KubeStateMetrics) { b := true; c.Spec.Enabled = &b })
 		waitMonitor(ctx, "gh86-life")
+		By("阻塞受管 SM 删除，证明原身份未消失前父 finalizer 不会完成")
+		monitor := getMonitor(ctx, "gh86-life")
+		monitor.SetFinalizers([]string{"gh86.test/hold-deletion"})
+		_, err = dc.Resource(smGVR).Namespace(ns).Update(ctx, monitor, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		releaseMonitor := func() {
+			current, e := dc.Resource(smGVR).Namespace(ns).Get(context.Background(), monitor.GetName(), metav1.GetOptions{})
+			if apierrors.IsNotFound(e) {
+				return
+			}
+			Expect(e).NotTo(HaveOccurred())
+			Expect(current.GetUID()).To(Equal(monitor.GetUID()))
+			current.SetFinalizers(nil)
+			_, e = dc.Resource(smGVR).Namespace(ns).Update(context.Background(), current, metav1.UpdateOptions{})
+			Expect(e).NotTo(HaveOccurred())
+		}
+		DeferCleanup(releaseMonitor)
 		cr := getCR(ctx, "gh86-life")
 		Expect(cc.Delete(ctx, cr)).To(Succeed())
+		waitCR(ctx, "gh86-life", func(c *api.KubeStateMetrics) bool { return c.DeletionTimestamp != nil })
+		Consistently(func() bool {
+			c := &api.KubeStateMetrics{}
+			if cc.Get(ctx, client.ObjectKey{Name: cr.Name}, c) != nil {
+				return false
+			}
+			o, e := dc.Resource(smGVR).Namespace(ns).Get(ctx, monitor.GetName(), metav1.GetOptions{})
+			return len(c.Finalizers) > 0 && e == nil && o.GetUID() == monitor.GetUID()
+		}, 6*time.Second, time.Second).Should(BeTrue())
+		releaseMonitor()
 		Eventually(func() bool {
 			return apierrors.IsNotFound(cc.Get(ctx, client.ObjectKey{Name: cr.Name}, &api.KubeStateMetrics{}))
 		}, 120*time.Second, time.Second).Should(BeTrue())
