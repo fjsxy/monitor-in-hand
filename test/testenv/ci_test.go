@@ -144,17 +144,23 @@ var _ = Describe("双版本一期验收门禁", func() {
 				HaveKeyWithValue("kubernetes", "1.19"),
 				HaveKeyWithValue("kubectl", "v1.19.16"),
 				HaveKeyWithValue("run_id_suffix", "119"),
-				HaveKeyWithValue("lane", "servicemonitor"),
+				HaveKeyWithValue("lane", "sm"),
 				HaveKeyWithValue("target", "e2e-servicemonitor"),
 			),
 			SatisfyAll(
 				HaveKeyWithValue("kubernetes", "1.28"),
 				HaveKeyWithValue("kubectl", "v1.28.15"),
 				HaveKeyWithValue("run_id_suffix", "128"),
-				HaveKeyWithValue("lane", "servicemonitor"),
+				HaveKeyWithValue("lane", "sm"),
 				HaveKeyWithValue("target", "e2e-servicemonitor"),
 			),
 		))
+		By("长 GitHub run ID 与每个 lane 组合后仍符合环境身份的 32 字符上限")
+		for _, entry := range entries {
+			item := entry.(map[string]any)
+			runID := "ci-39949292548-" + item["run_id_suffix"].(string) + "-" + item["lane"].(string)
+			Expect(len(runID)).To(BeNumerically("<=", 32), runID)
+		}
 		Expect(job["env"]).To(HaveKeyWithValue(
 			"TEST_RUN_ID",
 			"ci-${{ github.run_id }}-${{ matrix.run_id_suffix }}-${{ matrix.lane }}",

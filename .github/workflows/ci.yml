@@ -98,12 +98,12 @@ jobs:
           - kubernetes: "1.19"
             kubectl: "v1.19.16"
             run_id_suffix: "119"
-            lane: servicemonitor
+            lane: sm
             target: e2e-servicemonitor
           - kubernetes: "1.28"
             kubectl: "v1.28.15"
             run_id_suffix: "128"
-            lane: servicemonitor
+            lane: sm
             target: e2e-servicemonitor
     env:
       KUBERNETES_VERSION: ${{ matrix.kubernetes }}
