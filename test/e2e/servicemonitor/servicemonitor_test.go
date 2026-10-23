@@ -202,12 +202,14 @@ var _ = Describe("配套采集配置", Ordered, func() {
 		obj := getMonitor(ctx, "gh86-main")
 		oldUID := obj.GetUID()
 		obj.Object["spec"].(map[string]interface{})["endpoints"] = []interface{}{map[string]interface{}{"port": "wrong"}}
+		obj.SetLabels(map[string]string{"drift": "repair"})
 		_, err := dc.Resource(smGVR).Namespace(ns).Update(ctx, obj, metav1.UpdateOptions{})
 		Expect(err).NotTo(HaveOccurred())
-		Eventually(func() string {
+		Eventually(func() bool {
 			o := getMonitor(ctx, "gh86-main")
-			return o.Object["spec"].(map[string]interface{})["endpoints"].([]interface{})[0].(map[string]interface{})["port"].(string)
-		}, 40*time.Second, time.Second).Should(Equal("http-metrics"))
+			port := o.Object["spec"].(map[string]interface{})["endpoints"].([]interface{})[0].(map[string]interface{})["port"].(string)
+			return port == "http-metrics" && o.GetLabels()["monitor-mgr.io/user-id"] == "user-86" && o.GetLabels()["drift"] == ""
+		}, 40*time.Second, time.Second).Should(BeTrue())
 		Expect(dc.Resource(smGVR).Namespace(ns).Delete(ctx, obj.GetName(), metav1.DeleteOptions{})).To(Succeed())
 		waitCR(ctx, "gh86-main", func(c *api.KubeStateMetrics) bool {
 			return c.Status.ServiceMonitor != nil && c.Status.ServiceMonitor.Resource != nil && c.Status.ServiceMonitor.Resource.UID != "" && c.Status.ServiceMonitor.Resource.UID != string(oldUID)
@@ -247,8 +249,17 @@ var _ = Describe("配套采集配置", Ordered, func() {
 			deployment.Spec.Template.Annotations = map[string]string{}
 		}
 		deployment.Spec.Template.Annotations["gh86/restart"] = time.Now().UTC().Format(time.RFC3339Nano)
-		_, err = kc.AppsV1().Deployments("monitor-in-hand-system").Update(ctx, deployment, metav1.UpdateOptions{})
+		deployment, err = kc.AppsV1().Deployments("monitor-in-hand-system").Update(ctx, deployment, metav1.UpdateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() bool {
+			current, e := kc.AppsV1().Deployments(deployment.Namespace).Get(ctx, deployment.Name, metav1.GetOptions{})
+			return e == nil && current.Status.ObservedGeneration >= deployment.Generation && current.Status.UpdatedReplicas == 1 && current.Status.AvailableReplicas == 1 && current.Status.Replicas == 1
+		}, 180*time.Second, time.Second).Should(BeTrue(), "等待新进程真实替代旧 Pod")
+		obj = getMonitor(ctx, "gh86-main")
+		obj.SetLabels(map[string]string{"restart-drift": "repair"})
+		_, err = dc.Resource(smGVR).Namespace(ns).Update(ctx, obj, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() string { return getMonitor(ctx, "gh86-main").GetLabels()["monitor-mgr.io/user-id"] }, 40*time.Second, time.Second).Should(Equal("user-86"))
 		waitMonitor(ctx, "gh86-main")
 	}, NodeTimeout(8*time.Minute))
 	It(id(4)+" 外部同名和旧 owner 不接管", func(ctx SpecContext) {
