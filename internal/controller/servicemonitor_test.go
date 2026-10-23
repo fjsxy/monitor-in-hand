@@ -2,6 +2,8 @@ package controller_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	api "github.com/fjsxy/monitor-in-hand/api/v1alpha1"
 	controller "github.com/fjsxy/monitor-in-hand/internal/controller"
 	. "github.com/onsi/ginkgo/v2"
@@ -13,12 +15,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
+	"net/http"
+	"net/http/httptest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sync/atomic"
 )
 
 var _ = Describe("可选配套 API 调谐", func() {
@@ -75,6 +82,41 @@ var _ = Describe("可选配套 API 调谐", func() {
 		Expect(endpoint.Delete(context.Background(), "ksm-gh86", metav1.DeleteOptions{})).To(Succeed())
 		reconcile()
 		Expect(cr.Status.ServiceMonitor.State).To(Equal("Ready"))
+		By("create 已写入但响应丢失时按 owner 核验，不重复创建")
+		Expect(endpoint.Delete(context.Background(), "ksm-gh86", metav1.DeleteOptions{})).To(Succeed())
+		ambiguous := true
+		dc.PrependReactor("create", "servicemonitors", func(action ktesting.Action) (bool, runtime.Object, error) {
+			if !ambiguous {
+				return false, nil, nil
+			}
+			ambiguous = false
+			obj := action.(ktesting.CreateAction).GetObject()
+			Expect(dc.Tracker().Create(gvr, obj, "monitoring")).To(Succeed())
+			return true, nil, errors.New("injected response loss after create")
+		})
+		reconcile()
+		Expect(cr.Status.ServiceMonitor.State).To(Equal("Degraded"))
+		count := len(dc.Actions())
+		reconcile()
+		Expect(cr.Status.ServiceMonitor.State).To(Equal("Ready"))
+		for _, action := range dc.Actions()[count:] {
+			Expect(action.GetVerb()).NotTo(Equal("create"))
+		}
+		By("并发更新 409 保留身份并在下一轮重试")
+		conflictOnce := true
+		dc.PrependReactor("update", "servicemonitors", func(action ktesting.Action) (bool, runtime.Object, error) {
+			if conflictOnce {
+				conflictOnce = false
+				return true, nil, apierrors.NewConflict(gvr.GroupResource(), "ksm-gh86", errors.New("replaced RV"))
+			}
+			return false, nil, nil
+		})
+		cr.Spec.ServiceMonitor.Interval = "20s"
+		Expect(c.Update(context.Background(), cr)).To(Succeed())
+		reconcile()
+		Expect(cr.Status.ServiceMonitor.State).To(Equal("Degraded"))
+		reconcile()
+		Expect(cr.Status.ServiceMonitor.State).To(Equal("Ready"))
 		By("挂起保留配套对象，关闭采集只删除配套对象")
 		yes := true
 		cr.Spec.Suspended = &yes
@@ -84,9 +126,52 @@ var _ = Describe("可选配套 API 调谐", func() {
 		Expect(cr.Status.ServiceMonitor.State).To(Equal("Ready"))
 		cr.Spec.ServiceMonitor.Enabled = false
 		Expect(c.Update(context.Background(), cr)).To(Succeed())
+		deny = true
 		reconcile()
+		Expect(cr.Status.ServiceMonitor.State).To(Equal("Degraded"))
+		Expect(cr.Status.ServiceMonitor.Resource).NotTo(BeNil(), "关闭后的读取失败不能丢失待清理身份")
+		deny = false
+		obj, e = endpoint.Get(context.Background(), "ksm-gh86", metav1.GetOptions{})
+		Expect(e).NotTo(HaveOccurred())
+		obj.SetUID("observed-child-uid")
+		obj.SetResourceVersion("42")
+		_, e = endpoint.Update(context.Background(), obj, metav1.UpdateOptions{})
+		Expect(e).NotTo(HaveOccurred())
+		By("真实 dynamic HTTP 请求携带 UID/RV 条件；旧 client-go fake 不保留 DeleteOptions")
+		deleted := atomic.Bool{}
+		deletes := make(chan metav1.DeleteOptions, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if request.Method == http.MethodDelete {
+				options := metav1.DeleteOptions{}
+				if err := json.NewDecoder(request.Body).Decode(&options); err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				deletes <- options
+				deleted.Store(true)
+				_ = json.NewEncoder(w).Encode(&metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"})
+				return
+			}
+			if deleted.Load() {
+				w.WriteHeader(404)
+				_ = json.NewEncoder(w).Encode(&metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Failure", Reason: metav1.StatusReasonNotFound, Code: 404})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(obj)
+		}))
+		defer server.Close()
+		r.DynamicClient, e = dynamic.NewForConfig(&rest.Config{Host: server.URL})
+		Expect(e).NotTo(HaveOccurred())
+		reconcile()
+		options := <-deletes
+		Expect(options.Preconditions).NotTo(BeNil())
+		Expect(*options.Preconditions.UID).To(Equal(types.UID("observed-child-uid")))
+		Expect(*options.Preconditions.ResourceVersion).To(Equal("42"))
 		reconcile()
 		Expect(cr.Status.ServiceMonitor.State).To(Equal("Disabled"))
+		Expect(endpoint.Delete(context.Background(), "ksm-gh86", metav1.DeleteOptions{})).To(Succeed())
+		r.DynamicClient = dc
 		By("重新开启后停用清理全部资源")
 		cr.Spec.ServiceMonitor.Enabled = true
 		Expect(c.Update(context.Background(), cr)).To(Succeed())

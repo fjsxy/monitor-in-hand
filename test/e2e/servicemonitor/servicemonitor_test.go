@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -128,6 +129,7 @@ var _ = AfterSuite(func(ctx SpecContext) {
 		_, err = dc.Resource(smGVR).Namespace(ns).Get(ctx, ksm.ManagedResourceName(name), metav1.GetOptions{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	}
+	Expect(kc.CoreV1().Pods(ns).Delete(ctx, "gh86-unscheduled", metav1.DeleteOptions{})).To(SatisfyAny(Succeed(), WithTransform(apierrors.IsNotFound, BeTrue())))
 	By("外部 Agent 与独立采集配置的 UID/spec 不变")
 	for key, expected := range external {
 		parts := strings.SplitN(key, "/", 2)
@@ -258,10 +260,29 @@ var _ = Describe("配套采集配置", Ordered, func() {
 		})
 		Consistently(func() bool {
 			o, e := dc.Resource(smGVR).Namespace(ns).Get(ctx, foreign.GetName(), metav1.GetOptions{})
-			return e == nil && o.GetUID() == foreign.GetUID() && reflect.DeepEqual(o.Object["spec"], foreign.Object["spec"])
+			return e == nil && o.GetUID() == foreign.GetUID() && reflect.DeepEqual(o.Object["spec"], foreign.Object["spec"]) && reflect.DeepEqual(o.GetLabels(), foreign.GetLabels())
 		}, 6*time.Second, time.Second).Should(BeTrue())
+		By("旧 CR UID 即使带管理标签也不能接管；finalizer 仅用于防止测试夹具被 GC 抢先删除")
+		foreign, err = dc.Resource(smGVR).Namespace(ns).Get(ctx, foreign.GetName(), metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		yes := true
+		foreign.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "KubeStateMetrics", Name: "gh86-conflict", UID: types.UID("previous-cr-uid"), Controller: &yes}})
+		foreign.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "monitor-in-hand", "foreign": "preserve"})
+		foreign.SetFinalizers([]string{"gh86.test/fixture"})
+		foreign, err = dc.Resource(smGVR).Namespace(ns).Update(ctx, foreign, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Consistently(func() bool {
+			o, e := dc.Resource(smGVR).Namespace(ns).Get(ctx, foreign.GetName(), metav1.GetOptions{})
+			return e == nil && o.GetUID() == foreign.GetUID() && reflect.DeepEqual(o.Object["spec"], foreign.Object["spec"]) && reflect.DeepEqual(o.GetLabels(), foreign.GetLabels())
+		}, 8*time.Second, time.Second).Should(BeTrue())
+		Expect(getCR(ctx, "gh86-conflict").Status.ServiceMonitor.Reason).To(Equal("ResourceConflict"))
 		By("冲突解除后自动创建当前 owner 的对象")
-		Expect(dc.Resource(smGVR).Namespace(ns).Delete(ctx, foreign.GetName(), metav1.DeleteOptions{})).To(Succeed())
+		foreign, err = dc.Resource(smGVR).Namespace(ns).Get(ctx, foreign.GetName(), metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		foreign.SetFinalizers(nil)
+		_, err = dc.Resource(smGVR).Namespace(ns).Update(ctx, foreign, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dc.Resource(smGVR).Namespace(ns).Delete(ctx, foreign.GetName(), metav1.DeleteOptions{})).To(SatisfyAny(Succeed(), WithTransform(apierrors.IsNotFound, BeTrue())))
 		waitMonitor(ctx, "gh86-conflict")
 	}, NodeTimeout(4*time.Minute))
 	It(id(5)+" 挂起、关闭采集、停用、恢复与删除", func(ctx SpecContext) {
@@ -312,10 +333,9 @@ var _ = Describe("配套采集配置", Ordered, func() {
 				c.Spec.Deployment = api.KubeStateMetricsDeploymentSpec{Mode: api.DeploymentModeDaemonSetSharded, DaemonSetSharded: &api.KubeStateMetricsDaemonSetShardedSpec{}}
 			})
 		} else {
-			create(ctx, "gh86-unsupported", true)
-			update(ctx, "gh86-unsupported", func(c *api.KubeStateMetrics) {
-				c.Spec.Deployment = api.KubeStateMetricsDeploymentSpec{Mode: api.DeploymentModeDaemonSetSharded, DaemonSetSharded: &api.KubeStateMetricsDaemonSetShardedSpec{}}
-			})
+			unsupported := &api.KubeStateMetrics{ObjectMeta: metav1.ObjectMeta{Name: "gh86-unsupported"}, Spec: api.KubeStateMetricsSpec{TargetNamespace: ns, ServiceMonitor: &api.KubeStateMetricsServiceMonitor{Enabled: true}, Deployment: api.KubeStateMetricsDeploymentSpec{Mode: api.DeploymentModeDaemonSetSharded, DaemonSetSharded: &api.KubeStateMetricsDaemonSetShardedSpec{}}}}
+			Expect(cc.Create(ctx, unsupported)).To(Succeed())
+			names = append(names, unsupported.Name)
 			waitCR(ctx, "gh86-unsupported", func(c *api.KubeStateMetrics) bool {
 				for _, condition := range c.Status.Conditions {
 					if condition.Reason == "UnsupportedMode" {
@@ -324,7 +344,21 @@ var _ = Describe("配套采集配置", Ordered, func() {
 				}
 				return false
 			})
+			By("1.19 不支持模式在首次声明后没有任何受管资源写入")
+			for _, gvr := range []schema.GroupVersionResource{smGVR, {Version: "v1", Resource: "services"}, {Version: "v1", Resource: "serviceaccounts"}, {Group: "apps", Version: "v1", Resource: "deployments"}, {Group: "apps", Version: "v1", Resource: "statefulsets"}, {Group: "apps", Version: "v1", Resource: "daemonsets"}, {Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}, {Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}} {
+				objects, err := dc.Resource(gvr).Namespace(ns).List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/instance=gh86-unsupported"})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(objects.Items).To(BeEmpty(), gvr.String())
+			}
+			for _, resource := range []string{"clusterroles", "clusterrolebindings"} {
+				objects, err := dc.Resource(schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: resource}).List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/instance=gh86-unsupported"})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(objects.Items).To(BeEmpty())
+			}
 		}
+		By("保留一个未调度 Pod，使 DaemonSet 的 unscheduled 端点也有实际 Pod 样本")
+		_, err := kc.CoreV1().Pods(ns).Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "gh86-unscheduled"}, Spec: corev1.PodSpec{SchedulerName: "gh86-no-scheduler", Containers: []corev1.Container{{Name: "placeholder", Image: "registry.k8s.io/pause:3.9"}}}}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
 		for _, name := range []string{"gh86-main", "gh86-sharded"} {
 			update(ctx, name, func(c *api.KubeStateMetrics) {
 				c.Spec.ServiceMonitor.Interval = "5s"
@@ -363,7 +397,7 @@ var _ = Describe("配套采集配置", Ordered, func() {
 	It(id(7)+" 零 namespace 与模式切换保持正确目标集合", func(ctx SpecContext) {
 		By("namespace 零匹配时保留配套对象，恢复后继续采集")
 		update(ctx, "gh86-main", func(c *api.KubeStateMetrics) {
-			c.Spec.NamespaceFilter = api.NamespaceFilter{Mode: api.NamespaceFilterModeInclude, Names: []string{"gh86-no-match"}}
+			c.Spec.NamespaceFilter = api.NamespaceFilter{Mode: api.NamespaceFilterModeInclude, NamePatterns: []string{"^gh86-no-match$"}}
 		})
 		waitCR(ctx, "gh86-main", func(c *api.KubeStateMetrics) bool {
 			return c.Status.ObservedGeneration == c.Generation && c.Status.EffectiveNamespaceCount == 0 && c.Status.DesiredPods == 0
@@ -376,6 +410,19 @@ var _ = Describe("配套采集配置", Ordered, func() {
 		waitWorkload(ctx, "gh86-main")
 		waitMonitor(ctx, "gh86-main")
 		assertTargetsAndSamples(ctx)
+		if minor == "1.28" {
+			By("StatefulSet 切换 DaemonSet 后同时验证 node/control 目标与旧 workload 消失")
+			update(ctx, "gh86-main", func(c *api.KubeStateMetrics) {
+				c.Spec.Deployment = api.KubeStateMetricsDeploymentSpec{Mode: api.DeploymentModeDaemonSetSharded, DaemonSetSharded: &api.KubeStateMetricsDaemonSetShardedSpec{}}
+			})
+			waitWorkload(ctx, "gh86-main")
+			waitMonitor(ctx, "gh86-main")
+			_, err := kc.AppsV1().StatefulSets(ns).Get(ctx, "ksm-gh86-main", metav1.GetOptions{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			_, err = kc.AppsV1().Deployments(ns).Get(ctx, "ksm-gh86-main", metav1.GetOptions{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			assertTargetsAndSamples(ctx)
+		}
 		checkPeer(ctx)
 	}, NodeTimeout(10*time.Minute))
 })
@@ -534,25 +581,9 @@ func assertTargetsAndSamples(ctx context.Context) {
 		if e = json.Unmarshal(b, &response); e != nil {
 			return e
 		}
-		expected := map[string]bool{}
-		endpoints, e := kc.CoreV1().Endpoints(ns).List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/name=kube-state-metrics"})
+		expected, e := expectedEndpoints(ctx)
 		if e != nil {
 			return e
-		}
-		for _, ep := range endpoints.Items {
-			for _, name := range names {
-				if strings.HasPrefix(name, "gh86.peer.") || name == "gh86-legacy" || name == "gh86-life" || name == "gh86-unsupported" {
-					continue
-				}
-				if ep.Labels["app.kubernetes.io/instance"] != strings.TrimPrefix(ksm.ManagedResourceName(name), "ksm-") {
-					continue
-				}
-				for _, subset := range ep.Subsets {
-					for _, a := range subset.Addresses {
-						expected[ep.Name+"|"+a.IP+":8080"] = true
-					}
-				}
-			}
 		}
 		actual := map[string]bool{}
 		for _, t := range response.Data.ActiveTargets {
@@ -565,34 +596,126 @@ func assertTargetsAndSamples(ctx context.Context) {
 			}
 			actual[t.Discovered["__meta_kubernetes_service_name"]+"|"+u.Host] = true
 		}
-		if len(expected) == 0 || !reflect.DeepEqual(actual, expected) {
-			return fmt.Errorf("实际 targets=%v，期望=%v", actual, expected)
+		if len(actual) != len(expected) {
+			return fmt.Errorf("实际 targets=%v，必要端点=%v", actual, expected)
+		}
+		for key := range expected {
+			if !actual[key] {
+				return fmt.Errorf("Agent 缺少必要 target %s", key)
+			}
 		}
 		AddReportEntry("真实targets", string(b), ReportEntryVisibilityFailureOrVerbose)
 		return nil
 	}, 180*time.Second, 2*time.Second).Should(Succeed())
-	By("从 remote_write 接收端查询实际 kube_pod_info 样本")
+	By("从 remote_write 接收端逐一核验必要端点的 up 与职责对应的指标样本")
 	queryBase, queryStop := forward(ctx, "service/vmselect", 8481)
 	defer queryStop()
-	query := url.QueryEscape(`kube_pod_info{prometheus="monitor-in-hand-test/gh86"}`)
-	Eventually(func() bool {
+	query := url.QueryEscape(`count by (__name__,service,instance) ({__name__=~"up|kube_pod_info|kube_namespace_created",prometheus="monitor-in-hand-test/gh86"})`)
+	Eventually(func() error {
 		b, e := readHTTP(ctx, queryBase+"/select/86/prometheus/api/v1/query?query="+query)
 		if e != nil {
-			return false
+			return e
 		}
 		var v struct {
 			Status string `json:"status"`
 			Data   struct {
-				Result []json.RawMessage `json:"result"`
+				Result []struct {
+					Metric map[string]string `json:"metric"`
+				} `json:"result"`
 			} `json:"data"`
 		}
-		if json.Unmarshal(b, &v) != nil {
-			return false
+		if e := json.Unmarshal(b, &v); e != nil {
+			return e
 		}
-		if len(v.Data.Result) == 0 {
-			return false
+		if v.Status != "success" {
+			return fmt.Errorf("查询未成功: %s", string(b))
+		}
+		observed := map[string]bool{}
+		for _, sample := range v.Data.Result {
+			observed[sample.Metric["service"]+"|"+sample.Metric["instance"]+"|"+sample.Metric["__name__"]] = true
+		}
+		expected, e := expectedEndpoints(ctx)
+		if e != nil {
+			return e
+		}
+		for endpoint, family := range expected {
+			for _, metric := range []string{"up", family} {
+				if !observed[endpoint+"|"+metric] {
+					return fmt.Errorf("remote_write 缺少 %s 的 %s 样本；已有 %v", endpoint, metric, observed)
+				}
+			}
 		}
 		AddReportEntry("真实remote_write样本", string(b), ReportEntryVisibilityFailureOrVerbose)
-		return true
-	}, 180*time.Second, 2*time.Second).Should(BeTrue())
+		return nil
+	}, 180*time.Second, 2*time.Second).Should(Succeed())
+}
+
+// expectedEndpoints 从声明的拓扑确定必要 Service 和数量，不能从现存 Service 反推而漏掉缺失对象。
+func expectedEndpoints(ctx context.Context) (map[string]string, error) {
+	expected := map[string]string{}
+	for _, name := range []string{"gh86-main", "gh86-conflict", "gh86-sharded", "gh86-daemon"} {
+		if name == "gh86-daemon" && minor != "1.28" {
+			continue
+		}
+		cr := &api.KubeStateMetrics{}
+		if err := cc.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+			return nil, err
+		}
+		base := "ksm-" + name
+		counts := map[string]int{base: 1}
+		if cr.Spec.Deployment.Mode == api.DeploymentModeStatefulSetSharded {
+			counts[base] = 2
+		}
+		if cr.Spec.Deployment.Mode == api.DeploymentModeDaemonSetSharded {
+			ds, err := kc.AppsV1().DaemonSets(ns).Get(ctx, base, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			if ds.Status.DesiredNumberScheduled < 1 {
+				return nil, fmt.Errorf("%s 没有 node 端点", base)
+			}
+			counts[base] = int(ds.Status.DesiredNumberScheduled)
+			counts[base+"-control"] = 2
+		}
+		services, err := kc.CoreV1().Services(ns).List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/instance=" + name})
+		if err != nil {
+			return nil, err
+		}
+		if len(services.Items) != len(counts) {
+			return nil, fmt.Errorf("%s Service 数量 %d，预期 %d", name, len(services.Items), len(counts))
+		}
+		for service, count := range counts {
+			ep, err := kc.CoreV1().Endpoints(ns).Get(ctx, service, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			seen, roles := 0, map[string]int{}
+			for _, subset := range ep.Subsets {
+				for _, address := range subset.Addresses {
+					if address.TargetRef == nil {
+						return nil, fmt.Errorf("%s endpoint 缺少 Pod 引用", service)
+					}
+					pod, err := kc.CoreV1().Pods(ns).Get(ctx, address.TargetRef.Name, metav1.GetOptions{})
+					if err != nil {
+						return nil, err
+					}
+					role := pod.Labels["monitor-in-hand/role"]
+					roles[role]++
+					family := "kube_pod_info"
+					if role == "cluster" {
+						family = "kube_namespace_created"
+					}
+					expected[service+"|"+address.IP+":8080"] = family
+					seen++
+				}
+			}
+			if seen != count {
+				return nil, fmt.Errorf("%s ready endpoints=%d，预期 %d", service, seen, count)
+			}
+			if strings.HasSuffix(service, "-control") && (roles["cluster"] != 1 || roles["unscheduled"] != 1) {
+				return nil, fmt.Errorf("%s control 角色不完整: %v", service, roles)
+			}
+		}
+	}
+	return expected, nil
 }

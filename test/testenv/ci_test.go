@@ -45,14 +45,14 @@ var _ = Describe("双版本一期验收门禁", func() {
 			)),
 		)))
 
-		By("验证矩阵全部 187 个 ID 与其中 57 个版本化 E2E 都受本次结果门禁约束")
+		By("验证矩阵全部 209 个 ID 与其中 71 个版本化 E2E 都受本次结果门禁约束")
 		Expect(steps).To(ContainElement(SatisfyAll(
 			HaveKeyWithValue("name", "校验一期全部 blocking JUnit"),
 			HaveKeyWithValue("run", And(
 				ContainSubstring("go run ./cmd/phase1-gate"),
 				ContainSubstring("--reports artifacts"),
-				ContainSubstring("--expected-blocking-count 187"),
-				ContainSubstring("--expected-e2e-count 57"),
+				ContainSubstring("--expected-blocking-count 209"),
+				ContainSubstring("--expected-e2e-count 71"),
 			)),
 		)))
 
@@ -91,7 +91,7 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(strings.Count(string(contents), "paths:")).To(Equal(0), "blocking job 不得按 changed paths 跳过")
 	})
 
-	It("按两个固定版本和两个 E2E lane 并行运行，并在失败时先保存证据再清理", func() {
+	It("按两个固定版本和三个 E2E lane 并行运行，并在失败时先保存证据再清理", func() {
 		By("读取 CI workflow 并定位双版本双 lane 验收 job")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
@@ -105,12 +105,12 @@ var _ = Describe("双版本一期验收门禁", func() {
 		Expect(found).To(BeTrue(), "缺少 test-environment blocking job")
 		Expect(job).To(HaveKeyWithValue("name", "e2e-${{ matrix.lane }} (Kubernetes ${{ matrix.kubernetes }})"))
 
-		By("验证 Kubernetes 1.19 和 1.28 的 KSM、Agent lane 使用四个独立矩阵入口")
+		By("验证 Kubernetes 1.19 和 1.28 的 KSM、Agent、ServiceMonitor lane 使用六个独立矩阵入口")
 		strategy := job["strategy"].(map[string]any)
 		Expect(strategy["fail-fast"]).To(BeFalse())
 		matrix := strategy["matrix"].(map[string]any)
 		entries := matrix["include"].([]any)
-		Expect(entries).To(HaveLen(4))
+		Expect(entries).To(HaveLen(6))
 		Expect(entries).To(ConsistOf(
 			SatisfyAll(
 				HaveKeyWithValue("kubernetes", "1.19"),
@@ -139,6 +139,20 @@ var _ = Describe("双版本一期验收门禁", func() {
 				HaveKeyWithValue("run_id_suffix", "128"),
 				HaveKeyWithValue("lane", "agent"),
 				HaveKeyWithValue("target", "e2e-agent"),
+			),
+			SatisfyAll(
+				HaveKeyWithValue("kubernetes", "1.19"),
+				HaveKeyWithValue("kubectl", "v1.19.16"),
+				HaveKeyWithValue("run_id_suffix", "119"),
+				HaveKeyWithValue("lane", "servicemonitor"),
+				HaveKeyWithValue("target", "e2e-servicemonitor"),
+			),
+			SatisfyAll(
+				HaveKeyWithValue("kubernetes", "1.28"),
+				HaveKeyWithValue("kubectl", "v1.28.15"),
+				HaveKeyWithValue("run_id_suffix", "128"),
+				HaveKeyWithValue("lane", "servicemonitor"),
+				HaveKeyWithValue("target", "e2e-servicemonitor"),
 			),
 		))
 		Expect(job["env"]).To(HaveKeyWithValue(
