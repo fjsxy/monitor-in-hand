@@ -15,3 +15,9 @@
 首轮发现关闭采集在 GET 403 时丢失待清理身份的 P1，已由公开 Reconcile 红绿回归及 reviewer 独立 probe 确认修复。namespace 零匹配改用无匹配 NamePatterns；1.19 UnsupportedMode 在首次创建前声明并验证零资源；完整目标按声明拓扑确定，逐端点检查对应样本。权限恢复先等待原进程自动收敛，再验证重启；删除测试阻塞 SM finalizer 验证父 CR 保留，解除后才完成。
 
 两轴最终遗留问题均为 0。此结论是静态审查与指定 probe，不替代真实双版本 E2E。
+
+## 汇总门禁接线复审
+
+完整 CI `39950173580` 的九个执行 job 均通过，最终汇总因缺少新增 `SM → sm` lane 映射而拒绝报告。补充计划已发布并精确回读：https://github.com/fjsxy/monitor-in-hand/issues/86#issuecomment-6364738379 。
+
+两轴均只读核验该最小增量并通过：新增映射与 artifact 路径一致；复用 `UT-GATE-GH65-002` 验证双版本正确来源与错误 lane 拒绝；保留原 ID、同步 #86 来源，无新增遗留问题。回归先红后绿，修复后的本地汇总已对上一轮同一 CI 的 18 份报告核对全部 209 个 blocking ID；最终候选仍须重新完成完整 CI。
