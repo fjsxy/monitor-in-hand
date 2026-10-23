@@ -124,7 +124,7 @@ lint-chart: ## Lint the supported Helm installation artifact.
 verify-generated: manifests ## Verify Helm RBAC is synchronized from Kubebuilder markers.
 	cmp config/rbac/role.yaml charts/monitor-in-hand/generated/manager-role.yaml
 	cmp config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml charts/monitor-in-hand/crds/monitoring.fjsxy.github.io_kubestatemetrics.yaml
-	sha256sum --check config/crd/baselines/v0.1.0.sha256
+	sha256sum --check config/crd/baselines/servicemonitor-v1.sha256
 	git diff --exit-code -- config/rbac/role.yaml config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml charts/monitor-in-hand/generated/manager-role.yaml charts/monitor-in-hand/crds/monitoring.fjsxy.github.io_kubestatemetrics.yaml
 
 smoke-install: ## Run the isolated kind installation smoke test.
@@ -177,6 +177,13 @@ e2e-kubestatemetrics: e2e-image ## Verify KubeStateMetrics deployment modes agai
 		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=35m \
 		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/kubestatemetrics" \
 		./test/e2e/kubestatemetrics
+
+e2e-servicemonitor: e2e-image ## 验证可选配套采集、故障恢复、生命周期及真实 Agent 样本。
+	mkdir -p "$(E2E_REPORT_DIR)/servicemonitor"
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" HELM_BIN="$(HELM)" \
+		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=60m \
+		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/servicemonitor" \
+		./test/e2e/servicemonitor
 
 e2e-default-deployment: e2e-kubestatemetrics ## Compatibility alias for the original E2E entry point.
 

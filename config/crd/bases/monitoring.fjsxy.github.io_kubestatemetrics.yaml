@@ -376,6 +376,25 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              serviceMonitor:
+                description: ServiceMonitor 仅声明本实例的配套采集配置。
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled 默认关闭，升级不自动为历史实例创建资源。
+                    type: boolean
+                  interval:
+                    description: Interval 省略时使用 30s。
+                    type: string
+                  labels:
+                    additionalProperties:
+                      type: string
+                    description: Labels 附加采集分组标签，不得覆盖 Operator 身份标签。
+                    type: object
+                  scrapeTimeout:
+                    description: ScrapeTimeout 省略时使用 10s，不能大于 Interval。
+                    type: string
+                type: object
               suspended:
                 default: false
                 description: Suspended stops the workload while retaining its Service,
@@ -511,6 +530,49 @@ spec:
                 - Ready
                 - Degraded
                 type: string
+              serviceMonitor:
+                description: ServiceMonitor 是配套资源的独立观察结果。
+                properties:
+                  message:
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  reason:
+                    type: string
+                  resource:
+                    description: ServiceMonitorReference 记录本次真实观察到的对象身份；UID 不代表父实例身份。
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - namespace
+                    type: object
+                  state:
+                    enum:
+                    - Unknown
+                    - Disabled
+                    - Ready
+                    - Degraded
+                    - Deleting
+                    type: string
+                required:
+                - message
+                - observedGeneration
+                - reason
+                - state
+                type: object
             type: object
         required:
         - spec

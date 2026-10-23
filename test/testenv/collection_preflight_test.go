@@ -649,14 +649,14 @@ esac
 		Expect(endpoint.Fragment).To(BeEmpty())
 	})
 
-	It("[UT-BOUNDARY-GH60-001] 本 Operator 安装身份无权读写 Agent 与采集配置 API", func() {
+	It("[UT-BOUNDARY-GH60-001] 本 Operator 只新增配套 ServiceMonitor 权限且不管理 Agent", func() {
 		By("读取会被 Helm 机械同步的 manager ClusterRole 生成源")
 		root, err := filepath.Abs(filepath.Join("..", ".."))
 		Expect(err).NotTo(HaveOccurred())
 		objects := readManifestObjects(filepath.Join(root, "config", "rbac", "role.yaml"))
 		Expect(objects).To(HaveLen(1))
 
-		By("验证 manager 对 monitoring.coreos.com 整个 API group 都没有权限")
+		By("验证 monitoring API 权限仅覆盖配套 servicemonitors")
 		rules, found, err := unstructured.NestedSlice(objects[0], "rules")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(found).To(BeTrue())
@@ -664,7 +664,11 @@ esac
 			rule := item.(map[string]any)
 			apiGroups, _, err := unstructured.NestedStringSlice(rule, "apiGroups")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(apiGroups).NotTo(ContainElement("monitoring.coreos.com"))
+			if len(apiGroups) == 1 && apiGroups[0] == "monitoring.coreos.com" {
+				resources, _, err := unstructured.NestedStringSlice(rule, "resources")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resources).To(ConsistOf("servicemonitors"))
+			}
 		}
 	})
 

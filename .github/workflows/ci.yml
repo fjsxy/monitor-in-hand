@@ -95,6 +95,16 @@ jobs:
             run_id_suffix: "128"
             lane: agent
             target: e2e-agent
+          - kubernetes: "1.19"
+            kubectl: "v1.19.16"
+            run_id_suffix: "119"
+            lane: servicemonitor
+            target: e2e-servicemonitor
+          - kubernetes: "1.28"
+            kubectl: "v1.28.15"
+            run_id_suffix: "128"
+            lane: servicemonitor
+            target: e2e-servicemonitor
     env:
       KUBERNETES_VERSION: ${{ matrix.kubernetes }}
       TEST_RUN_ID: ci-${{ github.run_id }}-${{ matrix.run_id_suffix }}-${{ matrix.lane }}
@@ -171,8 +181,8 @@ jobs:
         run: >-
           go run ./cmd/phase1-gate
           --reports artifacts
-          --expected-blocking-count 187
-          --expected-e2e-count 57
+          --expected-blocking-count 209
+          --expected-e2e-count 71
       - name: 校验全部上游 blocking job
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
