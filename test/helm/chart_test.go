@@ -45,7 +45,8 @@ var _ = Describe("Operator Helm chart", func() {
 
 		container := firstContainer(deployment)
 		Expect(nested(deployment, "spec", "template", "spec", "serviceAccountName")).To(Equal("test-release-monitor-in-hand"))
-		Expect(container["image"]).To(Equal("docker.io/fjsxy/monitor-in-hand:0.1.0"))
+		chart := decodeYAMLFile(filepath.Join(repositoryRoot(), "charts/monitor-in-hand/Chart.yaml"))
+		Expect(container["image"]).To(Equal("docker.io/fjsxy/monitor-in-hand:" + chart["appVersion"].(string)))
 		Expect(container["imagePullPolicy"]).To(Equal("IfNotPresent"))
 		Expect(container["args"]).To(ConsistOf(
 			"--leader-elect=true",
@@ -129,6 +130,7 @@ var _ = Describe("Operator Helm chart", func() {
 		Expect(keys).To(Equal([]string{
 			"affinity",
 			"healthProbe",
+			"image",
 			"logLevel",
 			"nodeSelector",
 			"resources",
@@ -284,6 +286,29 @@ var _ = Describe("Operator Helm chart", func() {
 		monitor := properties["spec"].(map[string]interface{})["properties"].(map[string]interface{})["serviceMonitor"].(map[string]interface{})["properties"].(map[string]interface{})
 		Expect(monitor).To(HaveKey("labels"))
 		Expect(monitor["enabled"].(map[string]interface{})["default"]).To(BeFalse())
+	})
+
+	It("HELM-GH87-001 实际打包 chart 并以 OCI digest 渲染，拒绝不合法值", func() {
+		By("通过真实 Helm 生成 tgz，并从已打包文件渲染")
+		root := repositoryRoot()
+		helm := os.Getenv("HELM_BIN")
+		if helm == "" {
+			helm = filepath.Join(root, ".tools/bin/helm")
+		}
+		dir := GinkgoT().TempDir()
+		chart := decodeYAMLFile(filepath.Join(root, "charts/monitor-in-hand/Chart.yaml"))
+		output, err := exec.Command(helm, "package", filepath.Join(root, "charts/monitor-in-hand"), "--destination", dir).CombinedOutput()
+		Expect(err).NotTo(HaveOccurred(), string(output))
+		archive := filepath.Join(dir, "monitor-in-hand-"+chart["version"].(string)+".tgz")
+		digest := "sha256:" + strings.Repeat("1", 64)
+		output, err = exec.Command(helm, "template", "packaged", archive, "--set", "image.digest="+digest).CombinedOutput()
+		Expect(err).NotTo(HaveOccurred(), string(output))
+		Expect(string(output)).To(ContainSubstring("docker.io/fjsxy/monitor-in-hand@" + digest))
+		By("digest 和来源配置保持收敛，不开放任意镜像仓库透传")
+		for _, value := range []string{"image.digest=latest", "image.digest=sha256:abc", "image.repository=foreign/repo"} {
+			output, err := renderChartError("--set", value)
+			Expect(err).To(HaveOccurred(), output)
+		}
 	})
 
 })

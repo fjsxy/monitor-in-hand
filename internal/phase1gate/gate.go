@@ -207,6 +207,7 @@ func validateJUnitProvenance(id, path string) string {
 	lane := map[string]string{
 		"KSM":        "ksm",
 		"SM":         "sm",
+		"RELEASE":    "rel",
 		"BOUNDARY":   "ksm",
 		"PREFLIGHT":  "agent",
 		"COLLECTION": "agent",

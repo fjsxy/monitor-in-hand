@@ -1,6 +1,7 @@
 
 # Image URL to use all building/pushing image targets
-IMG ?= docker.io/fjsxy/monitor-in-hand:0.1.0
+RELEASE_VERSION ?= $(shell sed -n 's/^appVersion: "\(.*\)"/\1/p' charts/monitor-in-hand/Chart.yaml)
+IMG ?= docker.io/fjsxy/monitor-in-hand:$(RELEASE_VERSION)
 HELM ?= $(shell command -v helm 2>/dev/null || printf '%s/.tools/bin/helm' '$(CURDIR)')
 GINKGO ?= go run github.com/onsi/ginkgo/v2/ginkgo
 KIND ?= kind
@@ -307,3 +308,28 @@ envtest: $(LOCALBIN) ## Download envtest-setup locally if necessary.
 	test -s $(LOCALBIN)/setup-envtest && \
 		go version -m $(LOCALBIN)/setup-envtest | grep -Fq "$(ENVTEST_VERSION)" || \
 		GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION)
+
+##@ 候选发布与契约消费
+SOURCE_COMMIT ?= $(if $(RELEASE_TESTED_COMMIT),$(RELEASE_TESTED_COMMIT),$(shell git rev-parse HEAD))
+RELEASE_OUTPUT ?= artifacts/releases/$(RELEASE_VERSION)
+BUNDLE ?= artifacts/published/$(RELEASE_VERSION)
+.PHONY: release-image release-package release-publish release-fetch release-verify release-upgrade e2e-release
+release-image: ## 发布同源 amd64/arm64 镜像及固定的 pre-SM 对照候选。
+	go run ./cmd/release images --source-commit "$(SOURCE_COMMIT)" --version "$(RELEASE_VERSION)"
+release-package: ## 组装并验证 chart/CRD/RBAC/契约/摘要，不接受未提交的源。
+	HELM_BIN="$(HELM)" go run ./cmd/release package --source-commit "$(SOURCE_COMMIT)" --version "$(RELEASE_VERSION)" --bundle "$(RELEASE_OUTPUT)"
+release-publish: ## 创建不可覆盖的 GitHub prerelease；候选不代表验收通过。
+	go run ./cmd/release publish --source-commit "$(SOURCE_COMMIT)" --bundle "$(RELEASE_OUTPUT)"
+release-fetch: ## 下载远程候选到独立目录，实际验收不使用本地组装目录。
+	mkdir -p "$(BUNDLE)"
+	gh release download "v$(RELEASE_VERSION)" --repo fjsxy/monitor-in-hand --dir "$(BUNDLE)" --clobber
+	go run ./cmd/release verify --source-commit "$(SOURCE_COMMIT)" --bundle "$(BUNDLE)"
+release-verify: ## 校验已下载发布包和完整 schema 能力。
+	go run ./cmd/release verify --source-commit "$(SOURCE_COMMIT)" --bundle "$(BUNDLE)"
+release-upgrade: ## 显式 context；先校验，再 server-side apply CRD，最后 Helm upgrade。
+	HELM_BIN="$(HELM)" go run ./cmd/release upgrade --source-commit "$(SOURCE_COMMIT)" --bundle "$(BUNDLE)" --context "$(KUBE_CONTEXT)" --namespace "$(NAMESPACE)" --release "$(RELEASE)"
+e2e-release: release-fetch ## 使用远程候选验证新装、两类旧版升级、受限平台身份与真实采集。
+	mkdir -p "$(E2E_REPORT_DIR)/release"
+	KUBERNETES_VERSION="$(KUBERNETES_VERSION)" TEST_RUN_ID="$(TEST_RUN_ID)" RELEASE_BUNDLE="$(abspath $(BUNDLE))" RELEASE_TESTED_COMMIT="$(SOURCE_COMMIT)" HELM_BIN="$(HELM)" \
+		$(GINKGO) -v --fail-on-pending --fail-on-empty --timeout=45m \
+		--junit-report=junit.xml --json-report=report.json --output-dir="$(E2E_REPORT_DIR)/release" ./test/e2e/release
