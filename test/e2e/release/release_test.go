@@ -433,6 +433,15 @@ func recordDeploymentContract(ctx context.Context) {
 	expectedRole := &rbacv1.ClusterRole{}
 	Expect(yaml.Unmarshal(data, expectedRole)).To(Succeed())
 	Expect(role.Rules).To(Equal(expectedRole.Rules))
+	deployment, err := kc.AppsV1().Deployments(opNS).Get(ctx, "monitor-in-hand-monitor-in-hand", metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	sa, err := kc.CoreV1().ServiceAccounts(opNS).Get(ctx, deployment.Spec.Template.Spec.ServiceAccountName, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	binding, err := kc.RbacV1().ClusterRoleBindings().Get(ctx, "monitor-in-hand-monitor-in-hand-manager", metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(binding.RoleRef).To(Equal(rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name}))
+	Expect(binding.Subjects).To(ConsistOf(rbacv1.Subject{Kind: "ServiceAccount", Name: sa.Name, Namespace: opNS}))
+	AddReportEntry("生效的 Operator 权限身份", map[string]string{"serviceAccount": sa.Namespace + "/" + sa.Name, "serviceAccountUID": string(sa.UID), "bindingUID": string(binding.UID), "roleUID": string(role.UID)}, ReportEntryVisibilityFailureOrVerbose)
 	schemaBytes, err := json.Marshal(definition.Spec.Versions)
 	Expect(err).NotTo(HaveOccurred())
 	rbacBytes, err := json.Marshal(role.Rules)
@@ -711,6 +720,7 @@ func getHTTP(ctx context.Context, address string) ([]byte, error) {
 func assertData(ctx context.Context, expectedNames []string) {
 	GinkgoHelper()
 	By("比对必要 Service 的真实 target，并查询同环境接收端的可关联样本")
+	By("从当前 Service Endpoints 建立必要端点集合，避免沿用已失效地址")
 	expected := map[string]bool{}
 	for _, name := range expectedNames {
 		c := getCR(ctx, name)
@@ -750,6 +760,7 @@ func assertData(ctx context.Context, expectedNames []string) {
 		}
 		return false
 	}, 180*time.Second, time.Second).Should(BeTrue())
+	By("读取 Agent active targets，逐一核对必要地址和健康状态")
 	base, stop := forward(ctx, "pod/prom-agent-gh87-0", 9090)
 	defer stop()
 	Eventually(func() error {
@@ -789,6 +800,7 @@ func assertData(ctx context.Context, expectedNames []string) {
 		AddReportEntry("真实 targets", string(b), ReportEntryVisibilityFailureOrVerbose)
 		return nil
 	}, 180*time.Second, 2*time.Second).Should(Succeed())
+	By("查询接收端真实样本，按 namespace、Service 和 instance 关联每个必要端点")
 	queryBase, queryStop := forward(ctx, "service/vmselect", 8481)
 	defer queryStop()
 	query := url.QueryEscape(`count by (namespace,service,instance) (kube_pod_info{prometheus="monitor-in-hand-test/gh87"})`)

@@ -38,3 +38,5 @@ make release-upgrade BUNDLE="bundle-${VERSION}" SOURCE_COMMIT="${SOURCE_COMMIT}"
 降级不属于无损回滚承诺：启用新字段后不能用旧 schema 覆盖并声称数据保留。#62/#63/#64 延期范围不变。安全卸载仍须先清理本项目 CR 并等待 finalizer。
 
 CI 的 `rel` lane 按 Chart appVersion 对应的轻量 Git tag 锁定候选源提交，下载同一发布包；测试报告记录该候选源提交。其他 lane 验证 CI 当前提交。发布验收时须确认 tag/source/testedCommit 为拟交付的提交，并在同一个 run/attempt 汇总；后续 main rebase 不改写候选来源。
+
+候选完整验收仅引用该版本 tag 触发的 CI（所有 job checkout 同一候选提交，rel 额外断言 tag 源等于 GITHUB_SHA）；日常 PR/main 对冻结候选的回归与当前提交测试分开解释，不拼成候选发布证据。
