@@ -53,4 +53,4 @@ Issue：https://github.com/fjsxy/monitor-in-hand/issues/87
 
 ## 真实升级修订
 
-历史 Helm 安装持有 `.spec.versions`，无 force 的 SSA 不能升级真实旧 schema。改为公开 Kubernetes JSON Patch：先 GET 并比对已知旧/新 spec（忽略 API 默认 conversion=None），新装用 create；已存在时只替换 spec，携带 UID/resourceVersion test。未知 schema、webhook 转换、并发冲突都在 Helm 前停止，metadata/status/CRD UID 不重建。UT-GH87-003 扩展覆盖旧基线、重复升级、新装、未知漂移和 409；不增加或重编号 ID。
+历史 Helm 安装持有 `.spec.versions`，无 force 的 SSA 不能升级真实旧 schema。改为公开 Kubernetes JSON Patch：先 GET 并比对已知旧/新 spec（忽略 API 默认 conversion=None），新装用 create；已存在时只替换 spec，携带 UID/resourceVersion test。未知 schema、webhook 转换、并发冲突都在 Helm 前停止，metadata/status/CRD UID 不重建。UT-RELEASE-GH87-003 扩展覆盖旧基线、重复升级、新装、未知漂移和并发更新冲突；不增加或重编号 ID。

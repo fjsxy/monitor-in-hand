@@ -326,7 +326,7 @@ release-fetch: ## 下载远程候选到独立目录，实际验收不使用本�
 	go run ./cmd/release verify --source-commit "$(SOURCE_COMMIT)" --bundle "$(BUNDLE)"
 release-verify: ## 校验已下载发布包和完整 schema 能力。
 	go run ./cmd/release verify --source-commit "$(SOURCE_COMMIT)" --bundle "$(BUNDLE)"
-release-upgrade: ## 显式 context；先校验，再 server-side apply CRD，最后 Helm upgrade。
+release-upgrade: ## 显式 context；先校验已知基线，以 UID/RV 条件原位更新 CRD，再 Helm upgrade。
 	HELM_BIN="$(HELM)" go run ./cmd/release upgrade --source-commit "$(SOURCE_COMMIT)" --bundle "$(BUNDLE)" --context "$(KUBE_CONTEXT)" --namespace "$(NAMESPACE)" --release "$(RELEASE)"
 e2e-release: release-fetch ## 使用远程候选验证新装、两类旧版升级、受限平台身份与真实采集。
 	mkdir -p "$(E2E_REPORT_DIR)/release"
