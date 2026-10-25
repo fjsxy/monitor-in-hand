@@ -242,6 +242,10 @@ func exportPrevious(ctx context.Context) (string, func(), error) {
 			cleanup()
 			return "", func() {}, e
 		}
+		// Git archive 的全局 PAX 头仅携带 commit 元数据，不是待展开文件。
+		if h.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
 		path := filepath.Join(dir, h.Name)
 		if !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
 			cleanup()
