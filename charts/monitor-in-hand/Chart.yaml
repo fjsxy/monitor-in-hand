@@ -2,6 +2,6 @@ apiVersion: v2
 name: monitor-in-hand
 description: 可观测组件管控 Operator
 type: application
-version: 0.2.0-rc.1
-appVersion: "0.2.0-rc.1"
+version: 0.2.0-rc.2
+appVersion: "0.2.0-rc.2"
 kubeVersion: ">=1.19.0-0"

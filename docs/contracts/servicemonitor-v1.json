@@ -65,7 +65,7 @@
     "entry": "make release-upgrade BUNDLE=... SOURCE_COMMIT=... KUBE_CONTEXT=...",
     "order": [
       "verify bundle hashes/source/digests/schema",
-      "kubectl server-side apply CRD, no delete or force",
+      "核对已知 CRD spec；新装 create；既有对象以 UID/resourceVersion test 的 JSON Patch 原位更新，拒绝未知漂移/并发冲突",
       "helm upgrade same pinned chart --skip-crds"
     ],
     "historicalInstances": "旧 CR 不自动启用采集，只在后续显式修改后启用"

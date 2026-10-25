@@ -12,6 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"sigs.k8s.io/yaml"
+
 	product "github.com/fjsxy/monitor-in-hand/internal/release"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -39,30 +42,77 @@ var _ = Describe("可消费的发布包", func() {
 		}
 	})
 
-	It("UT-RELEASE-GH87-003 校验失败零写入，CRD apply 成功后才升级同一 chart", func() {
+	It("UT-RELEASE-GH87-003 校验和基线拒绝零写入，带 UID/RV test 更新后才升级 chart", func() {
 		dir, m := bundleFixture()
+		oldData, err := os.ReadFile(filepath.Join(dir, m.Legacy.CRD))
+		Expect(err).NotTo(HaveOccurred())
+		old := &extv1.CustomResourceDefinition{}
+		Expect(yaml.Unmarshal(oldData, old)).To(Succeed())
+		old.UID = "original-uid"
+		old.ResourceVersion = "41"
+		old.Spec.Conversion = &extv1.CustomResourceConversion{Strategy: extv1.NoneConverter}
+		current, _ := json.MarshalIndent(old, "", "  ")
 		commands := [][]string{}
-		runner := func(ctx context.Context, name string, args ...string) error {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			commands = append(commands, append([]string{name}, args...))
-			return nil
+			if containsArg(args, "get") {
+				return current, nil
+			}
+			if containsArg(args, "--patch-file") {
+				data, e := os.ReadFile(args[len(args)-1])
+				Expect(e).NotTo(HaveOccurred())
+				var patch []map[string]any
+				Expect(json.Unmarshal(data, &patch)).To(Succeed())
+				Expect(patch).To(HaveLen(3))
+				Expect(patch[0]).To(HaveKeyWithValue("value", "original-uid"))
+				Expect(patch[1]).To(HaveKeyWithValue("value", "41"))
+				Expect(patch[2]).To(HaveKeyWithValue("path", "/spec"))
+			}
+			return nil, nil
 		}
-		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "kind-owned", "monitoring", "monitor-in-hand", runner)).To(Succeed())
+		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "kind-owned", "monitoring", "operator", runner)).To(Succeed())
+		Expect(commands).To(HaveLen(3))
+		Expect(commands[1]).To(ContainElements("patch", "--type=json", "--patch-file"))
+		Expect(commands[2]).To(ContainElements("helm", "upgrade", "--skip-crds", filepath.Join(dir, m.Chart)))
+		By("当前 schema 已是新基线时只读后升级 Helm，新装则先 create")
+		data, e := os.ReadFile(filepath.Join(dir, m.CRD))
+		Expect(e).NotTo(HaveOccurred())
+		desired := &extv1.CustomResourceDefinition{}
+		Expect(yaml.Unmarshal(data, desired)).To(Succeed())
+		desired.UID = old.UID
+		desired.ResourceVersion = "42"
+		current, _ = json.Marshal(desired)
+		commands = nil
+		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "owned", "ns", "op", runner)).To(Succeed())
 		Expect(commands).To(HaveLen(2))
-		Expect(commands[0]).To(Equal([]string{"kubectl", "--context", "kind-owned", "apply", "--server-side", "--field-manager=monitor-in-hand-release", "--filename", filepath.Join(dir, m.CRD)}))
-		Expect(commands[1]).To(ContainElements("helm", "upgrade", "--skip-crds", filepath.Join(dir, m.Chart), "--kube-context", "kind-owned"))
-		By("外部 API 写失败时不会继续改变 Operator，坏 bundle 在任何命令前拒绝")
+		current = nil
 		commands = nil
-		failing := func(ctx context.Context, name string, args ...string) error {
-			commands = append(commands, []string{name})
-			return fmt.Errorf("conflict")
-		}
-		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "kind-owned", "monitoring", "operator", failing)).NotTo(Succeed())
+		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "owned", "ns", "op", runner)).To(Succeed())
+		Expect(commands[1]).To(ContainElement("create"))
+		By("未知漂移只读即拒绝，更新冲突不运行 Helm，坏包不调用 Kubernetes")
+		old.Spec.Group = "foreign.example"
+		current, _ = json.Marshal(old)
+		commands = nil
+		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "owned", "ns", "op", runner)).NotTo(Succeed())
 		Expect(commands).To(HaveLen(1))
+		old.Spec.Group = "monitoring.fjsxy.github.io"
+		current, _ = json.Marshal(old)
 		commands = nil
-		Expect(product.Upgrade(context.Background(), dir, "wrong-sha", "kind-owned", "monitoring", "operator", runner)).NotTo(Succeed())
-		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "", "monitoring", "operator", runner)).NotTo(Succeed())
+		failing := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if containsArg(args, "patch") {
+				commands = append(commands, []string{"conflict"})
+				return nil, fmt.Errorf("409 conflict")
+			}
+			return runner(ctx, name, args...)
+		}
+		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "owned", "ns", "op", failing)).NotTo(Succeed())
+		Expect(commands).To(HaveLen(2))
+		commands = nil
+		Expect(product.Upgrade(context.Background(), dir, "wrong", "owned", "ns", "op", runner)).NotTo(Succeed())
+		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "", "ns", "op", runner)).NotTo(Succeed())
 		Expect(commands).To(BeEmpty())
 	})
+
 })
 
 const fixtureCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -87,7 +137,13 @@ func bundleFixture() (string, *product.Manifest) {
 	}
 	Expect(tarWriter.Close()).To(Succeed())
 	Expect(zip.Close()).To(Succeed())
-	files := map[string][]byte{m.Chart: archive.Bytes(), m.CRD: crd, m.RBAC: []byte("kind: ClusterRole\n"), m.Contract: []byte(`{"contractVersion":1,"capability":"ksm-companion-servicemonitor/v1"}`), "legacy.tgz": []byte("legacy-chart"), "previous.tgz": []byte("previous-chart"), "legacy.yaml": []byte("kind: CustomResourceDefinition\n")}
+	legacy := &extv1.CustomResourceDefinition{}
+	Expect(yaml.Unmarshal(crd, legacy)).To(Succeed())
+	delete(legacy.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties, "serviceMonitor")
+	delete(legacy.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"].Properties, "serviceMonitor")
+	legacyData, err := yaml.Marshal(legacy)
+	Expect(err).NotTo(HaveOccurred())
+	files := map[string][]byte{m.Chart: archive.Bytes(), m.CRD: crd, m.RBAC: []byte("kind: ClusterRole\n"), m.Contract: []byte(`{"contractVersion":1,"capability":"ksm-companion-servicemonitor/v1"}`), "legacy.tgz": []byte("legacy-chart"), "previous.tgz": []byte("previous-chart"), "legacy.yaml": legacyData}
 	for name, data := range files {
 		Expect(os.WriteFile(filepath.Join(dir, name), data, 0600)).To(Succeed())
 		m.Files[name] = fmt.Sprintf("%x", sha256.Sum256(data))
@@ -100,4 +156,13 @@ func writeManifest(dir string, m *product.Manifest) {
 	data, err := json.Marshal(m)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(os.WriteFile(filepath.Join(dir, "release.json"), data, 0600)).To(Succeed())
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }

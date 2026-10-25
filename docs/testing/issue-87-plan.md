@@ -10,7 +10,7 @@ Issue：https://github.com/fjsxy/monitor-in-hand/issues/87
 - chart 支持固定 repository 的 `image.digest`，发布包默认锁定 index digest；不通过 latest 或本地 tag 交付。复用现有 Make/Docker buildx/Helm/GitHub release，不引入凭据存储或部署平台代码。
 - 原 `0.1.0` 镜像 index 固定 `sha256:c64fda8d39b6653f74ede950d8ce3e37a479e25c137fd78f956442d641f41d6a`。已检查真实 arm64 binary：仅早期 Operator runtime，无 KSM controller，且无 VCS revision。单独验证该历史版本升级后的 CR 保留与开始收敛，不声称其原本管理 KSM workload。
 - 另从 #86 前源提交 `2b2a8b79a52070fb89a08f5afae2b7698901c999` 发布 `0.1.0-pre-sm.2b2a8b7` 对照候选（明确非历史正式 0.1.0），用于证明运行中旧 KSM CR/workload/Service UID、finalizer、targetNamespace、owner 关系保留。旧 CRD 摘要保留，两种旧版路径分开产生 JUnit。
-- 升级入口先验证整个已下载 bundle 的 manifest/文件 hash、版本/来源、KSM CRD 名称及能力，再以显式 context 对已存在 CRD 做 server-side apply（不 delete/recreate、不 force 接管），随后 Helm upgrade/install 同一 tgz；重复执行可收敛。能力缺失在平台 CR 写入之前明确拒绝，不能靠新字段被静默裁剪后的对象猜测支持。
+- 升级入口先验证整个已下载 bundle 的 manifest/文件 hash、版本/来源、KSM CRD 名称及能力，再以显式 context 新装创建 CRD；既有 CRD 仅在完整 spec 与包内旧/新基线匹配时，以 JSON Patch 的 resourceVersion 与 UID test 前置条件替换 spec（不 delete/recreate、不 force 接管），随后 Helm upgrade/install 同一 tgz；重复执行可收敛。能力缺失在平台 CR 写入之前明确拒绝，不能靠新字段被静默裁剪后的对象猜测支持。
 - 机器契约包含 #86 的 spec/status/defaults/validation/reserved labels、stable name/owner、条件与 UID 观察、schema 能力判定；平台读取状态，不复制 Operator Service selector 算法。
 - 受限平台 SA 只具有 exporter CR 管理和 SM 只读权限；以真实 impersonation API 请求证明 SM 写被 403 拒绝，而显式 exporter 更新由实际 Operator SA 生成配套 SM。Operator 的权限证据使用其自身身份和实际写入，不复用平台身份的 SSAR。
 - #62/#63/#64 延期范围不变；测试中才安装外部 Prometheus Operator/原生 Agent。只有最终候选完整通过、版本和 digest 回填并回读后，才向平台 #28 宣告可消费；本 PR 不合并 #87，也不改平台产品代码。
@@ -36,7 +36,7 @@ Issue：https://github.com/fjsxy/monitor-in-hand/issues/87
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | UT-RELEASE-GH87-001 | #87 | Ginkgo/公开能力检查 | 通用 | schema 明确识别支持与旧版拒绝 | 读取真实新/旧 CRD，删改类型/default/status 引用字段，调用公开检查 | 仅完整支持的新 schema 通过；旧/缺失/不兼容字段明确拒绝 | Ginkgo failure/JUnit | make test-unit |
 | UT-RELEASE-GH87-002 | #87 | Ginkgo/公开 bundle 校验 | 通用 | 来源、digest、文件完整性可复核 | 构造包含 chart/CRD/RBAC/contract 的独立 bundle；注入 hash 错、路径逃逸、缺架构、错 SHA/版本、错 CRD | 合法包通过；不完整/篡改包在任何集群写入前拒绝 | 独立字面期望、JUnit | make test-unit |
-| UT-RELEASE-GH87-003 | #87 | Ginkgo/升级入口 | 通用 | 显式 context 与升级顺序 | 调用公开升级入口并记录外部执行边界，注入校验/CRD apply 失败 | 校验在前、CRD apply 在 Helm 前；显式 context；失败停止后续写；不 delete/recreate/force | 请求/命令记录、JUnit | make test-unit |
+| UT-RELEASE-GH87-003 | #87 | Ginkgo/升级入口 | 通用 | 显式 context 与升级顺序 | 调用公开升级入口并记录外部执行边界，注入校验/CRD 受保护更新 失败 | 校验在前、CRD 受保护更新 在 Helm 前；显式 context；失败停止后续写；不 delete/recreate/force | 请求/命令记录、JUnit | make test-unit |
 | HELM-GH87-001 | #87 | Ginkgo/实际 package/render | 通用 | chart 版本和 digest 钉住 | 实际打包/解包并 render 新 values，注入非法 digest；核对 CRD/RBAC 与源 | 同候选版本；image 使用 index digest；非法值拒绝；只含 KSM CRD/SM 管理 RBAC | tgz/hash/render、JUnit | make test-helm |
 | UT-GATE-GH65-002（复用） | #65 / #87 | Ginkgo/JUnit 门禁 | 1.19 / 1.28 | 新 rel lane 的版本来源核对 | 提交两个版本 RELEASE 通过结果及错 lane/版本反例 | 正确 rel 来源放行；错误来源拒绝；ID 不重编号 | JUnit | make test-unit |
 | 既有 GH86 与一期全部 blocking ID（复用） | #86 / #87 | 完整 CI | 1.19.16 / 1.28.15 | 发布变更不破坏功能和支持边界 | 同源提交执行既有 UT/IT/Helm、sm/ksm/agent lane，并增加 rel lane | 既有门禁维持；新增 16 个 ID 后总计 225 个，E2E 83 个，八个 E2E lane 清理成功 | 全部同 run/attempt JUnit | CI / make test |
@@ -50,3 +50,7 @@ Issue：https://github.com/fjsxy/monitor-in-hand/issues/87
 - 候选最终验收只接受该版本轻量 tag 触发的完整 CI：tag 指向 source/testedCommit，全部 blocking job checkout 同一 tag 提交，rel lane 再断言解析出的候选源等于 GITHUB_SHA。使用同一 run/attempt 的全部结果，不拼接其他候选或分支结果。
 - 日常 PR/main CI 继续测试当前提交，同时可回归 Chart appVersion 指定的冻结候选；这类门禁通过不宣称当前提交已发布，也不作为候选完整验收证明。合并 rebase 产生新 SHA 不改写候选来源。最终结果必须分别列明候选 tag CI 与 PR CI 的源。
 - 每次发布升级后，E2E 回读实际 CRD schema、RBAC rules，分别与候选独立产物比较并记录摘要；运行容器的 config digest 与已发布的平台 manifest config digest 相等，兼容 containerd 将 imageID 报告为 index 的行为。历史 CR 的外部测试 finalizer 必须被保留。
+
+## 真实升级修订
+
+历史 Helm 安装持有 `.spec.versions`，无 force 的 SSA 不能升级真实旧 schema。改为公开 Kubernetes JSON Patch：先 GET 并比对已知旧/新 spec（忽略 API 默认 conversion=None），新装用 create；已存在时只替换 spec，携带 UID/resourceVersion test。未知 schema、webhook 转换、并发冲突都在 Helm 前停止，metadata/status/CRD UID 不重建。UT-GH87-003 扩展覆盖旧基线、重复升级、新装、未知漂移和 409；不增加或重编号 ID。
