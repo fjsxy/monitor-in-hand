@@ -160,6 +160,7 @@ var _ = Describe("发布契约", Ordered, func() {
 		checkImage(ctx, manifest.Legacy.Image, false)
 		oldSchema, err := ec.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crdName, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		oldSchema.SetGroupVersionKind(extv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
 		data, err := json.Marshal(oldSchema)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(product.CheckCapability(data)).NotTo(Succeed())
@@ -383,6 +384,10 @@ var _ = AfterSuite(func(ctx SpecContext) {
 
 // 以下 helper 仅通过公开 Kubernetes/Helm/HTTP 边界观察，异步等待均有明确上限。
 func command(ctx context.Context, name string, args ...string) error {
+	_, err := commandOutput(ctx, name, args...)
+	return err
+}
+func commandOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
 	if name == "helm" && os.Getenv("HELM_BIN") != "" {
 		name = os.Getenv("HELM_BIN")
 	}
@@ -390,21 +395,31 @@ func command(ctx context.Context, name string, args ...string) error {
 	c.Dir = root
 	b, e := c.CombinedOutput()
 	if e != nil {
-		return fmt.Errorf("%s: %w: %s", name, e, b)
+		return nil, fmt.Errorf("%s: %w: %s", name, e, b)
 	}
-	return nil
+	return b, nil
 }
 func upgrade(ctx context.Context) {
 	GinkgoHelper()
-	Expect(product.Upgrade(ctx, bundle, manifest.SourceCommit, kubeContext, opNS, releaseName, command)).To(Succeed())
+	before, err := ec.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crdName, metav1.GetOptions{})
+	Expect(err).To(SatisfyAny(Succeed(), WithTransform(apierrors.IsNotFound, BeTrue())))
+	Expect(product.Upgrade(ctx, bundle, manifest.SourceCommit, kubeContext, opNS, releaseName, commandOutput)).To(Succeed())
 	recordDeploymentContract(ctx)
+	if err == nil {
+		after, e := ec.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crdName, metav1.GetOptions{})
+		Expect(e).NotTo(HaveOccurred())
+		Expect(after.UID).To(Equal(before.UID))
+		AddReportEntry("CRD 原位升级身份", map[string]string{"beforeUID": string(before.UID), "afterUID": string(after.UID)}, ReportEntryVisibilityFailureOrVerbose)
+	}
 }
 
 // recordDeploymentContract 核验实际 API schema 和生效权限，不能只用发布包本身证明集群已升级。
 func recordDeploymentContract(ctx context.Context) {
 	GinkgoHelper()
+	// 核对真实 served schema；typed client 解码后需补回已知 REST 端点的 GVK 才能序列化能力输入。
 	definition, err := ec.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crdName, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
+	definition.SetGroupVersionKind(extv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
 	live, err := json.Marshal(definition)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(product.CheckCapability(live)).To(Succeed())
@@ -426,6 +441,7 @@ func recordDeploymentContract(ctx context.Context) {
 		}
 		Expect(found).To(BeTrue(), version.Name)
 	}
+	// 核对已生效的完整规则，而非仅凭某一个 SM 权限请求推定 RBAC 正确。
 	role, err := kc.RbacV1().ClusterRoles().Get(ctx, "monitor-in-hand-manager-role", metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
 	data, err = os.ReadFile(filepath.Join(bundle, manifest.RBAC))
@@ -433,6 +449,7 @@ func recordDeploymentContract(ctx context.Context) {
 	expectedRole := &rbacv1.ClusterRole{}
 	Expect(yaml.Unmarshal(data, expectedRole)).To(Succeed())
 	Expect(role.Rules).To(Equal(expectedRole.Rules))
+	// 从实际 Deployment 身份追踪 SA 与绑定，不把平台权限当作 Operator 权限。
 	deployment, err := kc.AppsV1().Deployments(opNS).Get(ctx, "monitor-in-hand-monitor-in-hand", metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
 	sa, err := kc.CoreV1().ServiceAccounts(opNS).Get(ctx, deployment.Spec.Template.Spec.ServiceAccountName, metav1.GetOptions{})
@@ -442,6 +459,7 @@ func recordDeploymentContract(ctx context.Context) {
 	Expect(binding.RoleRef).To(Equal(rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name}))
 	Expect(binding.Subjects).To(ConsistOf(rbacv1.Subject{Kind: "ServiceAccount", Name: sa.Name, Namespace: opNS}))
 	AddReportEntry("生效的 Operator 权限身份", map[string]string{"serviceAccount": sa.Namespace + "/" + sa.Name, "serviceAccountUID": string(sa.UID), "bindingUID": string(binding.UID), "roleUID": string(role.UID)}, ReportEntryVisibilityFailureOrVerbose)
+	// 输出规范化摘要及对象 UID，便于在同一 run 中关联运行镜像与安装内容。
 	schemaBytes, err := json.Marshal(definition.Spec.Versions)
 	Expect(err).NotTo(HaveOccurred())
 	rbacBytes, err := json.Marshal(role.Rules)

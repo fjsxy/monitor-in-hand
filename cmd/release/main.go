@@ -55,7 +55,7 @@ func run(ctx context.Context, args []string) error {
 	case "verify":
 		return product.VerifyBundle(*dir, *source)
 	case "upgrade":
-		return product.Upgrade(ctx, *dir, *source, *kubeContext, *namespace, *name, execute)
+		return product.Upgrade(ctx, *dir, *source, *kubeContext, *namespace, *name, output)
 	case "images", "package":
 		if err := cleanSource(ctx, *source); err != nil {
 			return err
@@ -110,6 +110,9 @@ func execute(ctx context.Context, name string, args ...string) error {
 }
 
 func output(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if name == "helm" && os.Getenv("HELM_BIN") != "" {
+		name = os.Getenv("HELM_BIN")
+	}
 	c := exec.CommandContext(ctx, name, args...)
 	data, err := c.CombinedOutput()
 	if err != nil {
@@ -385,6 +388,7 @@ func packageChart(ctx context.Context, source, dir, version, digest string) erro
 	if err != nil {
 		return err
 	}
+	// 发布包默认选择 registry 已返回的不可变 digest，保留源 chart 的其他配置。
 	if digest != "" {
 		path := filepath.Join(chart, "values.yaml")
 		data, err := os.ReadFile(path)
@@ -404,5 +408,6 @@ func packageChart(ctx context.Context, source, dir, version, digest string) erro
 			return err
 		}
 	}
+	// 由 Helm 实际生成包，版本与运行镜像版本均来自同一次发布输入。
 	return execute(ctx, "helm", "package", chart, "--destination", dir, "--version", version, "--app-version", version)
 }

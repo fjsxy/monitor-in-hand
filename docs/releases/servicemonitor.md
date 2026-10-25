@@ -31,7 +31,7 @@ make release-upgrade BUNDLE="bundle-${VERSION}" SOURCE_COMMIT="${SOURCE_COMMIT}"
 
 在任意 CR 新字段写入前，平台用只读权限获取已部署的 KSM CRD，按机器契约检查完整字段类型、served version、enabled 缺省关闭及 status 引用能力。也可用 `go run ./cmd/release capability --file deployed-crd.yaml`。旧 schema 必须明确拒绝，不能通过先发送再读取被裁剪的 CR 猜测能力。
 
-升级入口验证 bundle 后，先用独立 field manager 对既有 CRD 执行 server-side apply，再用同包 chart 执行 Helm upgrade/install `--skip-crds`。Helm 的 `crds/` 不会自动更新已存在 schema。入口不删除 CRD、不批量重建 CR、不 force 覆盖冲突；CRD apply 失败即停止后续升级，管理员应处理具体冲突后重复执行同一包。
+升级入口验证 bundle 后，先读取并核对包内已知旧/新 CRD spec，再用 UID/resourceVersion test 的 JSON Patch 原位更新既有 CRD spec（新装使用 create），再用同包 chart 执行 Helm upgrade/install `--skip-crds`。Helm 的 `crds/` 不会自动更新已存在 schema。入口不删除 CRD、不批量重建 CR、不 force 覆盖冲突；CRD 更新失败即停止后续升级，未知 spec 漂移必须先由管理员检查，并发条件冲突可重复执行同一包。
 
 升级后旧 CR 保持关闭采集。显式发布 `spec.serviceMonitor.enabled=true` 后，Operator 才按当前 CR UID 创建配套对象。平台只需 CR 管理及 SM 只读权限，不能据此取得 SM 写权限；`ServiceMonitorReady` 只代表配套配置收敛，真实采集须另查 Agent targets 和接收端样本。
 
@@ -40,3 +40,5 @@ make release-upgrade BUNDLE="bundle-${VERSION}" SOURCE_COMMIT="${SOURCE_COMMIT}"
 CI 的 `rel` lane 按 Chart appVersion 对应的轻量 Git tag 锁定候选源提交，下载同一发布包；测试报告记录该候选源提交。其他 lane 验证 CI 当前提交。发布验收时须确认 tag/source/testedCommit 为拟交付的提交，并在同一个 run/attempt 汇总；后续 main rebase 不改写候选来源。
 
 候选完整验收仅引用该版本 tag 触发的 CI（所有 job checkout 同一候选提交，rel 额外断言 tag 源等于 GITHUB_SHA）；日常 PR/main 对冻结候选的回归与当前提交测试分开解释，不拼成候选发布证据。
+
+旧 Helm 创建的 CRD schema 由其 field manager 持有，直接 SSA 会发生所有权冲突。本入口只更新精确匹配已知基线的 spec，JSON Patch 的 UID/resourceVersion test 拒绝并发变化，不绕过冲突、不清除 managedFields；metadata/status 和既有 CR 保持。机制见 [Kubernetes API 并发控制](https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions)。
