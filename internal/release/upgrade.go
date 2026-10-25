@@ -81,19 +81,8 @@ func upgradeCRD(ctx context.Context, dir string, m *Manifest, kubeContext string
 	if err != nil {
 		return err
 	}
-	f, err := os.CreateTemp("", "mih-crd-upgrade-*.json")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if _, err = f.Write(payload); err != nil {
-		f.Close()
-		return err
-	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-	_, err = run(ctx, "kubectl", append(prefix, "patch", "crd", desired.Name, "--type=json", "--field-manager=monitor-in-hand-release", "--patch-file", f.Name())...)
+	// Kubernetes 1.19 的 kubectl 尚无 --patch-file；独立参数传递 JSON，不经过 shell。
+	_, err = run(ctx, "kubectl", append(prefix, "patch", "crd", desired.Name, "--type=json", "--field-manager=monitor-in-hand-release", "--patch", string(payload))...)
 	return err
 }
 
