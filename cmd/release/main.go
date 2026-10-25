@@ -126,12 +126,12 @@ func cleanSource(ctx context.Context, source string) error {
 	if strings.TrimSpace(string(sha)) != source {
 		return fmt.Errorf("源提交与 HEAD 不匹配")
 	}
-	status, err := output(ctx, "git", "status", "--porcelain", "--untracked-files=no")
+	status, err := output(ctx, "git", "status", "--porcelain", "--untracked-files=normal")
 	if err != nil {
 		return err
 	}
 	if len(bytes.TrimSpace(status)) != 0 {
-		return fmt.Errorf("发布要求已提交的干净 tracked 工作树")
+		return fmt.Errorf("发布要求已提交的干净工作树（含未跟踪源文件）")
 	}
 	return nil
 }
@@ -198,6 +198,7 @@ func publishImages(ctx context.Context, source, version string) error {
 	if err != nil {
 		return err
 	}
+	// 分别发布当前源与冻结功能前源，逐个平台核对实际 OCI revision。
 	for _, build := range []struct{ tag, sha, dir string }{{version, source, root}, {product.PreviousVersion, product.PreviousCommit, previous}} {
 		ref := product.Repository + ":" + build.tag
 		_, err := inspectImage(ctx, build.tag, build.sha)
@@ -275,6 +276,7 @@ func packageBundle(ctx context.Context, dir, source, version string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
+	// 准备并校验 registry 中三条真实镜像基线，历史 tag 漂移必须停止。
 	image, err := inspectImage(ctx, version, source)
 	if err != nil {
 		return err
@@ -305,6 +307,7 @@ func packageBundle(ctx context.Context, dir, source, version string) error {
 			return err
 		}
 	}
+	// 将独立 CRD、RBAC 和机器契约纳入同一来源记录，并逐文件计算摘要。
 	for dest, src := range map[string]string{m.CRD: "config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml", m.RBAC: "config/rbac/role.yaml", m.Contract: "docs/contracts/servicemonitor-v1.json", m.Legacy.CRD: filepath.Join(previous, "config/crd/bases/monitoring.fjsxy.github.io_kubestatemetrics.yaml")} {
 		data, err := os.ReadFile(src)
 		if err != nil {
@@ -356,6 +359,7 @@ func packageChart(ctx context.Context, source, dir, version, digest string) erro
 	}
 	defer os.RemoveAll(tmp)
 	chart := filepath.Join(tmp, "monitor-in-hand")
+	// 只在临时目录组装 chart，registry 返回 digest 后再固定运行镜像。
 	err = filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr

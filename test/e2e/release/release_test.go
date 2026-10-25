@@ -164,6 +164,22 @@ var _ = Describe("发布契约", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(product.CheckCapability(data)).NotTo(Succeed())
 		createCR(ctx, "gh87-historical", ns, false)
+		updateWith(ctx, cc, "gh87-historical", func(c *api.KubeStateMetrics) { c.Finalizers = append(c.Finalizers, "test.monitor-in-hand/gh87") })
+		// 只移除本测试添加的外部 finalizer，失败后也不阻塞业务 finalizer 的正常清理。
+		DeferCleanup(func() {
+			if apierrors.IsNotFound(cc.Get(context.Background(), client.ObjectKey{Name: "gh87-historical"}, &api.KubeStateMetrics{})) {
+				return
+			}
+			updateWith(context.Background(), cc, "gh87-historical", func(c *api.KubeStateMetrics) {
+				kept := []string{}
+				for _, f := range c.Finalizers {
+					if f != "test.monitor-in-hand/gh87" {
+						kept = append(kept, f)
+					}
+				}
+				c.Finalizers = kept
+			})
+		})
 		before := getCR(ctx, "gh87-historical")
 		By("历史 runtime 无 KSM controller，不能把不存在的旧 workload 算作已保留")
 		Consistently(func() bool {
@@ -177,11 +193,21 @@ var _ = Describe("发布契约", Ordered, func() {
 		Expect(after.UID).To(Equal(before.UID))
 		Expect(after.Spec.TargetNamespace).To(Equal(before.Spec.TargetNamespace))
 		Expect(after.Spec.ServiceMonitor).To(BeNil())
+		Expect(after.Finalizers).To(ContainElements(before.Finalizers))
 		_, err = dc.Resource(smGVR).Namespace(ns).Get(ctx, "ksm-gh87-historical", metav1.GetOptions{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		By("同一升级入口可以重复执行，保持原 CR 身份且不自动启用")
 		upgrade(ctx)
 		Expect(getCR(ctx, before.Name).UID).To(Equal(before.UID))
+		updateWith(ctx, cc, before.Name, func(c *api.KubeStateMetrics) {
+			kept := []string{}
+			for _, f := range c.Finalizers {
+				if f != "test.monitor-in-hand/gh87" {
+					kept = append(kept, f)
+				}
+			}
+			c.Finalizers = kept
+		})
 		deleteCR(ctx, before.Name)
 		assertExternal(ctx)
 	}, NodeTimeout(12*time.Minute))
@@ -371,7 +397,49 @@ func command(ctx context.Context, name string, args ...string) error {
 func upgrade(ctx context.Context) {
 	GinkgoHelper()
 	Expect(product.Upgrade(ctx, bundle, manifest.SourceCommit, kubeContext, opNS, releaseName, command)).To(Succeed())
+	recordDeploymentContract(ctx)
 }
+
+// recordDeploymentContract 核验实际 API schema 和生效权限，不能只用发布包本身证明集群已升级。
+func recordDeploymentContract(ctx context.Context) {
+	GinkgoHelper()
+	definition, err := ec.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crdName, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	live, err := json.Marshal(definition)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(product.CheckCapability(live)).To(Succeed())
+	data, err := os.ReadFile(filepath.Join(bundle, manifest.CRD))
+	Expect(err).NotTo(HaveOccurred())
+	expected := &extv1.CustomResourceDefinition{}
+	Expect(yaml.Unmarshal(data, expected)).To(Succeed())
+	for _, version := range expected.Spec.Versions {
+		found := false
+		for _, actual := range definition.Spec.Versions {
+			if actual.Name != version.Name {
+				continue
+			}
+			found = true
+			Expect(actual.Schema).To(Equal(version.Schema))
+			Expect(actual.Served).To(Equal(version.Served))
+			Expect(actual.Storage).To(Equal(version.Storage))
+			Expect(actual.Subresources).To(Equal(version.Subresources))
+		}
+		Expect(found).To(BeTrue(), version.Name)
+	}
+	role, err := kc.RbacV1().ClusterRoles().Get(ctx, "monitor-in-hand-manager-role", metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	data, err = os.ReadFile(filepath.Join(bundle, manifest.RBAC))
+	Expect(err).NotTo(HaveOccurred())
+	expectedRole := &rbacv1.ClusterRole{}
+	Expect(yaml.Unmarshal(data, expectedRole)).To(Succeed())
+	Expect(role.Rules).To(Equal(expectedRole.Rules))
+	schemaBytes, err := json.Marshal(definition.Spec.Versions)
+	Expect(err).NotTo(HaveOccurred())
+	rbacBytes, err := json.Marshal(role.Rules)
+	Expect(err).NotTo(HaveOccurred())
+	AddReportEntry("实际部署 schema 与 RBAC", map[string]string{"crdUID": string(definition.UID), "schemaSHA256": fmt.Sprintf("%x", sha256.Sum256(schemaBytes)), "rbacUID": string(role.UID), "rulesSHA256": fmt.Sprintf("%x", sha256.Sum256(rbacBytes))}, ReportEntryVisibilityFailureOrVerbose)
+}
+
 func uninstall(ctx context.Context) {
 	GinkgoHelper()
 	Expect(command(ctx, "helm", "uninstall", releaseName, "--kube-context", kubeContext, "--namespace", opNS, "--wait", "--timeout", "120s", "--ignore-not-found")).To(Succeed())
@@ -535,6 +603,41 @@ func checkImage(ctx context.Context, image product.Image, pinned bool) {
 		}
 		return false
 	}, 180*time.Second, time.Second).Should(BeTrue(), image.Tag)
+	// containerd 在某些版本报告 index imageID；进一步比较实际 runtime config 与锁定平台 manifest 的 config digest。
+	imageID := pod.Status.ContainerStatuses[0].ImageID
+	runtimeData, err := exec.CommandContext(ctx, "docker", "exec", pod.Spec.NodeName, "crictl", "inspecti", imageID).CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), string(runtimeData))
+	var runtimeImage struct {
+		Status struct {
+			ID string `json:"id"`
+		} `json:"status"`
+		Info struct {
+			ImageSpec struct {
+				Architecture string `json:"architecture"`
+				OS           string `json:"os"`
+				Config       struct {
+					Labels map[string]string `json:"Labels"`
+				} `json:"config"`
+			} `json:"imageSpec"`
+		} `json:"info"`
+	}
+	Expect(json.Unmarshal(runtimeData, &runtimeImage)).To(Succeed())
+	Expect(runtimeImage.Info.ImageSpec.Architecture).To(Equal(arch))
+	Expect(runtimeImage.Info.ImageSpec.OS).To(Equal("linux"))
+	platformData, err := exec.CommandContext(ctx, "docker", "buildx", "imagetools", "inspect", image.Repository+"@"+image.Platforms["linux/"+arch], "--raw").CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), string(platformData))
+	var platformManifest struct {
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
+	}
+	Expect(json.Unmarshal(platformData, &platformManifest)).To(Succeed())
+	Expect(platformManifest.Config.Digest).NotTo(BeEmpty())
+	Expect(runtimeImage.Status.ID).To(Equal(platformManifest.Config.Digest))
+	if image.SourceCommit != "" {
+		Expect(runtimeImage.Info.ImageSpec.Config.Labels["org.opencontainers.image.revision"]).To(Equal(image.SourceCommit))
+	}
+	AddReportEntry("运行时与平台 manifest 的 config digest", map[string]string{"runtimeConfigDigest": runtimeImage.Status.ID, "platformConfigDigest": platformManifest.Config.Digest}, ReportEntryVisibilityFailureOrVerbose)
 	AddReportEntry("实际运行镜像", map[string]any{"tag": image.Tag, "sourceCommit": image.SourceCommit, "nodeArchitecture": arch, "podUID": pod.UID, "podImage": pod.Spec.Containers[0].Image, "imageID": pod.Status.ContainerStatuses[0].ImageID, "indexDigest": image.IndexDigest, "platformDigest": image.Platforms["linux/"+arch]}, ReportEntryVisibilityFailureOrVerbose)
 }
 

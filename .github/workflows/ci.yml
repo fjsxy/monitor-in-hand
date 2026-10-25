@@ -145,6 +145,9 @@ jobs:
           version=$(sed -n 's/^appVersion: "\(.*\)"/\1/p' charts/monitor-in-hand/Chart.yaml)
           source=$(gh api "repos/fjsxy/monitor-in-hand/git/ref/tags/v${version}" --jq .object.sha)
           test "${#source}" -eq 40
+          if [ "${{ github.ref_type }}" = tag ]; then
+            test "${source}" = "${GITHUB_SHA}"
+          fi
           echo "RELEASE_TESTED_COMMIT=${source}" >> "$GITHUB_ENV"
       - name: E2E ${{ matrix.lane }}
         run: make ${{ matrix.target }} HELM=helm

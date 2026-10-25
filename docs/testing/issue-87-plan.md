@@ -44,3 +44,9 @@ Issue：https://github.com/fjsxy/monitor-in-hand/issues/87
 ## 结果记录
 
 当前未编码、未执行、未发布候选。最终补充 source/testedCommit、候选 tag、镜像 index/platform digest、bundle hash、下载位置、双版本逐例 JUnit、实际 imageID/UID、清理及已知限制。独立历史镜像路径和 pre-SM 对照路径不得混称同一旧版。
+
+## 验收来源补充（编码评审后收紧）
+
+- 候选最终验收只接受该版本轻量 tag 触发的完整 CI：tag 指向 source/testedCommit，全部 blocking job checkout 同一 tag 提交，rel lane 再断言解析出的候选源等于 GITHUB_SHA。使用同一 run/attempt 的全部结果，不拼接其他候选或分支结果。
+- 日常 PR/main CI 继续测试当前提交，同时可回归 Chart appVersion 指定的冻结候选；这类门禁通过不宣称当前提交已发布，也不作为候选完整验收证明。合并 rebase 产生新 SHA 不改写候选来源。最终结果必须分别列明候选 tag CI 与 PR CI 的源。
+- 每次发布升级后，E2E 回读实际 CRD schema、RBAC rules，分别与候选独立产物比较并记录摘要；运行容器的 config digest 与已发布的平台 manifest config digest 相等，兼容 containerd 将 imageID 报告为 index 的行为。历史 CR 的外部测试 finalizer 必须被保留。
