@@ -58,9 +58,8 @@ var _ = Describe("可消费的发布包", func() {
 			if containsArg(args, "get") {
 				return current, nil
 			}
-			if containsArg(args, "--patch-file") {
-				data, e := os.ReadFile(args[len(args)-1])
-				Expect(e).NotTo(HaveOccurred())
+			if containsArg(args, "--patch") {
+				data := []byte(args[len(args)-1])
 				var patch []map[string]any
 				Expect(json.Unmarshal(data, &patch)).To(Succeed())
 				Expect(patch).To(HaveLen(3))
@@ -72,7 +71,7 @@ var _ = Describe("可消费的发布包", func() {
 		}
 		Expect(product.Upgrade(context.Background(), dir, fixtureCommit, "kind-owned", "monitoring", "operator", runner)).To(Succeed())
 		Expect(commands).To(HaveLen(3))
-		Expect(commands[1]).To(ContainElements("patch", "--type=json", "--patch-file"))
+		Expect(commands[1]).To(ContainElements("patch", "--type=json", "--patch"))
 		Expect(commands[2]).To(ContainElements("helm", "upgrade", "--skip-crds", filepath.Join(dir, m.Chart)))
 		By("当前 schema 已是新基线时只读后升级 Helm，新装则先 create")
 		data, e := os.ReadFile(filepath.Join(dir, m.CRD))
