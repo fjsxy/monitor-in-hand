@@ -105,7 +105,18 @@ jobs:
             run_id_suffix: "128"
             lane: sm
             target: e2e-servicemonitor
+          - kubernetes: "1.19"
+            kubectl: "v1.19.16"
+            run_id_suffix: "119"
+            lane: rel
+            target: e2e-release
+          - kubernetes: "1.28"
+            kubectl: "v1.28.15"
+            run_id_suffix: "128"
+            lane: rel
+            target: e2e-release
     env:
+      GH_TOKEN: ${{ github.token }}
       KUBERNETES_VERSION: ${{ matrix.kubernetes }}
       TEST_RUN_ID: ci-${{ github.run_id }}-${{ matrix.run_id_suffix }}-${{ matrix.lane }}
     steps:
@@ -128,6 +139,13 @@ jobs:
         run: |
           make test-env-up
           make test-env-verify
+      - name: 锁定发布 lane 的候选源提交
+        if: ${{ matrix.lane == 'rel' }}
+        run: |
+          version=$(sed -n 's/^appVersion: "\(.*\)"/\1/p' charts/monitor-in-hand/Chart.yaml)
+          source=$(gh api "repos/fjsxy/monitor-in-hand/git/ref/tags/v${version}" --jq .object.sha)
+          test "${#source}" -eq 40
+          echo "RELEASE_TESTED_COMMIT=${source}" >> "$GITHUB_ENV"
       - name: E2E ${{ matrix.lane }}
         run: make ${{ matrix.target }} HELM=helm
       - name: 上传 E2E 测试报告
@@ -181,8 +199,8 @@ jobs:
         run: >-
           go run ./cmd/phase1-gate
           --reports artifacts
-          --expected-blocking-count 209
-          --expected-e2e-count 71
+          --expected-blocking-count 225
+          --expected-e2e-count 83
       - name: 校验全部上游 blocking job
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}

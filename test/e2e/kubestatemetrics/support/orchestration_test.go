@@ -2,9 +2,11 @@ package kubestatemetricssupport_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sigs.k8s.io/yaml"
 	"strings"
 	"time"
 
@@ -33,10 +35,15 @@ var _ = Describe("E2E orchestration contracts", func() {
 		Expect(err).NotTo(HaveOccurred(), string(output))
 
 		By("验证宿主构建、runtime 镜像、kind 导入与 Ginkgo 的严格顺序")
+		chartData, err := os.ReadFile(filepath.Join(repoRoot, "charts/monitor-in-hand/Chart.yaml"))
+		Expect(err).NotTo(HaveOccurred())
+		chart := map[string]any{}
+		Expect(yaml.Unmarshal(chartData, &chart)).To(Succeed())
+		image := "docker.io/fjsxy/monitor-in-hand:" + chart["appVersion"].(string)
 		plan := string(output)
 		hostBuildAt := strings.Index(plan, "CGO_ENABLED=0 GOOS=linux go build")
-		buildAt := strings.Index(plan, `docker build --file test/e2e/kubestatemetrics/Dockerfile --tag "docker.io/fjsxy/monitor-in-hand:0.1.0" bin/e2e-kubestatemetrics`)
-		loadAt := strings.Index(plan, `kind load docker-image --name "mih-e2e-128-sc-57-contract" "docker.io/fjsxy/monitor-in-hand:0.1.0"`)
+		buildAt := strings.Index(plan, fmt.Sprintf(`docker build --file test/e2e/kubestatemetrics/Dockerfile --tag "%s" bin/e2e-kubestatemetrics`, image))
+		loadAt := strings.Index(plan, fmt.Sprintf(`kind load docker-image --name "mih-e2e-128-sc-57-contract" "%s"`, image))
 		ginkgoAt := strings.Index(plan, "ginkgo -v")
 		Expect(hostBuildAt).To(BeNumerically(">=", 0), plan)
 		Expect(buildAt).To(BeNumerically(">=", 0), plan)

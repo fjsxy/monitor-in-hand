@@ -96,6 +96,20 @@ var _ = Describe("一期发布门禁", func() {
 		writeJUnit(wrongLane, "ci-run-119-ksm-1.19/kubestatemetrics", []junitCase{{name: monitorIDs[0]}})
 		_, err = phase1gate.VerifyJUnitResults(monitorIDs[:1], wrongLane)
 		Expect(err).To(MatchError(ContainSubstring("期望 sm lane 的 Kubernetes 1.19")))
+		By("发布产物报告来自独立 rel lane，仍拒绝跨 lane 结果")
+		for _, version := range []string{"119", "128"} {
+			id := strings.Replace(e2eID(version, "001"), "KSM-GH65", "RELEASE-GH87", 1)
+			minor := map[string]string{"119": "1.19", "128": "1.28"}[version]
+			r := GinkgoT().TempDir()
+			writeJUnit(r, "ci-run-"+version+"-rel-"+minor+"/release", []junitCase{{name: id}})
+			_, err = phase1gate.VerifyJUnitResults([]string{id}, r)
+			Expect(err).NotTo(HaveOccurred())
+			wrong := GinkgoT().TempDir()
+			writeJUnit(wrong, "ci-run-"+version+"-sm-"+minor+"/release", []junitCase{{name: id}})
+			_, err = phase1gate.VerifyJUnitResults([]string{id}, wrong)
+			Expect(err).To(MatchError(ContainSubstring("期望 rel lane")))
+		}
+
 	})
 
 	It("UT-GATE-GH65-003 拒绝各层缺失或非成功以及 E2E 重复和错误版本/lane", func() {

@@ -9,7 +9,8 @@
     "tolerations",
     "topologySpreadConstraints",
     "healthProbe",
-    "logLevel"
+    "logLevel",
+    "image"
   ],
   "properties": {
     "resources": {
@@ -20,7 +21,9 @@
       "properties": {
         "kubernetes.io/os": {
           "type": "string",
-          "enum": ["linux"]
+          "enum": [
+            "linux"
+          ]
         }
       },
       "additionalProperties": {
@@ -45,7 +48,9 @@
     "healthProbe": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["port"],
+      "required": [
+        "port"
+      ],
       "properties": {
         "port": {
           "type": "integer",
@@ -56,7 +61,25 @@
     },
     "logLevel": {
       "type": "string",
-      "enum": ["debug", "info", "warn", "error"]
+      "enum": [
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ]
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest"
+      ],
+      "properties": {
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[a-f0-9]{64}$"
+        }
+      }
     }
   }
 }

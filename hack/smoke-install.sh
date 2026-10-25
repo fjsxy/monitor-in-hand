@@ -4,7 +4,8 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 helm_bin=${HELM_BIN:-helm}
-image=${IMAGE:-docker.io/fjsxy/monitor-in-hand:0.1.0}
+chart_version=$(sed -n 's/^appVersion: "\(.*\)"/\1/p' "${repo_root}/charts/monitor-in-hand/Chart.yaml")
+image=${IMAGE:-docker.io/fjsxy/monitor-in-hand:${chart_version}}
 cluster_name=${KIND_CLUSTER_NAME:-"monitor-in-hand-smoke-${$}"}
 node_image=${KIND_NODE_IMAGE:-kindest/node:v1.28.15@sha256:a7c05c7ae043a0b8c818f5a06188bc2c4098f6cb59ca7d1856df00375d839251}
 namespace=monitor-in-hand-smoke

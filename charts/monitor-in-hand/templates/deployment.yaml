@@ -47,7 +47,7 @@ spec:
       {{- end }}
       containers:
         - name: manager
-          image: {{ printf "docker.io/fjsxy/monitor-in-hand:%s" .Chart.AppVersion | quote }}
+          image: {{ if .Values.image.digest }}{{ printf "docker.io/fjsxy/monitor-in-hand@%s" .Values.image.digest | quote }}{{ else }}{{ printf "docker.io/fjsxy/monitor-in-hand:%s" .Chart.AppVersion | quote }}{{ end }}
           imagePullPolicy: IfNotPresent
           args:
             - "--leader-elect=true"

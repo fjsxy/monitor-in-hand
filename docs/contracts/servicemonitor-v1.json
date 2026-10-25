@@ -1,0 +1,74 @@
+{
+  "contractVersion": 1,
+  "capability": "ksm-companion-servicemonitor/v1",
+  "api": {
+    "group": "monitoring.fjsxy.github.io",
+    "version": "v1alpha1",
+    "kind": "KubeStateMetrics",
+    "scope": "Cluster"
+  },
+  "spec": {
+    "path": "spec.serviceMonitor",
+    "enabledDefault": false,
+    "intervalDefault": "30s",
+    "scrapeTimeoutDefault": "10s",
+    "labels": "string map; opaque; no platform authorization semantics",
+    "validation": [
+      "positive Prometheus duration",
+      "scrapeTimeout <= interval",
+      "valid Kubernetes labels",
+      "reserved app.kubernetes.io/* and monitor-in-hand/* forbidden"
+    ]
+  },
+  "ownership": {
+    "namespace": "spec.targetNamespace",
+    "name": "由 Operator 计算，消费者读取 status.serviceMonitor.resource；不复制内部算法",
+    "controllerOwner": "当前 KubeStateMetrics CR UID",
+    "foreignResource": "不接管"
+  },
+  "observation": {
+    "path": "status.serviceMonitor",
+    "fields": [
+      "observedGeneration",
+      "state",
+      "reason",
+      "message",
+      "resource.apiVersion",
+      "resource.kind",
+      "resource.namespace",
+      "resource.name",
+      "resource.uid"
+    ],
+    "states": [
+      "Unknown",
+      "Disabled",
+      "Ready",
+      "Degraded",
+      "Deleting"
+    ],
+    "condition": "ServiceMonitorReady",
+    "meaning": "配套配置收敛，不代表 workload 可用或数据面已采集"
+  },
+  "lifecycle": {
+    "suspended": "保留配套对象",
+    "monitorDisabled": "只清理配套对象",
+    "componentDisabled": "清理全部本实例资源",
+    "deleted": "等待原身份资源消失后结束 finalizer"
+  },
+  "capabilityCheck": {
+    "entry": "go run ./cmd/release capability --file <deployed-crd.yaml>",
+    "before": "任何新字段 CR 写入前",
+    "requires": "served v1alpha1 的完整字段类型、enabled default=false、status UID/观察字段和全部状态枚举",
+    "unsupported": "明确拒绝，不依赖试写后被裁剪的字段"
+  },
+  "upgrade": {
+    "entry": "make release-upgrade BUNDLE=... SOURCE_COMMIT=... KUBE_CONTEXT=...",
+    "order": [
+      "verify bundle hashes/source/digests/schema",
+      "kubectl server-side apply CRD, no delete or force",
+      "helm upgrade same pinned chart --skip-crds"
+    ],
+    "historicalInstances": "旧 CR 不自动启用采集，只在后续显式修改后启用"
+  },
+  "externalResources": "PrometheusAgent、管理员独立四类采集配置及外部生成资源仍为外部资源"
+}

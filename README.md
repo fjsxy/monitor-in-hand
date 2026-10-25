@@ -2,7 +2,9 @@
 
 面向单个 Kubernetes 集群的可观测组件管控 Operator。当前提供可安装、可探活的控制面，以及 cluster-scoped `KubeStateMetrics` API 的默认单副本 Deployment 与 experimental StatefulSetSharded 调谐。
 
-发布镜像位于 Docker Hub：`docker.io/fjsxy/monitor-in-hand:<version>`。Chart 使用 `appVersion` 选择固定镜像 tag。
+发布镜像位于 Docker Hub：`docker.io/fjsxy/monitor-in-hand:<version>`。源码 Chart 使用 `appVersion` 选择固定镜像 tag；候选发布的 Chart 默认使用 OCI index digest。
+
+配套 ServiceMonitor 的发布、能力检查与 CRD 升级入口见 [发布说明](docs/releases/servicemonitor.md)，机器契约见 [servicemonitor-v1.json](docs/contracts/servicemonitor-v1.json)。`make release-image`、`release-package`、`release-publish` 固化发布流程；`make e2e-release` 从 GitHub 下载候选并验证真实安装与升级。
 
 ## 工程脚手架
 
